@@ -21,6 +21,10 @@ Phase 1.2 冒烟：单层 GGUF + KTMoEWrapper(LLAMAFILE)，全 CPU expert 走一
   # 若尚未安装 torch 等，再装一次（勿与 torch_npu 要求的版本冲突）
     --gguf /workspace/models/cache/dsv4_layer3.gguf \\
     --layer-idx 3
+
+  # Phase 2-B：同一进程内两个不同 GGUF（验证 LlamafileMoEWrapper 按路径缓存 loader）
+    --gguf /workspace/models/cache/dsv4_layer3.gguf --layer-idx 3 \\
+    --second-gguf /workspace/models/cache/dsv4_layer40.gguf --second-layer-idx 40
 """
 
 from __future__ import annotations
@@ -30,6 +34,70 @@ import sys
 from pathlib import Path
 
 import torch
+
+
+def _smoke_one(
+    gguf: Path,
+    layer_idx: int,
+    args: argparse.Namespace,
+    tag: str,
+) -> int:
+    """Run one KTMoEWrapper forward; return 0 on success."""
+    if not gguf.is_file():
+        print(f"ERROR: [{tag}] GGUF 不存在: {gguf}", file=sys.stderr)
+        return 2
+
+    try:
+        from kt_kernel import KTMoEWrapper  # noqa: WPS433
+    except ImportError as e:
+        print(
+            "ERROR: 无法 import kt_kernel。\n"
+            "  请先安装可编辑包（推荐）：\n"
+            "    cd /workspace/code/ktransformer/ktransformers-AK/kt-kernel && "
+            "/usr/local/python3.11.14/bin/python3 -m pip install -e .\n"
+            "  或确保已将编译好的 `kt_kernel_ext*.so` 放在 `kt-kernel/python/` 目录下（与源码同目录供 _cpu_detect 查找）。\n"
+            f"  原始错误: {e}",
+            file=sys.stderr,
+        )
+        return 2
+
+    device = torch.device(args.device)
+    gpu_mask = torch.zeros(args.num_experts, dtype=torch.bool)
+
+    print(
+        f"[{tag}] gguf={gguf} layer={layer_idx} device={device} "
+        f"H={args.hidden_size} inter={args.moe_intermediate_size} topk={args.num_experts_per_tok}"
+    )
+
+    wrapper = KTMoEWrapper(
+        layer_idx=layer_idx,
+        num_experts=args.num_experts,
+        num_experts_per_tok=args.num_experts_per_tok,
+        hidden_size=args.hidden_size,
+        moe_intermediate_size=args.moe_intermediate_size,
+        gpu_experts_mask=gpu_mask,
+        cpuinfer_threads=args.cpuinfer_threads,
+        threadpool_count=args.threadpool_count,
+        weight_path=str(gguf),
+        chunked_prefill_size=args.chunked_prefill_size,
+        method="LLAMAFILE",
+        numa_nodes=list(range(args.threadpool_count)),
+    )
+    wrapper.load_weights()
+
+    torch.manual_seed(0)
+    hidden = torch.randn(args.batch, args.hidden_size, dtype=torch.bfloat16, device=device)
+    topk_ids = torch.randint(0, args.num_experts, (args.batch, args.num_experts_per_tok), dtype=torch.long, device=device)
+    tw = torch.randn(args.batch, args.num_experts_per_tok, dtype=torch.float32, device=device)
+    topk_weights = torch.softmax(tw, dim=-1)
+
+    stream = _stream_handle(device)
+    out = wrapper.forward(hidden, topk_ids, topk_weights, stream)
+    if not torch.isfinite(out).all():
+        print(f"[{tag}] FAIL: non-finite outputs shape={tuple(out.shape)}", file=sys.stderr)
+        return 1
+    print(f"[{tag}] OK forward out shape={tuple(out.shape)} dtype={out.dtype} device={out.device}")
+    return 0
 
 
 def _stream_handle(device: torch.device) -> int:
@@ -58,63 +126,31 @@ def main() -> int:
     ap.add_argument("--threadpool-count", type=int, default=8)
     ap.add_argument("--chunked-prefill-size", type=int, default=8)
     ap.add_argument("--device", type=str, default="cpu", help="hidden/topk 张量所在设备：cpu | cuda | npu")
+    ap.add_argument(
+        "--second-gguf",
+        type=Path,
+        default=None,
+        help="Phase 2-B：第二个 GGUF 路径；与 --second-layer-idx 同时指定时在首层之后同进程再跑一层",
+    )
+    ap.add_argument("--second-layer-idx", type=int, default=None, help="与 --second-gguf 配对")
     args = ap.parse_args()
 
+    s_gguf, s_layer = args.second_gguf, args.second_layer_idx
+    if (s_gguf is None) ^ (s_layer is None):
+        print("ERROR: --second-gguf 与 --second-layer-idx 必须同时指定或同时省略", file=sys.stderr)
+        return 2
+
     gguf = args.gguf.expanduser().resolve()
-    if not gguf.is_file():
-        print(f"ERROR: --gguf 不存在: {gguf}", file=sys.stderr)
-        return 2
+    rc = _smoke_one(gguf, args.layer_idx, args, "p12")
+    if rc != 0:
+        return rc
 
-    try:
-        from kt_kernel import KTMoEWrapper  # noqa: WPS433
-    except ImportError as e:
-        print(
-            "ERROR: 无法 import kt_kernel。\n"
-            "  请先安装可编辑包（推荐）：\n"
-            "    cd /workspace/code/ktransformer/ktransformers-AK/kt-kernel && "
-            "/usr/local/python3.11.14/bin/python3 -m pip install -e .\n"
-            "  或确保已将编译好的 `kt_kernel_ext*.so` 放在 `kt-kernel/python/` 目录下（与源码同目录供 _cpu_detect 查找）。\n"
-            f"  原始错误: {e}",
-            file=sys.stderr,
-        )
-        return 2
+    if s_gguf is not None:
+        gguf2 = s_gguf.expanduser().resolve()
+        rc2 = _smoke_one(gguf2, s_layer, args, "p12b")
+        if rc2 != 0:
+            return rc2
 
-    device = torch.device(args.device)
-    gpu_mask = torch.zeros(args.num_experts, dtype=torch.bool)
-
-    print(
-        f"[p12] gguf={gguf} layer={args.layer_idx} device={device} "
-        f"H={args.hidden_size} inter={args.moe_intermediate_size} topk={args.num_experts_per_tok}"
-    )
-
-    wrapper = KTMoEWrapper(
-        layer_idx=args.layer_idx,
-        num_experts=args.num_experts,
-        num_experts_per_tok=args.num_experts_per_tok,
-        hidden_size=args.hidden_size,
-        moe_intermediate_size=args.moe_intermediate_size,
-        gpu_experts_mask=gpu_mask,
-        cpuinfer_threads=args.cpuinfer_threads,
-        threadpool_count=args.threadpool_count,
-        weight_path=str(gguf),
-        chunked_prefill_size=args.chunked_prefill_size,
-        method="LLAMAFILE",
-        numa_nodes=list(range(args.threadpool_count)),
-    )
-    wrapper.load_weights()
-
-    torch.manual_seed(0)
-    hidden = torch.randn(args.batch, args.hidden_size, dtype=torch.bfloat16, device=device)
-    topk_ids = torch.randint(0, args.num_experts, (args.batch, args.num_experts_per_tok), dtype=torch.long, device=device)
-    tw = torch.randn(args.batch, args.num_experts_per_tok, dtype=torch.float32, device=device)
-    topk_weights = torch.softmax(tw, dim=-1)
-
-    stream = _stream_handle(device)
-    out = wrapper.forward(hidden, topk_ids, topk_weights, stream)
-    if not torch.isfinite(out).all():
-        print(f"[p12] FAIL: non-finite outputs shape={tuple(out.shape)}", file=sys.stderr)
-        return 1
-    print(f"[p12] OK forward out shape={tuple(out.shape)} dtype={out.dtype} device={out.device}")
     return 0
 
 

@@ -1,6 +1,9 @@
-import torch
-from typing import List, Optional
+from __future__ import annotations
+
 import os
+from typing import Dict, List, Optional
+
+import torch
 
 # Use relative imports for package structure
 from ..experts_base import BaseMoEWrapper
@@ -22,9 +25,13 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
     """
     Llamafile-based MoE wrapper implementation.
     Supports GGUF quantized weights with llamafile backend.
+
+    GGUFLoader is cached **per resolved weight path** (file or directory): multiple MoE layers
+    that share one merged GGUF reuse a single mmap; **per-layer split GGUFs** each get their own
+    loader (Phase 2-B).
     """
 
-    _gguf_loader_instance = None  # Singleton GGUFLoader
+    _gguf_loaders_by_path: Dict[str, GGUFLoader] = {}
 
     def __init__(
         self,
@@ -73,10 +80,10 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         if not os.path.exists(weight_path):
             raise FileNotFoundError(f"GGUF weight path not found: {weight_path}")
 
-        # Initialize GGUF loader (singleton)
-        if LlamafileMoEWrapper._gguf_loader_instance is None:
-            LlamafileMoEWrapper._gguf_loader_instance = GGUFLoader(weight_path)
-        self.gguf_loader = LlamafileMoEWrapper._gguf_loader_instance
+        cache_key = os.path.realpath(weight_path)
+        if cache_key not in LlamafileMoEWrapper._gguf_loaders_by_path:
+            LlamafileMoEWrapper._gguf_loaders_by_path[cache_key] = GGUFLoader(weight_path)
+        self.gguf_loader = LlamafileMoEWrapper._gguf_loaders_by_path[cache_key]
 
         # Validate TP configuration with QK_K alignment
         QK_K = 256

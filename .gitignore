@@ -31,4 +31,4 @@ CMakeFiles/
 kvc2/
 sched/
 *.png
-model/DeepSeek-R1-GGUF/
+model/DeepSeek-R1-GGUF/model/w8a8/

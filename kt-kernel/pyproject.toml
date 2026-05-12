@@ -20,11 +20,12 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-  # Core dependencies
-  "torch==2.9.1",
+  # Core: Ascend 环境 torch_npu 2.8.x 固定要求 torch==2.8.0，勿锁到 2.9.x（会触发 libtorch_npu.so undefined symbol）
+  "torch>=2.8.0,<2.9.0",
   "safetensors>=0.4.0",
   "numpy>=1.24.0",
-  "triton>=2.0.0",
+  # Triton 主要为 x86 GPU 路径；aarch64 + NPU 推理通常不需要，且会拉数百 MB 与 torch 强绑定 wheel
+  "triton>=2.0.0; platform_machine == 'x86_64' or platform_machine == 'AMD64'",
   "gguf>=0.17.0",
   # CLI dependencies
   "typer>=0.9.0",

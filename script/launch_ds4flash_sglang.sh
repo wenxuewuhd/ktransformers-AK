@@ -1,3 +1,15 @@
+#!/usr/bin/env bash
+# DeepSeek-V4-Flash 8 卡 NPU + DeepEP + DP Attention（Ascend）。
+# 若在 ktransformers-AK 根目录执行：自动把 PYTHONPATH 指到 third_party/sglang/python；
+# 若在独立 sglang 仓库根目录执行且存在 ./python：仍可用 export PYTHONPATH=${PWD}/python（见下方分支）。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -d "$REPO/third_party/sglang/python" ]]; then
+  export PYTHONPATH="${REPO}/third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
+else
+  export PYTHONPATH="${PWD}/python${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 pkill -9 python | pkill -9 sglang
 sleep 3
 pkill -9 python | pkill -9 sglang
@@ -32,9 +44,7 @@ export STREAMS_PER_DEVICE=32
 # torch optimize memory fragmentation
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-# 设置SGLANG代码路径
-export PYTHONPATH=${PWD}/python:$PYTHONPATH
-MODEL_PATH=/workspace/models/DeepSeek-V4-Flash-W8A8/
+MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeek-V4-Flash-W8A8/}"
 
 ### HCCL env
 IFNAMES=eth0  # get name according to ifconfig

@@ -51,6 +51,5 @@ static inline cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t f
 // CUDA gives a static string per error code; ACL only exposes the *most recent*
 // error message on the current thread. Best-effort emulation.
 static inline const char* cudaGetErrorString(cudaError_t /*err*/) {
-  const char* m = aclGetRecentErrMsg();
-  return (m && *m) ? m : "ACL error";
+  return "ACL error";
 }

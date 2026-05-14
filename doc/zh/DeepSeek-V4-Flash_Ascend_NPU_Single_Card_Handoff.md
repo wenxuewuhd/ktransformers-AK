@@ -27,9 +27,13 @@
 
 **目标**：让 DeepSeek-V4-Flash（671B MoE，256 routed experts/层）在**单卡 Atlas 910B (64 GB HBM) + 鲲鹏 920 (1.5 TB DRAM, 192 cores, 8 NUMA)** 上跑起来，方式是把约 16/256 个"热"expert 留 NPU，剩 240/256 走 CPU 端 `kt-kernel`（llamafile GGUF Q8_0 backend, NEON SDOT）。
 
-**当前进度**：
-- ✅ Phase 0 完成：`kt_kernel_ext.cpython-311-aarch64-linux-gnu.so` 在 K920+CANN 上编出来、import 通、`CPUInfer/MOEConfig/MOE` 全 OK，ldd 确认链上 `libascendcl.so` 等 CANN 全套 runtime。
-- ⏳ 下一步：Phase 1.1 写 W8A8→GGUF Q8_0 转换器。
+**当前进度**（2026-05-13）：
+- ✅ Phase 0 完成：`kt_kernel_ext.cpython-311-aarch64-linux-gnu.so` 在 K920+CANN 上编出来、import 通、`CPUInfer/MOEConfig/MOE` 全 OK。
+- ✅ Phase 1.1 + 1.2 完成：W8A8→GGUF Q8_0 转换器 + Llamafile MoE 单层冒烟，43 层 GGUF 已经预生成至 `/workspace/models/cache/`。
+- ✅ Phase 2-B + P2.2 + P2.3 完成：`third_party/sglang` 已切到 baseline **`iforgetmyname/sglang@dsv4_release`**，KT 在 baseline 上 backport 了 `kt_accel.py` 与 `kt_ep_wrapper.py` 三处 NPU-friendly 改动；详见 `Phase0_Phase1_变更记录与复现手册.md §8 / §9`。
+- ✅ **P2.7 wiring 打通**：单卡 NPU + KT(LLAMAFILE) + DSv4-Flash W8A8 服务可以起、能接 `/generate` 并返回 200 OK，e2e_latency ≈ 2.3s。
+- ⏳ **当前阻塞**：生成内容是退化 token（"  !  !  !  !  …" 全是空格 / `!`），属于**数值问题**而非 wiring 问题。诊断与对照实验计划见 §6.11。
+- ⏳ 之后：Phase 3 CPU↔NPU 异步 overlap（性能）、Phase 4 KML 精度回归（可选）。
 
 **关键约束**：K920 是 ARMv8.2-A + NEON SDOT，**没有 SVE / BF16 / I8MM**。kt-kernel 自带的 `Int8_KERNEL_MOE`/`Int4_KERNEL_MOE` 是纯 SVE 汇编写的，在 K920 上跑不通，所以 CPU 这条腿先走 **llamafile GGUF Q8_0**（NEON SDOT 路径），Phase 4 再考虑用 KML libkblas 的 `cblas_gemm_s8s8s32` 替换核心 GEMM 做精度回归。
 
@@ -55,7 +59,7 @@
 | **Python** | `/usr/local/python3.11.14/bin/python3` (3.11.14) |
 | **PyTorch** | `2.8.0+cpu` |
 | **torch_npu** | `2.8.0.post2+gitdef4a1c`（已确认支持 `pin_memory=True`）|
-| **SGLang** | `0.1.dev11474+g298193eb3.d20260424`（kvcache-ai fork，路径 `/sgl-workspace/sglang/`，repo 里 `third_party/sglang/`）|
+| **SGLang** | 容器内常有**第二份**树（如 `/sgl-workspace/sglang/`）或 pip 安装的包；与本仓库 **`third_party/sglang/`** 可能**不是同一代码**。跑 Phase 2 / `launch_server` 前必须 `export PYTHONPATH=<repo>/third_party/sglang/python:$PYTHONPATH` 并 `python -c "import sglang; print(sglang.__file__)"` 自检。 |
 | **KML** | 2.5.0，安装在 `/usr/local/kml/`（headers + `libkml_rt.so.2.5.0` + `libkblas_armv8p_v2.5.0.so`，已 ldconfig）|
 | **hwloc** | `libhwloc-dev:arm64 2.7.0-2ubuntu1`（kt-kernel 硬依赖，用 `apt --allow-unauthenticated` 装的）|
 | **numactl** | 已装 |
@@ -161,14 +165,17 @@ Phase 1 单层 PoC（数值正确性）
    └── P1.2 单层 hybrid demo（可选；做了能精确定位整网精度问题，跳了靠整网 ref 验证）
 
 Phase 2 SGLang 整网集成（核心 milestone：整网在 K920+1 张 910B 上跑通）
-   ├── P2.1 解除 SGLang 上游 NPU "kt-* unsupported" gate
-   ├── P2.2 kt_ep_wrapper.py device-agnostic 化（cuda↔npu）
-   ├── P2.3 DSv4 模型代码集成 KTMoEWrapper
-   ├── P2.4 43 层 GGUF 权重批量转换（运行 P1.1 转换器 ×43）
-   ├── P2.5 NPU 16 个 hot expert 选取策略
-   ├── P2.6 禁用 NEXTN + 单卡 attention 路径
-   ├── P2.7 sglang serve 端到端测试
-   └── P2.8 HBM/DRAM 占用 sanity check
+   ├── P2.1 ✅ 解除 SGLang 上游 NPU "kt-* unsupported" gate（baseline 自带）
+   ├── P2.2 ✅ kt_ep_wrapper.py device-agnostic 化（kt_accel.py）
+   ├── P2.3 ✅ DSv4 模型代码集成 KTMoEWrapper（baseline 自带 + 3 处下游 patch）
+   ├── P2.4 ✅ 43 层 GGUF 权重批量转换（/workspace/models/cache/dsv4_layer*.gguf）
+   ├── P2.5 ⏳ NPU 16 个 hot expert 选取策略（第一版 [0..15]，待 dump activation 优化）
+   ├── P2.6 ✅ 禁用 NEXTN + 单卡 attention 路径
+   ├── P2.7 ✅ sglang serve **wiring 跑通**（curl /generate → 200，e2e 2.3s）
+   ├── P2.8 ✅ HBM/DRAM 占用 sanity check（max_total_tokens=4.27M，avail 7.92 GB）
+   ├── P2.9 ✅ 基线对齐：third_party/sglang 切到 iforgetmyname/sglang@dsv4_release
+   ├── P2.10 ✅ Triton-on-NPU 不可用的全局兜底（allocator_npu / mem_cache/common）
+   └── P2.11 ⏳ **数值对账**：生成内容退化（全 padding/`!`）的根因诊断 + 修复
 
 Phase 3 性能：CPU↔NPU 异步 overlap
    ├── 落地 aclrtSubscribeReport + aclrtProcessReport 后台线程
@@ -615,7 +622,7 @@ wrapper = LlamafileMoEWrapper(
     cpuinfer_threads=24,
     threadpool_count=8,
     weight_path="/workspace/models/cache/dsv4_layer3.gguf",
-    chunked_prefill_size=4,
+    chunked_prefill_size=4096,
     numa_nodes=list(range(8)),
 )
 wrapper.load_weights()
@@ -652,7 +659,7 @@ assert torch.isfinite(output).all()
 
 ## 6. Phase 2：SGLang 整网集成
 
-**这是核心 milestone**：完成后能 `sglang serve --tp 1 --kt-method LLAMAFILE --kt-num-gpu-experts 16` 起服务，整网 forward 通。
+**这是核心 milestone**：完成后能在 **`PYTHONPATH=<repo>/third_party/sglang/python`** 前提下 `python -m sglang.launch_server --tensor-parallel-size 1 --kt-method LLAMAFILE --kt-num-gpu-experts 16` 起服务，整网 forward 通。
 
 ### 6.1 P2.1：解除 SGLang 上游 NPU "kt-* unsupported" gate
 
@@ -803,37 +810,73 @@ masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts=16*43)
 - 检查 `deepseek_v4.py` 里 `num_nextn_predict_layers` forward 路径走不到（多半 sglang 已经有 if-guard）
 - attention（含 NSA/Lightning Indexer/Compressor）**已经在 NPU**，8 卡部署证明能跑。单卡时去掉 EP/TP all-to-all（EP=1 时 DeepEP 自动退化）
 
-### 6.7 P2.7：sglang serve 端到端测试
+### 6.7 P2.7：sglang serve 端到端测试（wiring 已通，数值未通）
+
+**当前状态（2026-05-13）**：服务能起、能接请求、HTTP 200，但 `text` 内容是退化 token。建议直接走脚本（已内置 PYTHON_BIN 探测、CANN env、参数对齐基线 8 卡子集）：
 
 ```bash
-ulimit -n 65536
-ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.0 \
-LD_LIBRARY_PATH=/usr/local/kml/lib:$LD_LIBRARY_PATH \
-python -m sglang.launch_server \
+# 推荐入口（与基线 launch_ds4flash_sglang.sh 取单卡子集）
+ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/p27.log
+
+# 临时调试附加 flag（不改脚本本体）
+EXTRA_FLAGS="--disable-cuda-graph" bash $REPO/tools/p27_launch_ds4flash_npu.sh
+EXTRA_FLAGS="--cuda-graph-bs 2"    bash $REPO/tools/p27_launch_ds4flash_npu.sh
+ASCEND_LAUNCH_BLOCKING=1 ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh  # 同步执行
+```
+
+脚本内部等价的 `sglang.launch_server` 命令（截至当前 commit）：
+
+```bash
+python3 -m sglang.launch_server \
     --model-path /workspace/models/DeepSeek-V4-Flash-W8A8 \
-    --device npu --tp 1 \
+    --device npu --tensor-parallel-size 1 \
+    --page-size 128 \
     --attention-backend ascend \
     --quantization compressed-tensors \
+    --disable-shared-experts-fusion \
+    --dtype bfloat16 \
+    --trust-remote-code \
+    --mem-fraction-static 0.85 \
+    --cuda-graph-bs 1 \
+    --disable-radix-cache \
+    --max-prefill-tokens 65535 \
+    --context-length 65536 \
+    --watchdog-timeout 18000 \
+    --skip-server-warmup \
     --kt-method LLAMAFILE \
     --kt-num-gpu-experts 16 \
-    --kt-weight-path "/workspace/models/cache/dsv4_layer{}.gguf" \
+    --kt-weight-path "/workspace/models/cache/dsv4_layer{layer_idx}.gguf" \
     --kt-threadpool-count 8 \
-    --kt-cpuinfer-threads 24 \
-    --disable-speculative-decoding \
+    --kt-cpuinfer 24 \
     --max-running-requests 1 \
-    --chunked-prefill-size 4 \
+    --chunked-prefill-size -1 \
     --host 0.0.0.0 --port 8000
 ```
 
-测一个 prompt：
+启动期会看到（已属正常路径，不是错）：
 
-```bash
-curl -X POST http://localhost:8000/generate \
-    -H 'Content-Type: application/json' \
-    -d '{"text": "你好，", "sampling_params": {"max_new_tokens": 32, "temperature": 0}}'
+```
+[allocator_npu] Triton driver unavailable (RuntimeError: 0 active drivers ([])); falling back to alloc_extend_naive ...
+[2026-05-13 11:55:22] The server is fired up and ready to roll!
 ```
 
-期望：输出一段 finite token，且与 8 卡部署同 prompt 同 seed 的输出"接近"（容许 Q8_0 量化误差）。
+发请求：
+
+```bash
+bash $REPO/tools/p27_curl_generate.sh
+```
+
+**实测返回**：
+
+```json
+{"text":"  !  !  !  !  ! ! ! ! ! ! ! ! ! ",
+ "output_ids":[223,223,3,223,223,3,...],
+ "meta_info":{"finish_reason":{"type":"length","length":32},
+              "prompt_tokens":2,"completion_tokens":32,
+              "e2e_latency":2.29}}
+```
+
+**结论**：service / scheduler / KV pool / npu graph / KT EP wrapper / W8A8 加载 / RoPE / Compressor 全链 wiring 通，**但模型 forward 数值产生退化输出**。这是 P2.11 要处理的事，**与 Triton fallback 无关**（fallback 只动 KV 索引算术）。诊断顺序见 §6.11。
 
 ### 6.8 P2.8：HBM/DRAM 占用 sanity check
 
@@ -849,11 +892,110 @@ curl -X POST http://localhost:8000/generate \
 
 ### 6.9 Phase 2 验收
 
-- [ ] `sglang serve` 起来后接受 HTTP 请求，输出 token finite
-- [ ] tokens/sec 有 baseline 数据（即使慢，也要记录）
-- [ ] 与 8 卡部署同 prompt 输出语义大致一致
-- [ ] HBM 占用 ≤ 30 GB
-- [ ] 内存 < 1 TB
+- [x] `sglang serve` 起来后接受 HTTP 请求，HTTP 200（finite output_ids，但 token 内容退化，见 §6.11）
+- [ ] tokens/sec 有 baseline 数据（**等数值修对后再录**，否则数字无意义）
+- [ ] 与 8 卡部署同 prompt 输出语义大致一致 → **未达成**
+- [x] HBM 占用 ≤ 30 GB（实测 avail ~7.92 GB，max_total_tokens=4276224）
+- [x] 内存 < 1 TB
+
+### 6.10 P2.9 + P2.10：基线对齐 + Triton-on-NPU 全局兜底（已完成）
+
+> 这两项是 2026-05-12/13 临时插入的工程项目，已落地；**完整细节**搬到了 `Phase0_Phase1_变更记录与复现手册.md §9`（含改动文件清单、原因、复现命令）。这里只给一句话索引：
+
+| 子项 | 索引 |
+|---|---|
+| **P2.9** `third_party/sglang` 切到 `iforgetmyname/sglang@dsv4_release`，原 `kvcache-ai/sglang` fork 归档为 `third_party/sglang.kvcache-ai-archive`；KT 三处下游 patch（`kt_accel.py` backport + `kt_ep_wrapper.py` 内 KTMoEWrapper 签名适配 + per-layer 模板 + `mask_cpu_expert_routing`） | `Phase0_Phase1_变更记录与复现手册.md §9.1–9.3` |
+| **P2.10** `triton 3.7` × `triton-ascend 3.2` 在该 docker 上版本错配 → 任何 `@triton.jit` kernel 一旦调用就抛 `0 active drivers ([])`；通过 `allocator_npu.py` + `mem_cache/common.py` 里 `_TRITON_DRIVER_AVAILABLE` 探测 + torch fallback 解决（纯整数下标算术，**不影响 forward 数值**） | `Phase0_Phase1_变更记录与复现手册.md §9.4` |
+
+降级开关：`SGLANG_NPU_ALLOC_FORCE_NAIVE=1` 显式强制 torch fallback；将来 wheel 修好探测自动转 True，无需改代码。
+
+### 6.11 P2.11：数值对账计划（**当前阻塞，下一步要做**）
+
+#### 6.11.1 问题描述
+
+```
+prompt:    "你好，"
+output:    "  !  !  !  !  ! ! ! ! ! ! ! ! ! "
+output_ids: [223,223,3,223,223,3,223,223,3,...]   # 空格(223) + "!"(3)
+```
+
+——服务通、e2e 2.29s、`isfinite=True`，但 token 分布严重退化。**与 Triton fallback 无关**（fallback 只动 KV 索引）。
+
+#### 6.11.2 假设清单（按概率从高到低）
+
+| # | 假设 | 验证手段 |
+|---|---|---|
+| H1 | **W8A8 (compressed-tensors / int-quantized) 权重 scale 加载未对齐**，导致 linear/MLA 数值整体崩 | 关 KT、关 cuda-graph，只用 baseline 自带 NPU MoE 看是否一样乱（详见 §6.11.3 实验 B） |
+| H2 | **`mask_cpu_expert_routing` 把 CPU expert 的 GPU 贡献整段置零**，但 CPU 那一路（`KTMoEWrapper.apply`）并未真正回写 hidden_states / 时序错位 | 把 `kt-num-gpu-experts` 调到 **256**（全 NPU expert，等价禁用 KT offload）再跑，看是否变正常 |
+| H3 | RoPE / Compressor 在 W8A8 路径下某个 scale 没接上 | 抓第一/最后一 layer 的 `attn_output` / `hidden_states` 的 `abs().mean()`，与 8 卡基线同 prompt 同位置 dump 对比 |
+| H4 | `--cuda-graph-bs 1` 捕获的 npu graph 对单 token 输入数值不稳 | 加 `EXTRA_FLAGS="--disable-cuda-graph"`，走 eager 看是否还是 `223/3` |
+| H5 | `--dtype bfloat16` 与 `--quantization compressed-tensors` 联合时某个 cast 丢精度 | 临时改 `--dtype float16` 对比 |
+
+#### 6.11.3 内存账（实验设计前必读）
+
+| 配置 | NPU HBM expert 占用 | DRAM expert 占用 | 是否会 OOM |
+|---|---|---|---|
+| `--kt-num-gpu-experts 0` | **0 GB**（NPU 上 0 个 expert 权重） | ≈264 GB（256/层 × 43 × 24 MB GGUF Q8_0） | ❌ 不会 |
+| `--kt-num-gpu-experts 16`（**当前默认**） | ≈16 GB（16/层 × 43 × 24 MB W8A8） | ≈264 GB（仍按 256/层 装载 GGUF；KT 内部按 mask 决定走哪条路） | ❌ 当前已能起，avail 7.92 GB |
+| `--kt-num-gpu-experts 30` | ≈30 GB | ≈264 GB | ⚠️ 接近 HBM 上限 |
+| `--kt-num-gpu-experts 256`（曾误写为「实验 B」） | **≈264 GB**（远超 64 GB HBM） | — | ✅ **必 OOM** |
+
+> 单 W8A8 expert 权重 ≈ 24 MB（gate+up+down 各 8 MB），43 层 × 256 → 264 GB。**单卡不可能把全部 expert 都放 NPU**。所以「全 NPU expert」这个对照不可行；要排除 KT EP 这一路，唯一能做的是反向打满到 **0**。
+
+`--kt-num-gpu-experts 0` 时 `mask_cpu_expert_routing(num_gpu_experts=0)` 的语义：
+```
+is_gpu = topk_ids < 0          # 恒为 False
+safe_ids     = zeros_like(...)  # 所有 id 改写为 0
+safe_weights = zeros_like(...)  # 所有 weight 改写为 0.0
+```
+→ NPU MoE 那一路对每个 token 贡献 0；**真正的 expert 计算全部走 `KTMoEWrapper.submit_forward`（CPU）**。这正是验证「CPU expert 路径本身对不对」的最干净对照。
+
+#### 6.11.4 推荐实验顺序（按时间成本递增）
+
+```bash
+# 实验 A：关 npu graph 走 eager，排除图捕获 / dynamo 重编译干扰
+EXTRA_FLAGS="--disable-cuda-graph" \
+  ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/p27_eager.log
+bash $REPO/tools/p27_curl_generate.sh
+# - 仍乱 → 与图捕获无关（更可能是数值 / mask / 权重）
+# - 变正常 → 图捕获把某条 dynamic shape 路径常量化错了
+
+# 实验 B：把所有 expert 推到 CPU，走纯 KT GGUF Q8_0 路径
+EXTRA_FLAGS="--kt-num-gpu-experts 0" \
+  ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/p27_all_cpu.log
+bash $REPO/tools/p27_curl_generate.sh
+# - 仍乱 → MoE 不是元凶，问题在 attention / MLA / RoPE / Compressor / W8A8 装载
+# - 变正常 → 锁定 NPU MoE 这一路（mask_cpu_expert_routing / GPU expert weight scale / stream 时序）
+
+# 实验 C：A + B 同时（最干净的对照）
+EXTRA_FLAGS="--disable-cuda-graph --kt-num-gpu-experts 0" \
+  ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh
+
+# 实验 D：dump 关键中间张量（A/B 没结论时再做）
+#   在 third_party/sglang/.../models/deepseek_v4.py 的 forward 里：
+#     - embedding 之后
+#     - 第 0 / 第 21 / 倒数第一层的 attn_output
+#     - lm_head 输入 hidden_states
+#   各打一行 `t.float().abs().mean().item(), .max().item()`，与 8 卡基线 dump 对账
+```
+
+#### 6.11.5 失败优先回退预案
+
+- 若实验 **B 仍乱**：基本可以排除 MoE 这一路。回去查：
+  - W8A8 装载（`--quantization compressed-tensors` vs `int-quantized` vs `modelslim`，看 `weight_scale` 是不是被对齐成同一个布局）；
+  - RoPE：DSv4 用 `is_neox_style=True` + `ComplexExpRotaryEmbedding`，确认 `freqs_cis` cos/sin 在 NPU 上的 cast/广播没出错；
+  - Compressor / NSA Lightning Indexer 在 W8A8 路径上是否拿到正确 scale；
+  - `--dtype bfloat16` vs `float16` 临时切换；
+- 若实验 **B 正常 / A + B 正常**：交叉对照证明 KT EP 这一路有问题。重点检查：
+  - `KTEPWrapperMethod.apply` 里 GPU/CPU 两路 hidden_states 的累加顺序与 stream 同步；
+  - `mask_cpu_expert_routing` 是否被 `torch.compile` 把 `num_gpu_experts` const-folded（每次 recompile 看 `[0/N] config.recompile_limit (8)` 警告：现在已经在打 N=8 上限）；
+  - `KTMoEWrapper.submit / sync` 在我们改成 `kt_current_stream_handle` 后是否真的等到了 CPU 那边算完（可临时在 `apply` 末尾加一条 `kt_device_synchronize()` 强同步比一发）；
+  - 16 个 NPU expert 的 W8A8 scale 是否被错误地按"全 256 expert 编号"读取，导致 expert 0..15 拿到了别的 expert 的 scale。
+
+#### 6.11.6 工具增强（建议先做）
+
+- 在 `tools/` 下新建 `p27_dump_tensors.py`：基于 sglang `engine` API，加载同一 `--model-path` + 同 prompt 做 1 token forward，dump 关键中间张量为 `.pt`；同 prompt 在 8 卡基线机器也跑一份，本地用 `torch.allclose` / 余弦相似度比对。
+- `tools/p27_curl_generate.sh` 增加 `--temperature 0 --top-p 1.0 --seed 1` 等参数，保证生成可复现，便于"今天/明天再跑"对比 token-level 是否完全一致。
 
 ---
 
@@ -938,6 +1080,8 @@ curl -X POST http://localhost:8000/generate \
 | **R6** | GGUF 转换器 shape 顺序写反 | 写 GGUF 时用了 PyTorch 顺序而非 column-major | 用 gguf-py 库或先用一个 mini 模型（如 Qwen 一个 layer）验证 |
 | **R7** | NPU HBM 不够装 KV cache | context 太长 + KV 留 NPU | 打开 KV offload to DRAM；或降 `max_running_requests` |
 | **R8** | 上游 `iqk_mul_mat_arm82.cpp` bug 再次出现 | rebase third_party/llamafile 时把已修的 `#define` 又注释掉 | 在 README/CI 加 sanity check：build 后 `nm libllamafile.a \| grep iqk_mul_mat_moe_arm82` 应非空 |
+| **R9** | Triton-on-NPU 看起来"能 import"但实际不可用 | 镜像里 `triton 3.7` + `triton-ascend 3.2` 版本错配，`triton.backends.ascend.compiler` 引用 upstream 已删除的 `AttrsDescriptor` → import 时立即 `ImportError`，运行时 `driver.active` 报 `0 active drivers ([])` | 已在 `allocator_npu.py` / `mem_cache/common.py` 加全局兜底（torch 等价路径，不影响 forward 数值）；将来升级 `triton-ascend` wheel 匹配 triton 3.7 后探测自动转 True |
+| **R10** | `source set_env.sh` 后 `python3` 跑到 `/usr/bin/python3`（系统 python，无 torch_npu/numpy/sglang） | `tools/p27_*` 任何 wrapper 脚本 / cron / systemd 启动 | 已在 `tools/p27_launch_ds4flash_npu.sh` 加 `PYTHON_BIN` 自动探测；如还有别的脚本，请用 `${PYTHON_BIN}` 而非裸 `python3` |
 
 ---
 
@@ -1044,6 +1188,9 @@ with safe_open('/workspace/models/DeepSeek-V4-Flash-W8A8/model-00005-of-00046.sa
 # Phase 1+ 跑 PoC 或 sglang 前请 export
 export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.0
 export LD_LIBRARY_PATH=/usr/local/Ascend/cann-8.5.0/lib64:/usr/local/kml/lib:$LD_LIBRARY_PATH
+# 本仓库 Phase 2 改在 third_party/sglang；与 /sgl-workspace/sglang 或 pip 全局包不是同一份，必须前置 PYTHONPATH：
+# export REPO=/workspace/code/ktransformer/ktransformers-AK
+# export PYTHONPATH="$REPO/third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
 # kt_kernel Python 包：请在 kt-kernel 目录执行 `pip install -e .`（勿仅把 python/ 加进 PYTHONPATH，否则找不到 kt_kernel 包名）
 # export PYTHONPATH=/path/to/kt_kernel_ext_build:$PYTHONPATH   # 若 .so 不在 site-packages，可追加 build 目录（仍建议 pip install -e）
 
@@ -1072,21 +1219,32 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/cann-8.5.0/lib64:/usr/local/kml/lib:$LD
 | `/etc/ld.so.conf.d/kml.conf` | 系统层新增 | 把 `/usr/local/kml/lib` 加进 ldconfig |
 | `kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/*` | 恢复（git） | Phase 4 备用，`git checkout 53f6a6d^ -- <path>` |
 
-### 11.2 待新建（Phase 1+）
+### 11.2 已完成（Phase 1 + Phase 2 wiring）
 
 | 文件 | Phase | 用途 |
 |---|---|---|
 | `tools/convert_w8a8_to_gguf_q8_0.py` | 1.1 | W8A8 单层 → GGUF Q8_0（单进程） |
 | `tools/batch_convert_w8a8_layers_mp.py` | 1.1 | 层间多进程批量转换 + 抽样 GGUFReader 校验 |
-| `tools/phase12_llamafile_moe_smoke.py` | 1.2 | `KTMoEWrapper(LLAMAFILE)` 单层 forward 冒烟 |
-| `tools/_q8_0.py`（可内联） | 1.1 | （已内联于 convert 脚本，可不单独建文件） |
-| `script/poc_dsv4_moe_p11_load.py` | 1.1 | （可选用 phase12 脚本替代） |
-| `script/poc_dsv4_moe_p12_hybrid.py`（可选） | 1.2 | 单层 hybrid（NPU+CPU）对账；也可用 phase12 扩展 |
-| `third_party/sglang/python/sglang/srt/utils/device.py` | 2.2 | 设备无关 stream helper（建议位置） |
-| `third_party/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py` | 2.2 | 改 device-agnostic |
-| `third_party/sglang/python/sglang/srt/models/deepseek_v4.py` | 2.3 | 集成 KTMoEWrapper |
-| `script/launch_single_npu_ds4flash.sh` | 2.7 | 单卡 sglang serve 拉起脚本 |
-| `script/convert_all_layers.sh` | 2.4 | 43 层批量转换 |
+| `tools/phase12_llamafile_moe_smoke.py` | 1.2 | `KTMoEWrapper(LLAMAFILE)` 单层 forward 冒烟（含 `--second-gguf` Phase 2-B 覆盖） |
+| `tools/kt_accel_stream_smoke.py` | 2.2 | 仅测 `kt_accel` stream/event/sync 抽象，不依赖权重 |
+| `tools/run_p22_smoke_checks.sh` | 2.2 | P2.2 三段冒烟（kt_accel + import kt_ep_wrapper + phase12） |
+| `tools/p27_launch_ds4flash_npu.sh` | 2.7 | 单卡 NPU + KT(LLAMAFILE) sglang serve 拉起；含 `PYTHON_BIN` 探测、CANN env、与基线 8 卡参数对齐 |
+| `tools/p27_curl_generate.sh` | 2.7 | 对已起服务发 `/generate` 冒烟 |
+| `third_party/sglang/python/sglang/srt/utils/kt_accel.py` | 2.2 + 2.9 | CUDA↔NPU stream/event/同步抽象（baseline 没有，自 archive backport） |
+| `third_party/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py` | 2.2 + 2.3 + 2.9 | KT EP wrapper：per-layer 模板、`KTMoEWrapper` 签名适配本机 wheel、stream → `kt_accel`、`mask_cpu_expert_routing` 替代 `mask_cpu_expert_ids` |
+| `third_party/sglang/python/sglang/srt/hardware_backend/npu/allocator_npu.py` | 2.10 | Triton driver 探测；不可用时让 `alloc_extend` 走 `alloc_extend_naive`（纯 torch） |
+| `third_party/sglang/python/sglang/srt/mem_cache/common.py` | 2.10 | 同上探测；`write_multi_cache_indices` / `write_cache_indices` / `get_last_loc` 在 driver 不可用时落 torch 等价实现 |
+| `.gitmodules` | 2.9 | `third_party/sglang` → `iforgetmyname/sglang@dsv4_release` |
+| `third_party/sglang.kvcache-ai-archive/` | 2.9 | 旧 `kvcache-ai/sglang` fork 归档，仅作 backport 参考 |
+
+### 11.3 待新建 / 待补（Phase 2.11 + Phase 3+）
+
+| 文件 | Phase | 用途 |
+|---|---|---|
+| `tools/p27_dump_tensors.py`（建议） | 2.11 | 加载同 model + 同 prompt forward 1 token，dump embedding / 中间层 attn_out / lm_head 输入 hidden 等关键张量，便于与 8 卡基线对账 |
+| `tools/p27_curl_generate.sh` 扩展 | 2.11 | 加 `temperature 0 / top_p 1.0 / seed` 参数，保证生成可复现 |
+| Phase 3 callback subscriber | 3 | `aclrtSubscribeReport` + `aclrtProcessReport` 后台线程（详 §7） |
+| Phase 4 KML W8A8 backend | 4 | `cblas_gemm_s8s8s32` 替代 Q8_0（详 §8） |
 
 ---
 
@@ -1157,7 +1315,7 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         cpuinfer_threads: int,            # 24（per NUMA）
         threadpool_count: int,            # 8（NUMA 数）
         weight_path: str,                 # GGUF 文件路径
-        chunked_prefill_size: int,        # 4 (PoC 用小值)
+        chunked_prefill_size: int,        # 须为 page_size 倍数；NPU 默认 page_size=128，如 4096
         cpu_save: bool = False,
         max_deferred_experts_per_token: int | None = None,
         method: str = "LLAMAFILE",

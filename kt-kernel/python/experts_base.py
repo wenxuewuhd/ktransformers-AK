@@ -18,6 +18,68 @@ import ctypes
 from kt_kernel import kt_kernel_ext
 
 
+# -----------------------------------------------------------------------------
+# NPU stream-callback bypass.
+#
+# On Ascend NPU, `CPUInfer::submit_with_cuda_stream` calls `aclrtLaunchCallback`,
+# which inserts the function into a per-stream **callback report queue**. ACL
+# requires a dedicated subscriber thread (registered via `aclrtSubscribeReport`
+# and continuously running `aclrtProcessReport`) to dispatch those callbacks.
+#
+# kt-kernel does NOT currently start such a worker (see
+# `cpu_backend/vendors/ascend_npu.h` — marked TODO Phase 3). Without a
+# subscriber, queued callbacks **silently never fire**, so the CPU forward
+# task never runs and `output_cpu` stays all-zero. `sync_with_cuda_stream`
+# likewise schedules its sync_ via the same callback queue and silently
+# completes without actually syncing anything.
+#
+# Until a callback worker is implemented, we route NPU traffic through the
+# synchronous `CPUInfer::submit()` / `CPUInfer::sync()` API: these execute
+# the task body directly on the calling Python thread, so there is no
+# dependency on a callback worker. The trade-off is loss of CPU/NPU overlap
+# (forward is fully serialized), but correctness > overlap.
+# -----------------------------------------------------------------------------
+
+
+def _should_bypass_stream_callback(device: torch.device) -> bool:
+    """Return True iff we must use the synchronous submit/sync path."""
+    if device.type == "npu":
+        return True
+    if os.environ.get("KT_FORCE_SYNC_SUBMIT", "") == "1":
+        return True
+    return False
+
+
+def _wait_device(device: torch.device) -> None:
+    """Block until pending async copies on `device`'s current stream finish.
+
+    NOTE on graph capture: torch.{cuda,npu}.synchronize() raises during cuda /
+    NPU graph capture (NPU returns ERR 107027 "stream is captured"). Bypass
+    mode runs the CPU forward on the Python main thread, which is **not**
+    captured into the graph anyway, so the sync would only be needed at
+    *capture time*; once the graph is replayed, the CPU function never runs.
+    In other words, bypass mode is fundamentally incompatible with cuda-graph
+    capture (TODO Phase 3 — implement ACL callback subscriber to unblock the
+    async path). Until then we just skip the sync during capture so that the
+    capture step itself doesn't crash; the caller is expected to use
+    ``--disable-cuda-graph`` for actually correct end-to-end runs.
+    """
+    if device.type == "npu":
+        try:
+            if torch.npu.is_current_stream_capturing():
+                return
+        except Exception:
+            pass
+        torch.npu.synchronize(device)
+    elif device.type == "cuda":
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+        except Exception:
+            pass
+        torch.cuda.synchronize(device)
+
+
 def generate_gpu_experts_masks(
     activation_freq: torch.Tensor,
     num_gpu_experts: int,
@@ -417,35 +479,46 @@ class BaseMoEWrapper(_MoEBase, ABC):
         weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
         immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
 
+        bypass = _should_bypass_stream_callback(hidden_states.device)
+        if bypass:
+            # CPU task is about to run on this thread; D2H copies above are
+            # non_blocking on the device's current stream and must finish first
+            # or workers will read stale (or zero) input.
+            _wait_device(hidden_states.device)
+
         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
-        self.cpu_infer.submit_with_cuda_stream(
-            cuda_stream,
-            self.moe.forward_task(
-                bsz_slot_tensor.data_ptr(),
-                immediate_experts_ids_cpu[current_slot].size(-1),
-                immediate_experts_ids_cpu[current_slot].data_ptr(),
-                weights_cpu[current_slot].data_ptr(),
-                input_tensor_cpu[current_slot].data_ptr(),
-                output_cpu[current_slot].data_ptr(),
-                incremental,
-            ),
+        immediate_task = self.moe.forward_task(
+            bsz_slot_tensor.data_ptr(),
+            immediate_experts_ids_cpu[current_slot].size(-1),
+            immediate_experts_ids_cpu[current_slot].data_ptr(),
+            weights_cpu[current_slot].data_ptr(),
+            input_tensor_cpu[current_slot].data_ptr(),
+            output_cpu[current_slot].data_ptr(),
+            incremental,
         )
+        if bypass:
+            self.cpu_infer.submit(immediate_task)
+        else:
+            self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         if deferred_ids is not None:
             deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
-            self.cpu_infer.submit_with_cuda_stream(
-                cuda_stream,
-                self.moe.forward_task(
-                    bsz_slot_tensor.data_ptr(),
-                    deferred_experts_ids_cpu[current_slot].size(-1),
-                    deferred_experts_ids_cpu[current_slot].data_ptr(),
-                    weights_cpu[current_slot].data_ptr(),
-                    input_tensor_cpu[current_slot].data_ptr(),
-                    output_cpu[next_slot].data_ptr(),
-                    False,
-                ),
+            if bypass:
+                _wait_device(hidden_states.device)
+            deferred_task = self.moe.forward_task(
+                bsz_slot_tensor.data_ptr(),
+                deferred_experts_ids_cpu[current_slot].size(-1),
+                deferred_experts_ids_cpu[current_slot].data_ptr(),
+                weights_cpu[current_slot].data_ptr(),
+                input_tensor_cpu[current_slot].data_ptr(),
+                output_cpu[next_slot].data_ptr(),
+                False,
             )
+            if bypass:
+                self.cpu_infer.submit(deferred_task)
+            else:
+                self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
     def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
@@ -472,7 +545,32 @@ class BaseMoEWrapper(_MoEBase, ABC):
 
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
-        self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+        bypass = _should_bypass_stream_callback(hidden_states.device)
+        if bypass:
+            self.cpu_infer.sync(allow_pending)
+        else:
+            self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+
+        if os.environ.get("KT_DEBUG_MOE_OUT", "") == "1":
+            oc = output_cpu[current_slot]
+            ic = _input_tensor_cpu[current_slot]
+            wc = _weights_cpu[current_slot]
+            ec = _immediate_experts_ids_cpu[current_slot]
+            finite_oc = torch.isfinite(oc).all().item()
+            finite_ic = torch.isfinite(ic).all().item()
+            finite_wc = torch.isfinite(wc).all().item()
+            nan_count = int(torch.isnan(oc).sum().item())
+            inf_count = int(torch.isinf(oc).sum().item())
+            print(
+                f"[KT_DEBUG] layer={self.layer_idx} slot={current_slot} bypass={bypass} "
+                f"output_cpu: finite={finite_oc} nan={nan_count}/{oc.numel()} inf={inf_count} "
+                f"first16={oc.float().flatten()[:16].tolist()} | "
+                f"input_cpu.finite={finite_ic} first8={ic.float().flatten()[:8].tolist()} | "
+                f"weights_cpu.finite={finite_wc} first={wc.flatten()[:8].tolist()} | "
+                f"expert_ids={ec.flatten()[:12].tolist()}",
+                flush=True,
+            )
+
         output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
         return output_gpu[current_slot]
 

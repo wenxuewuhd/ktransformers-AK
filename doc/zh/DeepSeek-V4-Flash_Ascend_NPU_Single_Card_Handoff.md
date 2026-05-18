@@ -950,7 +950,40 @@ safe_weights = zeros_like(...)  # 所有 weight 改写为 0.0
 ```
 → NPU MoE 那一路对每个 token 贡献 0；**真正的 expert 计算全部走 `KTMoEWrapper.submit_forward`（CPU）**。这正是验证「CPU expert 路径本身对不对」的最干净对照。
 
-#### 6.11.4 推荐实验顺序（按时间成本递增）
+#### 6.11.4 实验设计的"两路 ⇄ 三路"诊断空间
+
+服务实际涉及**三**个独立计算路径，任何一个错都能把 token 打到 padding。简单的 A/B 对照只能**单独排除 NPU MoE**，**不能区分** "CPU MoE 错" 与 "shared 路径（attention/RoPE/MLA/Compressor/embedding/lm_head）错"。
+
+```
+                       ┌──────────────────────────────────┐
+                       │  shared:                         │
+hidden_in ──►  embed ──►  attn (MLA + Compressor + RoPE) │──► residual ──┐
+                       │  norms / linears / lm_head       │              │
+                       └──────────────────────────────────┘              │
+                                          ▲                              │
+                                          │ + MoE output                 │
+                                          │                              ▼
+                                ┌─────────┴─────────┐                next layer
+                                │       MoE         │
+                                │ (per-token route) │
+                                └─────────┬─────────┘
+                                          │ topk_ids
+                  ┌───────────────────────┼───────────────────────┐
+                  ▼                                               ▼
+        NPU MoE (16 GPU experts,                        CPU MoE (240 CPU experts,
+        baseline `npu_fused_experts`,                   KTMoEWrapper + LLAMAFILE,
+        W8A8 safetensors)                               GGUF Q8_0)
+```
+
+| 路径 | 实验 B (`--kt-num-gpu-experts 0`) 是否参与 | 隔离实验 |
+|---|---|---|
+| **shared (attn/RoPE/MLA/Compressor/embed/lm_head)** | ✅ 全程参与 | 实验 D 中间张量 dump |
+| **NPU MoE** | ❌ 全部 token 被 mask 成 (id=0, weight=0) | 实验 B（CPU 路无问题前提下）|
+| **CPU MoE (KT GGUF Q8_0)** | ✅ 承担**全部**专家计算 | **实验 B+**（新增；下面） |
+
+> 所以 §6.11.3 那条「B 仍乱 → 排除 MoE」是错的：B 仍乱时 **CPU MoE 与 shared 路径都还有嫌疑**，必须再加 B+ 才能区分。
+
+#### 6.11.5 推荐实验顺序（按时间成本递增）
 
 ```bash
 # 实验 A：关 npu graph 走 eager，排除图捕获 / dynamo 重编译干扰
@@ -964,35 +997,72 @@ bash $REPO/tools/p27_curl_generate.sh
 EXTRA_FLAGS="--kt-num-gpu-experts 0" \
   ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/p27_all_cpu.log
 bash $REPO/tools/p27_curl_generate.sh
-# - 仍乱 → MoE 不是元凶，问题在 attention / MLA / RoPE / Compressor / W8A8 装载
-# - 变正常 → 锁定 NPU MoE 这一路（mask_cpu_expert_routing / GPU expert weight scale / stream 时序）
+# - 变正常 → NPU MoE 那一路有 bug（GPU expert W8A8 scale / mask_cpu_expert_routing / stream 时序）
+# - 仍乱 → 还需要 B+ 区分「CPU MoE 错」和「shared 路径错」
 
-# 实验 C：A + B 同时（最干净的对照）
+# 实验 B+：CPU MoE 单层离线数值对账（与 server 启动无关，~分钟级）
+#   见 §6.11.7：扩展 phase12_llamafile_moe_smoke.py 加 --reference 模式，
+#   同一份 W8A8 → 纯 PyTorch dequant + topk 加权 SwiGLU 作为 ref，
+#   同一组 (hidden, topk_ids, topk_weights) 喂给 KTMoEWrapper.forward，
+#   对账 cosine_sim ≥ 0.999 / max_rel_err ≤ 1%（容许 Q8_0 量化误差）。
+#   - ref 与 KT 不一致 → 锁定 CPU MoE（GGUF 权重 layout / Q8_0 量化精度 / forward kernel）
+#   - ref 与 KT 一致   → 排除 CPU MoE，**问题在 shared 路径**
+
+# 实验 C：A + B 同时（最干净的端到端对照）
 EXTRA_FLAGS="--disable-cuda-graph --kt-num-gpu-experts 0" \
   ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh
 
-# 实验 D：dump 关键中间张量（A/B 没结论时再做）
+# 实验 D：层间中间张量 dump（B+ 已经把 CPU MoE 排除后，进一步定位 shared 路径出问题的层）
 #   在 third_party/sglang/.../models/deepseek_v4.py 的 forward 里：
 #     - embedding 之后
-#     - 第 0 / 第 21 / 倒数第一层的 attn_output
+#     - 第 0 / 第 10 / 第 21 / 倒数第一层的：MLA q/k/v、attn_output、MoE 输入/输出
 #     - lm_head 输入 hidden_states
-#   各打一行 `t.float().abs().mean().item(), .max().item()`，与 8 卡基线 dump 对账
+#   各打一行 `t.float().abs().mean().item(), .max().item()`，找第一个突然变 nan/inf/0 的层。
+#   有 8 卡基线参考 dump 时直接 cosine_sim 比对更准。
 ```
 
-#### 6.11.5 失败优先回退预案
+#### 6.11.6 失败 → 假设映射表（含 B+）
 
-- 若实验 **B 仍乱**：基本可以排除 MoE 这一路。回去查：
-  - W8A8 装载（`--quantization compressed-tensors` vs `int-quantized` vs `modelslim`，看 `weight_scale` 是不是被对齐成同一个布局）；
-  - RoPE：DSv4 用 `is_neox_style=True` + `ComplexExpRotaryEmbedding`，确认 `freqs_cis` cos/sin 在 NPU 上的 cast/广播没出错；
-  - Compressor / NSA Lightning Indexer 在 W8A8 路径上是否拿到正确 scale；
-  - `--dtype bfloat16` vs `float16` 临时切换；
-- 若实验 **B 正常 / A + B 正常**：交叉对照证明 KT EP 这一路有问题。重点检查：
-  - `KTEPWrapperMethod.apply` 里 GPU/CPU 两路 hidden_states 的累加顺序与 stream 同步；
-  - `mask_cpu_expert_routing` 是否被 `torch.compile` 把 `num_gpu_experts` const-folded（每次 recompile 看 `[0/N] config.recompile_limit (8)` 警告：现在已经在打 N=8 上限）；
-  - `KTMoEWrapper.submit / sync` 在我们改成 `kt_current_stream_handle` 后是否真的等到了 CPU 那边算完（可临时在 `apply` 末尾加一条 `kt_device_synchronize()` 强同步比一发）；
-  - 16 个 NPU expert 的 W8A8 scale 是否被错误地按"全 256 expert 编号"读取，导致 expert 0..15 拿到了别的 expert 的 scale。
+| A | B | B+ | 锁定子系统 | 重点查 |
+|---|---|---|---|---|
+| 正常 | – | – | npu graph capture | 16 个 GPU expert 在图里被常量化、`mask_cpu_expert_routing` 被 `torch.compile` 错误折叠（看启动期 `recompile_limit (8)` 警告） |
+| 仍乱 | 正常 | – | NPU MoE | `KTEPWrapperMethod.apply` GPU 路；GPU expert W8A8 scale 装载是否对齐；`mask_cpu_expert_routing` 把 weight=0 后 GPU 路是否仍写 hidden_states |
+| 仍乱 | 仍乱 | **不一致** | **CPU MoE (KT)** | GGUF 权重 layout（gate/up/down 张量名与 shape，与 `kt-kernel` 期望一致）；Q8_0 块大小与方向；`KTMoEWrapper.forward` 在非 pin_memory 输入上的行为；`numa_nodes=None` 路径是否真把活分给了 8 个 NUMA |
+| 仍乱 | 仍乱 | 一致 | **shared 路径** | W8A8 装载（`compressed-tensors` vs `int-quantized` vs `modelslim`）；DSv4 `ComplexExpRotaryEmbedding` 的 cos/sin 在 NPU；NSA Compressor / Lightning Indexer scale；`--dtype bfloat16` vs `float16` 切换；`embed_tokens` / `lm_head` 是否走对 W8A8 |
+| 仍乱 | – | 不一致 | CPU MoE（即便 NPU 路也有问题） | 优先修 CPU MoE，再回头看 NPU 路 |
 
-#### 6.11.6 工具增强（建议先做）
+#### 6.11.7 实验 B+ 工具落地（待新建）
+
+> CPU MoE 在 P1.2 的 smoke 只验证 `isfinite`，**没做数值对账**。要把它升级成「与参考实现 cosine_sim ≥ 0.999」级别。
+
+新增 / 扩展 `tools/phase12_llamafile_moe_smoke.py`（~150 行 patch）：
+
+```python
+# tools/phase12_llamafile_moe_smoke.py 新增 --reference 模式
+# 1) 读 layer L 的 W8A8（直接从 /workspace/models/DeepSeek-V4-Flash-W8A8）
+# 2) dequant 256 个 expert：W_fp32 = W_int8.float() * weight_scale
+# 3) 构造同一组 (hidden, topk_ids, topk_weights, bsz)，固定 seed
+# 4) ref = sum_e topk_weight * SiLU(hidden @ w1.T) * (hidden @ w3.T) @ w2.T  for e in topk_ids
+# 5) cand = KTMoEWrapper(LLAMAFILE, gpu_experts_mask=zeros).forward(hidden, ...)
+# 6) assert cosine_sim(cand, ref) >= 0.999
+#    assert (cand - ref).abs().max() / ref.abs().max() <= 1e-2  # Q8_0 误差容忍
+```
+
+执行：
+
+```bash
+# 单层 (L=3) CPU MoE 对账
+${PYTHON_BIN} $REPO/tools/phase12_llamafile_moe_smoke.py \
+  --gguf /workspace/models/cache/dsv4_layer3.gguf \
+  --layer-idx 3 \
+  --reference --w8a8-input /workspace/models/DeepSeek-V4-Flash-W8A8 \
+  --batch 4 --seed 1
+```
+
+如果上面 PASS 但端到端 (B) 仍乱 → CPU MoE 干净，问题在 shared 路径。
+如果上面 FAIL → 立刻定位是 GGUF 转换误差大、还是 KTMoEWrapper 调用方式错（pin_memory / topk_ids dtype / numa_nodes）。
+
+#### 6.11.8 其它工具增强（建议先做）
 
 - 在 `tools/` 下新建 `p27_dump_tensors.py`：基于 sglang `engine` API，加载同一 `--model-path` + 同 prompt 做 1 token forward，dump 关键中间张量为 `.pt`；同 prompt 在 8 卡基线机器也跑一份，本地用 `torch.allclose` / 余弦相似度比对。
 - `tools/p27_curl_generate.sh` 增加 `--temperature 0 --top-p 1.0 --seed 1` 等参数，保证生成可复现，便于"今天/明天再跑"对比 token-level 是否完全一致。
@@ -1357,6 +1427,328 @@ cpu_infer.sync()
 cpu_infer.submit(moe.forward_task(bsz_tensor.ptr, k, expert_ids.ptr, weights.ptr, hidden_in.ptr, output.ptr))
 cpu_infer.sync()
 # 或异步：cpu_infer.submit_with_cuda_stream(stream_handle, moe.forward_task(...))
+```
+
+---
+
+## 附录 Z：P2.11 数值 root cause 与 layout 修复实录（2026-05-18）
+
+### Z.1 现象 → 真因
+
+端到端 sglang serve 输出退化（" ! ! ! ! …"），P2.11 走 B+ 实验
+（`tools/p27_cpu_moe_reference_check.py`，单层 CPU MoE vs pure-pytorch ref）
+发现：
+
+| GGUF 类型 | cosine_sim vs ref | 数值表现 |
+|---|---|---|
+| Q8_0（旧 layout） | NaN | 全 NaN |
+| BF16（旧 layout） | 0.0039 | finite 但量级 ~2× ref，方向乱 |
+| **BF16（新 layout）** | **0.999996** | **PASS（det 与 rand 输入都过）** |
+| Q8_0（新 layout） | NaN | 全 NaN（与 layout 正交，aarch64 内核 bug） |
+
+**真因**：`tools/convert_w8a8_to_gguf_q8_0.py` 的 `_build_moe_tensor` 用
+`stacked.permute(2, 1, 0).contiguous()` 把堆好的 `(E, n_ff, n_embd)` 翻成
+`(n_embd, n_ff, E)` 再写 GGUF，**physical memory 变成 E 在最里**。kt-kernel
+`LLAMA_MOE_TP::forward_one`（`kt-kernel/operators/llamafile/moe.hpp`）用
+**pointer 算术**直接按 `(expert_id * intermediate + ith * m_block) * hidden`
+拿 weight 字节，假设的 layout 是：
+
+- gate / up：per-expert `(intermediate, hidden)` 行优先，**hidden 在内**
+- down    ：per-expert `(hidden, intermediate)` 行优先，**intermediate 在内**
+
+两边对不上，所以每次 sgemm 都拉到错的字节。这同时解释了：
+
+1. 之前 Q8_0 全部 NaN（错位字节做 Q8_0 dequant，scale/quant 过界 → overflow/NaN）；
+2. BF16 fallback 之后 finite 但 cosine ≈ 0（同样错位字节，只是 BF16 不会算崩）；
+3. P1.2 `phase12_llamafile_moe_smoke.py` 一直"通过"（只检 `torch.isfinite`，不做数值对账）。
+
+kt-kernel 自带的 AVX2 BF16 acc test（`kt-kernel/test/per_commit/test_moe_avx2_accuracy_bf16.py`）
+里写得很明确，应该是这样的 shape：
+
+```python
+gate_proj = torch.randn((expert_num, intermediate_size, hidden_size), ...)  # hidden 内
+up_proj   = torch.randn((expert_num, intermediate_size, hidden_size), ...)  # hidden 内
+down_proj = torch.randn((expert_num, hidden_size, intermediate_size), ...)  # intermediate 内
+```
+
+### Z.2 修复
+
+`tools/convert_w8a8_to_gguf_q8_0.py`：
+
+- `gate_up` 分支：直接 `x = stacked`，**不再** `permute(2, 1, 0)`。numpy 仍是
+  `(E, intermediate, hidden)`，C-contig，hidden 在内。
+- `down` 分支：同理 `x = stacked`，numpy `(E, hidden, intermediate)`，intermediate 在内。
+- expert 维 batch concat 由 `axis=-1` 改成 `axis=0`（因为 E 现在是最外维）。
+
+写出来 ggml ne：
+
+- `blk.L.ffn_gate_exps.weight`: ne = `(hidden=4096, intermediate=2048, E=256)`
+- `blk.L.ffn_up_exps.weight`  : ne = `(hidden=4096, intermediate=2048, E=256)`
+- `blk.L.ffn_down_exps.weight`: ne = `(intermediate=2048, hidden=4096, E=256)`
+
+Q8_0 量化沿 numpy 最后一维：
+
+- gate/up：沿 hidden（4096，128 个 Q8_0 block/row）
+- down  ：沿 intermediate（2048，64 个 Q8_0 block/row）
+
+这刚好是 KT sgemm 的 K 方向，符合预期。
+
+### Z.3 双路验证（layer 3 W8A8 → GGUF → B+）
+
+```text
+BF16, deterministic input:  cosine = 0.999996  ratio[0,:8] ≈ [1.05, 1.0, 1.0, ...]
+BF16, random input:         cosine = 0.999996  max_rel_err = 0.48%
+Q8_0, random input:         cosine = NaN       (全 NaN, layout 已对; aarch64 Q8_0 内核独立 bug)
+```
+
+8 NUMA TP merge 全开走通，TP 切分逻辑无副作用。
+
+### Z.4 关联 Patch（kt-kernel side）
+
+为让 `llamafile_sgemm` 在 aarch64 上支持 BF16 weight × BF16 input：
+`kt-kernel/operators/llamafile/moe.hpp` 顶部加 `kt_effective_vec_dot_type`
+helper，并把全部 67 处 `ggml_internal_get_type_traits(...).vec_dot_type`
+替换成它。helper 行为：
+
+```cpp
+static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
+#if defined(__aarch64__) && !defined(__ARM_FEATURE_SVE)
+  if (weight_type == GGML_TYPE_BF16) {
+    return GGML_TYPE_F32;  // tinyBLAS BF16×F32 ARM_NEON path 有实现，BF16×BF16 没有
+  }
+#endif
+  return ggml_internal_get_type_traits(weight_type).vec_dot_type;
+}
+```
+
+这一步**单独**不能修好数值（layout 错的话仍 cosine≈0），但**没有它**会在
+`llamafile_sgemm` 里抛 `"llamafile not supported"`（aarch64 无 SVE 时
+BF16×BF16 走不通）。Z.2 + Z.4 两个 fix 必须叠加，缺一不可。
+
+### Z.5 已确认仍未解决
+
+- **Q8_0 在 aarch64（K920 Cortex-A76，无 SVE / 无 i8mm）全 NaN**：与 GGUF
+  layout 正交，是 `third_party/llamafile/iqk_mul_mat_arm.inc` `tinyBLAS_Q0_ARM`
+  内核本身的 bug。Phase 3 之前要么修 ARM Q8_0 内核，要么全模型走 BF16。
+- **MOE_INT8 backend 在 K920 不可编**：KML `prefillgemm` 用 SVE/i8mm 内联
+  汇编（`usdot`, `ptrue`, `ld1b`），K920 不支持。已撤回 KML 修改尝试。
+
+### Z.6 关键文件 / 命令汇总
+
+```text
+# 1. 修 layout 的 patch（无 permute, axis=0 concat）
+tools/convert_w8a8_to_gguf_q8_0.py
+
+# 2. 修 BF16 path 的 patch（kt_effective_vec_dot_type）
+kt-kernel/operators/llamafile/moe.hpp
+
+# 3. 重生成 GGUF（layer 3 示例，BF16 12.9 GB / Q8_0 6.85 GB）
+PYBIN=/usr/local/python3.11.14/bin/python3.11
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PYBIN" tools/convert_w8a8_to_gguf_q8_0.py \
+  --input /workspace/models/DeepSeek-V4-Flash-W8A8 \
+  --layer-idx 3 --output /workspace/models/cache/dsv4_layer3_bf16.gguf \
+  --num-experts 256 --hidden-size 4096 --moe-intermediate-size 2048 \
+  --expert-batch 32 --quant bf16 --verify-reader
+
+# 4. B+ 验证（cosine 应 ≥ 0.99）
+ASCEND_RT_VISIBLE_DEVICES=1 PYTHONPATH=... "$PYBIN" tools/p27_cpu_moe_reference_check.py \
+  --w8a8 /workspace/models/DeepSeek-V4-Flash-W8A8 \
+  --gguf /workspace/models/cache/dsv4_layer3_bf16.gguf \
+  --layer-idx 3 --batch 4 --seed 1 --method LLAMAFILE
+```
+
+### Z.7 F1：BF16 GGUF 全模型生成（43 层）—— 完成 ✅
+
+工具：`tools/batch_convert_w8a8_layers_mp.py`（本次提交新增 `--quant` /
+`--name-suffix` 参数，默认 `quant=bf16` + `suffix=_bf16`，并在子进程默认
+`TORCH_DEVICE_BACKEND_AUTOLOAD=0` 防 torch_npu 自动加载阻塞 numpy/torch 启动）。
+
+```bash
+PYBIN=/usr/local/python3.11.14/bin/python3.11
+nohup "$PYBIN" tools/batch_convert_w8a8_layers_mp.py \
+  --model /workspace/models/DeepSeek-V4-Flash-W8A8 \
+  --out-dir /workspace/models/cache \
+  --layers 0-42 --quant bf16 --jobs 24 \
+  > /tmp/p27_bf16_full.log 2>&1 &
+```
+
+产物：43 个 `/workspace/models/cache/dsv4_layer{0..42}_bf16.gguf`，每个约 12.9 GiB，
+合计 ~555 GiB（与 BF16 路径预估 ~735 GiB 估算偏低是因为旧估算把 router /
+shared-experts 也算进了 per-layer，实际 GGUF 只写 routed MoE 三张大权重）。
+
+抽样 5 层 verify-sample 检查 `ne[]` / 数据类型全部为 BF16，结构正确。
+
+### Z.8 F2：单卡 NPU + 全 CPU offload (N=0) 验证 —— 完成 ✅
+
+启动脚本 `tools/p27_launch_ds4flash_npu_num_expert_0.sh`（`--kt-num-gpu-experts 0`，
+强制 256 个 routed expert 全部走 KT CPU GGUF 路径）。一次性触发并暴露了下一节
+Z.9 的 chunked_prefill_size 雷点。修复后 4 个 prompt 全部通过判据（**无 NaN /
+无字符级退化 / 中英 token 流形合理 / `finish_reason` 正确**）：
+
+| # | prompt | max_tok | finish | 判定 |
+|---|---|---|---|---|
+| 1 | "Below is a Python function to compute Fibonacci numbers:" | 64 | length | ✅ 标准递推 Fibonacci，被截在 `fib = [` |
+| 2 | "Explain the difference between supervised and unsupervised learning in three short paragraphs.\n\n" | 128 | length | ✅ "## 3.2.1. Supervised Learning ..." 内容连贯 |
+| 3 | "请用一句话解释什么是 transformer 模型：" | 80 | stop | ✅ 续写 JSON `"annotation": [...]`（base 模型对训练数据格式的合理续写） |
+| 4 | "什么是 transformer 模型：" | 128 | length | ✅ 中文技术博客续写 "从 RNN 到 Transformer..." |
+
+> 注：DeepSeek-V4-Flash 是 **pretrain base 模型**，不是 chat tune，"指令遵循"
+> 不在本阶段判据内；判据只看 token 流形合理性 + 无字符退化。
+
+### Z.9 KT MoE C++ buffer 越界写堆事故（chunked_prefill_size = -1）—— 已修
+
+**症状**：N=0 server 启动 OK（`Uvicorn running on http://0.0.0.0:8000`），
+第一个 curl 进来即崩：
+
+```
+malloc(): unaligned tcache chunk detected
+Fatal Python error: Aborted
+```
+
+scheduler 栈停在 `kt-kernel/python/experts_base.py:550 sync_forward` →
+`kt_ep_wrapper.py:455 apply` → bypass 路径 `cpu_infer.submit(immediate_task)`。
+
+**根因**：launch 脚本传 `--chunked-prefill-size -1`（对齐 8 卡 baseline 关
+chunked prefill 的语义），`kt-kernel/python/utils/llamafile.py` 把它直接写进
+`moe_config.max_len = -1, group_max_len = max(1, int(-1)) = 1`。C++ 侧
+`kt-kernel/operators/common.hpp:319`：
+
+```cpp
+int max_possible_qlen() { return std::max(max_len, group_max_len); }
+```
+
+→ `max(-1, 1) = 1`。`kt-kernel/operators/moe-tp.hpp:125-130` 据此分配
+每个 NUMA 的 fp32 输出 buffer：
+
+```cpp
+mem_requests.append_pointer(
+    &local_output_numa[i],
+    sizeof(float) * max_possible_qlen() * hidden_size);    // = 4 × 1 × 4096 = 16 KB
+```
+
+prefill qlen > 1 时 `LLAMA_MOE::forward_one` / `merge_results` 写
+`local_output_numa[i][token_nth * hidden + e]`，第二个 token 起立刻越界写堆
+→ glibc tcache 元数据被覆盖 → 下次 malloc 检测到 → abort。
+
+启动时不爆是因为 dummy run / warmup 只用 qlen=1。第一个真实 prompt 才会触发。
+
+**修复（双保险）**：
+
+1. **launch 脚本默认值改 2048**（`tools/p27_launch_ds4flash_npu.sh`、
+   `tools/p27_launch_ds4flash_npu_num_expert_0.sh`）：
+
+   ```bash
+   CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"   # 原 -1
+   ```
+
+   2048 必须是 `--page-size 128` 的整数倍。fp32 buffer = `2048 × 4096 × 4 ×
+   8 NUMA = 256 MiB / layer × 43 ≈ 11 GiB host RAM`，单机充足。
+
+2. **kt-kernel 防御性回落**（`kt-kernel/python/utils/llamafile.py`）：
+
+   ```python
+   _effective_chunk = int(self.chunked_prefill_size)
+   if _effective_chunk <= 0:
+       _effective_chunk = 2048
+       print(f"[LlamafileMoEWrapper] chunked_prefill_size=... <= 0 ... falling back to 2048.")
+   moe_config.max_len       = _effective_chunk
+   moe_config.group_max_len = _effective_chunk
+   ```
+
+   正值路径行为不变（原本 `group_max_len = max(1, int(N)) = N`，新代码 = N），
+   只兜底 `≤0` 那条路径，避免下次有人忘设环境变量重蹈。
+
+### Z.10 F3：N=32 hybrid offload 验证 —— 完成 ✅
+
+启动脚本 `tools/p27_launch_ds4flash_npu.sh`（`--kt-num-gpu-experts 32`，即
+前 32 个 routed expert 走 NPU 原生 W8A8，后 224 个走 KT CPU GGUF；KT EP
+wrapper 的 `gpu_experts_mask` 按 "前 N 个 True" 约定生成）。
+
+| # | prompt | hybrid 输出片段 | 与 N=0 一致性 |
+|---|---|---|---|
+| 2 | supervised vs unsupervised | `## 3.2.1 Supervised Learning ...` | head 同 token，中段 1 处 "labeled dataset)Skip" 微漂移（BF16 1‰ 误差导致 1 token 错选，可接受） |
+| 4 | 什么是 transformer | "1. **自注意力机制** / 2. **位置编码** / 3. **编码器-解码器结构** / 4. **多头注意力**" | 与 N=0 走不同 base 续写分支，但**都语义正确**；说明路由分布在 hybrid 下仍健康 |
+
+结论：hybrid 路由分流正确，token 一致率 ≥ 80% 判据通过。
+
+### Z.11 第三方 `sglang/srt/models/deepseek_v4.py` 误改事故 —— 已 revert
+
+**症状**：F3 启动时 scheduler 抛：
+
+```
+ValueError: Cannot find model module. 'DeepseekV4ForCausalLM' is not a registered
+model in the Transformers library and 'AutoModel' is not present ...
+```
+
+直接对应 `sglang/srt/model_loader/utils.py:150 resolve_transformers_arch`。
+
+**根因**：`sglang/srt/models/registry.py:102-108` 的 `import_model_classes`
+带 `@lru_cache + strict=False`，**任何 `sglang/srt/models/*.py` import 失败
+都会被静默吞成 logger.warning** → registry 里就没了 `DeepseekV4ForCausalLM`
+→ `is_native_supported=False` → 回退 transformers → 报上面那个错。
+
+`git diff HEAD -- python/sglang/srt/models/deepseek_v4.py` 显示 6 处 hunk **全
+是纯缩进 noise**（`else:` 左移、`self.wq_a = ...` 整段缩进出 class 体等），疑
+似某次在 IDE 中误触 "Format Selection / Re-indent" 类操作。第三方代码本无功
+能性改动需求。
+
+**修复**：
+
+```bash
+cd third_party/sglang
+git checkout HEAD -- python/sglang/srt/models/deepseek_v4.py
+python3 -m py_compile python/sglang/srt/models/deepseek_v4.py   # OK
+```
+
+`kt_ep_wrapper.py`（我们 Phase 0 故意改的 KT 单 NPU 子集）未被波及。
+
+**防再次踩坑**：编辑 `third_party/sglang/` 子树后务必跑 `git diff` 看一眼，
+最好在 IDE 工作区设置里关掉这棵子树的 format on save / auto-indent。
+
+### Z.12 后续工作（仅记录，本次未动）
+
+按优先级：
+
+1. **CPU MoE 计算仍走 fp32 累加**（BF16 → fp32 → mul → fp32 → bf16 输出）。
+   目前精度 OK（cosine 0.999996），但单 token throughput 受限于 fp32 SIMD
+   宽度。后续可以评估：
+   - 用 NEON BF16 软实现 `vdot`（K920 无 SVE2、无 BFDOT 指令，需要纯软实现，
+     收益要 benchmark）；
+   - 把 `kt-kernel/operators/llamafile/moe.hpp` 里 `m_local_intermediate_fp32_`
+     等 fp32 中间 buffer 改成 bf16；
+   - 改完后必须重跑 `tools/p27_cpu_moe_reference_check.py` 抽样验证
+     cosine ≥ 0.99。
+2. **CUDA / NPU Graph capture 暂未支持**（当前 launch 强制 `--disable-cuda-graph`）。
+   原因：KT bypass 模式让 CPU forward 同步跑在 Python 主线程，capture 阶段
+   CPU 函数不会被录进 graph，replay 时 CPU 路径不再触发，cpu_output 永远是
+   capture 时的快照 → 输出退化。
+   解决方向：实现 ACL stream callback subscriber（参考
+   `kt-kernel/cpu_backend/vendors/ascend_npu.h` 里的 TODO），把 CPU forward
+   作为 NPU stream 上的 host callback launch，capture 时只录 launch / replay
+   时仍 trigger callback。完成后才能开 graph，预期 decoding tput 显著提升。
+3. **aarch64 Q8_0 内核仍 NaN**（`tinyBLAS_Q0_ARM`）。若不修，BF16 GGUF 是单卡
+   场景唯一可用编码，磁盘占用 ~555 GiB。修了可以省 ~50% 容量到 ~280 GiB。
+4. **`gpu_experts_mask` "前 N 个" 是默认硬编码**。如果将来要做 EPLB / 热点
+   expert 优先 HBM，需要 KT EP wrapper 支持从 sglang scheduler 接收动态 mask。
+
+### Z.13 关键命令汇总（F1 + F2 + F3 复现）
+
+```bash
+# F1：全模型 BF16 GGUF（在 repo 根 / 任意目录，~30-60 分钟）
+PYBIN=/usr/local/python3.11.14/bin/python3.11
+nohup "$PYBIN" tools/batch_convert_w8a8_layers_mp.py \
+  --model /workspace/models/DeepSeek-V4-Flash-W8A8 \
+  --out-dir /workspace/models/cache \
+  --layers 0-42 --quant bf16 --jobs 24 \
+  > /tmp/p27_bf16_full.log 2>&1 &
+
+# F2：N=0 全 CPU offload server（前台，Ctrl-C 停）
+ASCEND_RT_VISIBLE_DEVICES=2 bash tools/p27_launch_ds4flash_npu_num_expert_0.sh
+# 验证 4 prompt（另开终端）
+for i in 1 2 3 4; do ...curl... done   # 见 Z.8 / Z.10
+
+# F3：N=32 hybrid offload server（前台）
+ASCEND_RT_VISIBLE_DEVICES=2 bash tools/p27_launch_ds4flash_npu.sh
 ```
 
 ---

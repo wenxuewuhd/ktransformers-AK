@@ -4,19 +4,37 @@
 
 - 层间并行：使用 ProcessPoolExecutor，每个 worker 子进程调用
   `convert_w8a8_to_gguf_q8_0.py` 处理一层（避免在父进程里重复占内存）。
-- 默认输出：`{output_dir}/dsv4_layer{L}.gguf`
+- 输出文件名：``{output_dir}/{name_prefix}{L}{name_suffix}.gguf``。
+  - ``--quant q8_0``（默认）：name_suffix 默认 ``""``，与历史路径兼容
+    （``dsv4_layer3.gguf``）。
+  - ``--quant bf16``：name_suffix 默认 ``_bf16``，例如 ``dsv4_layer3_bf16.gguf``，
+    便于与同层 Q8_0 共存。
 - 全部完成后可选抽样用 GGUFReader 校验（兼容 NumPy 2）。
 
-示例::
+示例 — Q8_0 全量::
 
   /usr/local/python3.11.14/bin/python3 tools/batch_convert_w8a8_layers_mp.py \\
     --input /workspace/models/DeepSeek-V4-Flash-W8A8 \\
     --output-dir /workspace/models/cache \\
     --layer-start 0 --layer-end 42 \\
+    --quant q8_0 \\
     --jobs 4 \\
     --verify-sample 3
 
-注意：每层约 6.85GB；`--jobs` 过大易打满内存与磁盘带宽，建议 2～8。
+示例 — BF16 全量（aarch64 上 Q8_0 仍 NaN 时走的路径，见 Handoff 附录 Z）::
+
+  /usr/local/python3.11.14/bin/python3 tools/batch_convert_w8a8_layers_mp.py \\
+    --input /workspace/models/DeepSeek-V4-Flash-W8A8 \\
+    --output-dir /workspace/models/cache_bf16 \\
+    --layer-start 0 --layer-end 42 \\
+    --quant bf16 \\
+    --jobs 2 \\
+    --verify-sample 3
+
+容量参考（W8A8 -> GGUF，per layer，DSv4-Flash 256 experts × 4096H × 2048I）：
+  - Q8_0  : 6.85 GiB / layer ×43 = ~295 GiB
+  - BF16  : 12.9 GiB / layer ×43 = ~555 GiB  ← 注意磁盘
+注意：每层 BF16 ~12.9 GB；``--jobs`` 过大易打满内存与磁盘带宽，建议 2～4。
 """
 
 from __future__ import annotations
@@ -46,6 +64,7 @@ def _run_one_layer(
     expert_batch: int,
     hidden_size: int,
     moe_intermediate_size: int,
+    quant: str,
 ) -> tuple[int, int, str]:
     """子进程入口：跑单层转换。返回 (layer_idx, returncode, tail_log)."""
     script = str(_convert_script())
@@ -66,8 +85,15 @@ def _run_one_layer(
         str(hidden_size),
         "--moe-intermediate-size",
         str(moe_intermediate_size),
+        "--quant",
+        quant,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # convert_w8a8_to_gguf_q8_0.py 用 TORCH_DEVICE_BACKEND_AUTOLOAD=0 可绕开 torch_npu
+    # 自加载（与 npu 卡无关），加速纯 numpy/torch CPU 转换；批量场景下默认打开。
+    import os as _os
+    env = _os.environ.copy()
+    env.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     tail = ""
     if proc.stdout:
         tail += proc.stdout[-4000:]
@@ -111,10 +137,39 @@ def main() -> int:
     ap.add_argument("--hidden-size", type=int, default=4096)
     ap.add_argument("--moe-intermediate-size", type=int, default=2048)
     ap.add_argument("--name-prefix", type=str, default="dsv4_layer", help="输出文件名前缀")
-    ap.add_argument("--skip-existing", action="store_true", help="若目标 gguf 已存在且 >1GiB 则跳过")
+    ap.add_argument(
+        "--name-suffix",
+        type=str,
+        default=None,
+        help=(
+            "输出文件名后缀（不含 .gguf）。默认按 --quant 自动选：q8_0 -> ''，"
+            "bf16 -> '_bf16'。手动传入可覆盖。"
+        ),
+    )
+    ap.add_argument(
+        "--quant",
+        type=str,
+        default="q8_0",
+        choices=["q8_0", "bf16"],
+        help=(
+            "Output element type, passthrough to convert_w8a8_to_gguf_q8_0.py。"
+            "q8_0 容量小 ~6.85 GiB/layer，但 aarch64 ARM_NEON 走 tinyBLAS_Q0_ARM 当前 NaN（见 Handoff 附录 Z.5）；"
+            "bf16 容量 12.9 GiB/layer，aarch64 走 BF16×F32 tinyBLAS path（已修复 Z.2 + Z.4），数值健全。"
+        ),
+    )
+    ap.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="若目标 gguf 已存在且 >1GiB 则跳过（按 quant 容量判定的最小阈值）",
+    )
     ap.add_argument("--verify-sample", type=int, default=3, help="结束后随机抽样验证的层数；0 关闭")
     ap.add_argument("--seed", type=int, default=42, help="抽样随机种子")
     args = ap.parse_args()
+
+    if args.name_suffix is None:
+        args.name_suffix = "" if args.quant == "q8_0" else f"_{args.quant}"
+    # Skip threshold: BF16 ~12 GiB, Q8_0 ~6 GiB；用 1 GiB 已经足够区分 "完整 vs 半成品"
+    min_skip_bytes = 1 << 30
 
     model_dir = args.input.expanduser().resolve()
     out_dir = args.output_dir.expanduser().resolve()
@@ -136,8 +191,8 @@ def main() -> int:
 
     tasks: list[tuple] = []
     for lid in layers:
-        outp = out_dir / f"{args.name_prefix}{lid}.gguf"
-        if args.skip_existing and outp.is_file() and outp.stat().st_size > (1 << 30):
+        outp = out_dir / f"{args.name_prefix}{lid}{args.name_suffix}.gguf"
+        if args.skip_existing and outp.is_file() and outp.stat().st_size > min_skip_bytes:
             print(f"[batch] skip existing {outp.name}")
             continue
         tasks.append(
@@ -150,6 +205,7 @@ def main() -> int:
                 args.expert_batch,
                 args.hidden_size,
                 args.moe_intermediate_size,
+                args.quant,
             )
         )
 
@@ -187,7 +243,9 @@ def main() -> int:
         rnd = random.Random(args.seed)
         k = min(args.verify_sample, len(done_layers))
         sample = sorted(rnd.sample(done_layers, k)) if k > 0 else []
-        paths = [out_dir / f"{args.name_prefix}{lid}.gguf" for lid in sample]
+        paths = [
+            out_dir / f"{args.name_prefix}{lid}{args.name_suffix}.gguf" for lid in sample
+        ]
         print(f"[batch] verify-sample k={k} layers={sample}")
         _verify_sample_paths(paths)
 

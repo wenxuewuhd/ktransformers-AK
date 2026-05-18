@@ -209,8 +209,24 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         # Llamafile-specific configuration
         moe_config.m_block = 32  # Parallel block size
         moe_config.group_min_len = 10  # Use forward_one when qlen < 10
-        moe_config.max_len = self.chunked_prefill_size
-        moe_config.group_max_len = max(1, int(self.chunked_prefill_size))
+        # Defensive fallback: chunked_prefill_size <= 0 (e.g. -1 meaning "disabled" in sglang
+        # baseline) would otherwise let C++ compute max_possible_qlen() = max(max_len=-1,
+        # group_max_len=max(1,-1)=1) = 1, sizing per-NUMA fp32 output buffer
+        # (moe-tp.hpp:130 local_output_numa[i]) to a single token. The very first prefill
+        # with qlen > 1 then overruns the buffer and corrupts glibc tcache metadata
+        # (observed as "malloc(): unaligned tcache chunk detected" Fatal Python error).
+        # Clamp to a safe positive value so KT can always alloc a fp32 buffer at least as
+        # large as the per-call qlen the caller will pass.
+        _effective_chunk = int(self.chunked_prefill_size)
+        if _effective_chunk <= 0:
+            _effective_chunk = 2048
+            print(
+                f"[LlamafileMoEWrapper] chunked_prefill_size={self.chunked_prefill_size} "
+                f"<= 0 is unsafe for KT MoE C++ buffer sizing; falling back to "
+                f"{_effective_chunk}."
+            )
+        moe_config.max_len = _effective_chunk
+        moe_config.group_max_len = _effective_chunk
 
         # Set weight pointers
         moe_config.gate_proj = gate_data.data_ptr()

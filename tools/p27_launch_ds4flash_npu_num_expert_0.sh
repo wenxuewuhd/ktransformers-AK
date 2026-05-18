@@ -153,7 +153,7 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --watchdog-timeout 18000 \
   --skip-server-warmup \
   --kt-method LLAMAFILE \
-  --kt-num-gpu-experts 32 \
+  --kt-num-gpu-experts 0 \
   --kt-weight-path "$KT_GGUF_TEMPLATE" \
   --kt-threadpool-count 8 \
   --kt-cpuinfer 24 \

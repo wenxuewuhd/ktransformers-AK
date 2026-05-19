@@ -17,8 +17,9 @@
 //     code waiting on the callback (e.g. CPUInfer::sync_with_cuda_stream) will
 //     hang forever.
 //   * The submit_with_cuda_stream / sync_with_cuda_stream path therefore
-//     requires the host process to also spin up a callback worker (TODO Phase
-//     3). The synchronous CPUInfer::submit() / sync() path works without it
+//     requires the host process to also spin up a callback worker (see
+//     cpu_backend/ascend_callback_worker.cpp). The synchronous CPUInfer::submit()
+//     / sync() path works without it
 //     and is what the Phase 1 PoC uses.
 // ============================================================================
 
@@ -26,6 +27,10 @@
 #include <acl/acl_rt.h>
 
 #include <cstdint>
+
+#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
+#include "../ascend_callback_worker.h"
+#endif
 
 // ---- types -----------------------------------------------------------------
 using cudaStream_t = aclrtStream;
@@ -44,6 +49,9 @@ inline constexpr cudaError_t cudaSuccess = ACL_SUCCESS;
 // semantics. (ACL_CALLBACK_BLOCK can block the host if the device queue
 // is full.) See header note above re: the required subscriber thread.
 static inline cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* userData) {
+#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
+  kt::ascend::ensure_stream_subscribed(stream);
+#endif
   return aclrtLaunchCallback(fn, userData, ACL_CALLBACK_NO_BLOCK, stream);
 }
 

@@ -27,7 +27,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-export PYTHONPATH="${REPO}/third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="${REPO}/third_party/sglang/python:${REPO}/kt-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
 
 # ---------- 选定 Python 解释器 ----------
 # 现象：本镜像默认 PATH 里 ``python3`` 指 ``/usr/bin/python3``（系统 python，没装
@@ -146,7 +146,6 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --dtype bfloat16 \
   --trust-remote-code \
   --mem-fraction-static 0.85 \
-  --disable-cuda-graph \
   --disable-radix-cache \
   --max-prefill-tokens 65535 \
   --context-length 65536 \
@@ -162,8 +161,6 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --host 0.0.0.0 \
   --port "$PORT" \
   ${EXTRA_FLAGS}
-# 关 cuda-graph 原因：kt-kernel NPU bypass 模式 (kt-kernel/python/experts_base.py
-# `_should_bypass_stream_callback`) 把 CPU forward 同步跑在 Python 主线程；graph
-# capture 阶段 CPU 函数不会被录进 graph，replay 时 Python 主线程不再被触发，
-# cpu_output 永远是 capture 时的快照 → 输出错误。Phase 3 把 ACL callback
-# subscriber 实现后再可启用 cuda-graph（见 ascend_npu.h TODO）。
+# cuda-graph 已启用：kt-kernel ACL callback worker + kt_ep_wrapper NPU graph
+# host callback（见 kt-kernel/cpu_backend/ascend_callback_worker.*）。
+# 调试同步路径：KT_FORCE_SYNC_SUBMIT=1；回退无 graph：EXTRA_FLAGS="--disable-cuda-graph"

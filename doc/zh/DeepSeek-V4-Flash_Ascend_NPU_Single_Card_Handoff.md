@@ -1718,14 +1718,15 @@ python3 -m py_compile python/sglang/srt/models/deepseek_v4.py   # OK
      等 fp32 中间 buffer 改成 bf16；
    - 改完后必须重跑 `tools/p27_cpu_moe_reference_check.py` 抽样验证
      cosine ≥ 0.99。
-2. **CUDA / NPU Graph capture 暂未支持**（当前 launch 强制 `--disable-cuda-graph`）。
-   原因：KT bypass 模式让 CPU forward 同步跑在 Python 主线程，capture 阶段
-   CPU 函数不会被录进 graph，replay 时 CPU 路径不再触发，cpu_output 永远是
-   capture 时的快照 → 输出退化。
-   解决方向：实现 ACL stream callback subscriber（参考
-   `kt-kernel/cpu_backend/vendors/ascend_npu.h` 里的 TODO），把 CPU forward
-   作为 NPU stream 上的 host callback launch，capture 时只录 launch / replay
-   时仍 trigger callback。完成后才能开 graph，预期 decoding tput 显著提升。
+2. **CUDA / NPU Graph capture + KT CPU MoE**（任务 2，2026-05 落地）：
+   - `kt-kernel/cpu_backend/ascend_callback_worker.{h,cpp}`：`aclrtSubscribeReport` +
+     后台 `aclrtProcessReport` 线程；`cudaLaunchHostFunc` 前自动 subscribe stream。
+   - `experts_base.py`：NPU 默认走 `submit_with_cuda_stream`（`KT_FORCE_SYNC_SUBMIT=1` 可回退）。
+   - `kt_ep_wrapper.py`：graph capture 路径 `copy_inputs` + `torch_npu.npu._launch_host_func`
+     + `run_pinned_forward_sync`；`cuda_graph_runner` 已调用 `KTMoEWrapper.set_capture_batch_sizes`。
+   - `tools/p27_launch_ds4flash_npu*.sh` 已去掉 `--disable-cuda-graph`。
+   - **回归**：`ASCEND_RT_VISIBLE_DEVICES=<卡> bash tools/p27_launch_ds4flash_npu_num_expert_0.sh`
+     后跑 Z.8 四个 curl prompt；无 ERR 107027、输出语义连贯即通过。
 3. **aarch64 Q8_0 内核仍 NaN**（`tinyBLAS_Q0_ARM`）。若不修，BF16 GGUF 是单卡
    场景唯一可用编码，磁盘占用 ~555 GiB。修了可以省 ~50% 容量到 ~280 GiB。
 4. **`gpu_experts_mask` "前 N 个" 是默认硬编码**。如果将来要做 EPLB / 热点

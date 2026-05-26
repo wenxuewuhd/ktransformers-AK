@@ -1,0 +1,13 @@
+{
+  "kind": "silu_mul_unfused",
+  "shape": [
+    6,
+    2048
+  ],
+  "dtype": "torch.bfloat16",
+  "nan_count": 0,
+  "has_nan": false,
+  "mean": -17.51801109313965,
+  "std": 2912.1611328125,
+  "abs_max": 50176.0
+}

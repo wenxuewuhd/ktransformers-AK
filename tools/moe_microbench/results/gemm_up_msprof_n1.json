@@ -1,0 +1,22 @@
+{
+  "kind": "gemm_up",
+  "mode": "msprof_hardware_only",
+  "op_pattern": "QuantBatchMatmul",
+  "device_mean_us": 16.7222,
+  "device_std_us": 0.157109388643709,
+  "device_p50_us": 16.68,
+  "device_p95_us": 16.933,
+  "device_p99_us": 16.9546,
+  "device_max_us": 16.96,
+  "device_min_us": 16.52,
+  "matched_rows": 10,
+  "source_csv": "kernel_details:npu_results/n_active_1/gemm_up/05d710313bd1_839853_20260526083054553_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+  "trace_dir": "npu_results/n_active_1/gemm_up",
+  "cfg": {
+    "N": 1,
+    "n_active_experts": 1,
+    "H": 4096,
+    "I": 2048
+  },
+  "gemm_path": "loop_quant_matmul"
+}

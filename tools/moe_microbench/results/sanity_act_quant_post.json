@@ -1,0 +1,27 @@
+{
+  "x_int8": {
+    "kind": "x_int8",
+    "shape": [
+      6,
+      4096
+    ],
+    "dtype": "torch.float32",
+    "nan_count": 0,
+    "has_nan": false,
+    "mean": -0.4720459282398224,
+    "std": 34.97970199584961,
+    "abs_max": 127.0
+  },
+  "x_scale": {
+    "kind": "x_scale",
+    "shape": [
+      6
+    ],
+    "dtype": "torch.float32",
+    "nan_count": 0,
+    "has_nan": false,
+    "mean": 0.028850886970758438,
+    "std": 0.0020553991198539734,
+    "abs_max": 0.03038877807557583
+  }
+}

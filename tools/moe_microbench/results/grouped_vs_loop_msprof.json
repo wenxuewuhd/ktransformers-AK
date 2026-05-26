@@ -1,0 +1,76 @@
+{
+  "kind": "grouped_vs_loop",
+  "mode": "msprof_hardware_only",
+  "cfg": {
+    "N": 6,
+    "E_act": 6
+  },
+  "results": [
+    {
+      "target": "up",
+      "grouped_hw": {
+        "kind": "grouped_up",
+        "mode": "msprof_hardware_only",
+        "op_pattern": "QuantBatchMatmul",
+        "device_mean_us": 104.03609999999999,
+        "device_std_us": 0.5531308073141502,
+        "device_p50_us": 103.8825,
+        "device_p95_us": 104.83555,
+        "device_p99_us": 104.93671000000002,
+        "device_max_us": 104.96200000000002,
+        "device_min_us": 103.26199999999999,
+        "matched_rows": 10,
+        "source_csv": "kernel_details:npu_results/gvl_up_grouped/05d710313bd1_837442_20260526082952799_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "trace_dir": "npu_results/gvl_up_grouped"
+      },
+      "loop_hw": {
+        "kind": "loop_up",
+        "mode": "msprof_hardware_only",
+        "op_pattern": "QuantBatchMatmul",
+        "device_mean_us": 102.2138,
+        "device_std_us": 0.6766014779765069,
+        "device_p50_us": 102.31199999999998,
+        "device_p95_us": 103.12955,
+        "device_p99_us": 103.25231,
+        "device_max_us": 103.283,
+        "device_min_us": 100.74200000000002,
+        "matched_rows": 10,
+        "source_csv": "kernel_details:npu_results/gvl_up_loop/05d710313bd1_837442_20260526082957550_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "trace_dir": "npu_results/gvl_up_loop"
+      }
+    },
+    {
+      "target": "down",
+      "grouped_hw": {
+        "kind": "grouped_down",
+        "mode": "msprof_hardware_only",
+        "op_pattern": "QuantBatchMatmul",
+        "device_mean_us": 79.69579999999999,
+        "device_std_us": 0.5521870697508212,
+        "device_p50_us": 79.5815,
+        "device_p95_us": 80.70254999999999,
+        "device_p99_us": 80.70290999999999,
+        "device_max_us": 80.70299999999999,
+        "device_min_us": 78.92099999999999,
+        "matched_rows": 10,
+        "source_csv": "kernel_details:npu_results/gvl_down_grouped/05d710313bd1_837442_20260526083002180_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "trace_dir": "npu_results/gvl_down_grouped"
+      },
+      "loop_hw": {
+        "kind": "loop_down",
+        "mode": "msprof_hardware_only",
+        "op_pattern": "QuantBatchMatmul",
+        "device_mean_us": 77.9517,
+        "device_std_us": 1.0354084266607047,
+        "device_p50_us": 78.2715,
+        "device_p95_us": 79.328,
+        "device_p99_us": 79.7384,
+        "device_max_us": 79.841,
+        "device_min_us": 76.00200000000001,
+        "matched_rows": 10,
+        "source_csv": "kernel_details:npu_results/gvl_down_loop/05d710313bd1_837442_20260526083006900_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "trace_dir": "npu_results/gvl_down_loop"
+      }
+    }
+  ]
+}

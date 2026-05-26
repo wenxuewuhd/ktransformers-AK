@@ -1,0 +1,21 @@
+{
+  "kind": "silu_mul_unfused",
+  "mode": "msprof_hardware_only",
+  "op_pattern": "Silu+Mul+DynamicQuant",
+  "device_mean_us": 6.714100000000002,
+  "device_std_us": 0.0,
+  "device_p50_us": 6.714100000000002,
+  "device_p95_us": 6.714100000000002,
+  "device_p99_us": 6.714100000000002,
+  "device_max_us": 6.714100000000002,
+  "device_min_us": 6.714100000000002,
+  "matched_rows": 50,
+  "source_csv": null,
+  "trace_dir": "npu_results/silu_mul_unfused",
+  "cfg": {
+    "N": 6,
+    "n_active_experts": 6,
+    "H": 4096,
+    "I": 2048
+  }
+}

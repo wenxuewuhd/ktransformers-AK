@@ -1,0 +1,13 @@
+{
+  "kind": "gemm_up",
+  "shape": [
+    6,
+    4096
+  ],
+  "dtype": "torch.bfloat16",
+  "nan_count": 0,
+  "has_nan": false,
+  "mean": 0.19251422584056854,
+  "std": 63.946319580078125,
+  "abs_max": 290.0
+}

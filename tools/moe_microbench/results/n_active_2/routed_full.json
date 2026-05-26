@@ -1,0 +1,49 @@
+{
+  "kind": "routed_full",
+  "cfg": {
+    "N": 6,
+    "H": 4096,
+    "I": 2048,
+    "E_act": 6
+  },
+  "timing": {
+    "device_mean_us": 9651.292972564697,
+    "device_p50_us": 9700.97017288208,
+    "device_p95_us": 9843.95318031311,
+    "device_p99_us": 9958.15552711487,
+    "device_max_us": 10145.83969116211,
+    "device_std_us": 176.09904929736496,
+    "host_mean_us": 9822.100857272744,
+    "n": 100,
+    "dispatch_overhead_us": 170.8078847080469
+  },
+  "derived": {
+    "routed_full_compute_only_us": 9712.949171066284,
+    "routed_full_post_dispatch_us": 9651.292972564697,
+    "dispatch_overhead_us": 170.8078847080469
+  },
+  "segments": {
+    "compute_only": {
+      "device_mean_us": 9712.949171066284,
+      "device_p50_us": 9690.069675445557,
+      "device_p95_us": 9845.385217666626,
+      "device_p99_us": 9944.500341415405,
+      "device_max_us": 9976.2601852417,
+      "device_std_us": 90.90677271518462,
+      "host_mean_us": 9894.334077835083,
+      "n": 100,
+      "dispatch_overhead_us": 181.38490676879883
+    },
+    "post_dispatch": {
+      "device_mean_us": 9651.292972564697,
+      "device_p50_us": 9700.97017288208,
+      "device_p95_us": 9843.95318031311,
+      "device_p99_us": 9958.15552711487,
+      "device_max_us": 10145.83969116211,
+      "device_std_us": 176.09904929736496,
+      "host_mean_us": 9822.100857272744,
+      "n": 100,
+      "dispatch_overhead_us": 170.8078847080469
+    }
+  }
+}

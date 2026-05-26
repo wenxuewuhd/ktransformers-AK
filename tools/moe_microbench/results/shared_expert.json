@@ -1,0 +1,19 @@
+{
+  "kind": "shared_expert",
+  "cfg": {
+    "num_tokens": 1,
+    "H": 4096,
+    "S": 2048
+  },
+  "timing": {
+    "device_mean_us": 978.6453950405121,
+    "device_p50_us": 967.2199785709381,
+    "device_p95_us": 1020.9579467773438,
+    "device_p99_us": 1054.7347748279578,
+    "device_max_us": 1182.919979095459,
+    "device_std_us": 33.367391711388784,
+    "host_mean_us": 1131.985979154706,
+    "n": 100,
+    "dispatch_overhead_us": 153.34058411419392
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "kind": "silu_mul_unfused",
+  "cfg": {
+    "N": 6,
+    "mode": "unfused"
+  },
+  "timing": {
+    "device_mean_us": 355.1188001036644,
+    "device_p50_us": 347.9599952697754,
+    "device_p95_us": 403.2550036907196,
+    "device_p99_us": 427.97579109668794,
+    "device_max_us": 550.320029258728,
+    "device_std_us": 27.27238117407509,
+    "host_mean_us": 504.1737575083971,
+    "n": 100,
+    "dispatch_overhead_us": 149.0549574047327
+  }
+}

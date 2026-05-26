@@ -1,0 +1,21 @@
+{
+  "kind": "shared_expert",
+  "mode": "msprof_hardware_only",
+  "op_pattern": "QuantBatchMatmul+QuantMatmul+DynamicQuant+Silu+Mul",
+  "device_mean_us": 46.51045,
+  "device_std_us": 0.0,
+  "device_p50_us": 46.51045,
+  "device_p95_us": 46.51045,
+  "device_p99_us": 46.51045,
+  "device_max_us": 46.51045,
+  "device_min_us": 46.51045,
+  "matched_rows": 100,
+  "source_csv": null,
+  "trace_dir": "npu_results/shared_expert",
+  "cfg": {
+    "N": 6,
+    "n_active_experts": 6,
+    "H": 4096,
+    "I": 2048
+  }
+}

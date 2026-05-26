@@ -1,0 +1,34 @@
+{
+  "kind": "csa",
+  "mode": "msprof_hardware_only",
+  "seq_len": 32768,
+  "batch_size": 1,
+  "indexer_hw": {
+    "device_mean_us": 36.102599999999995,
+    "device_std_us": 1.6324429055865937,
+    "device_p50_us": 35.1705,
+    "device_p95_us": 38.997,
+    "device_p99_us": 39.4002,
+    "device_max_us": 39.501,
+    "device_min_us": 34.64,
+    "matched_rows": 10,
+    "op_pattern": "QuantLightningIndexer",
+    "source_csv": "kernel_details:npu_results/csa_indexer_seq32768/05d710313bd1_731931_20260526073516369_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
+  },
+  "attn_hw": {
+    "device_mean_us": 38.8429,
+    "device_std_us": 1.323521246523833,
+    "device_p50_us": 38.3905,
+    "device_p95_us": 41.182,
+    "device_p99_us": 41.4052,
+    "device_max_us": 41.461,
+    "device_min_us": 37.341,
+    "matched_rows": 10,
+    "op_pattern": "SparseAttnSharedkv",
+    "source_csv": "kernel_details:npu_results/csa_attn_seq32768/05d710313bd1_731931_20260526073521133_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
+  },
+  "trace_dirs": [
+    "npu_results/csa_indexer_seq32768",
+    "npu_results/csa_attn_seq32768"
+  ]
+}

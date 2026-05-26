@@ -1,0 +1,17 @@
+{
+  "indexer_min_us": 248.43560054898262,
+  "indexer_max_us": 273.0635988712311,
+  "spread_pct": 9.913232349883245,
+  "floor_confirmed": false,
+  "verdict": "floor refuted",
+  "kernel_errors": [
+    4,
+    16
+  ],
+  "successful_cols": [
+    64,
+    256,
+    1024,
+    8192
+  ]
+}

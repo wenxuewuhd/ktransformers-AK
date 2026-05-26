@@ -1,0 +1,95 @@
+# DeepSeek-V4-Flash NPU attention microbench config
+# 实测来源: tools/p27_launch_ds4flash_npu.sh + ascend_backend.py + nsa_indexer.py (2026-05-26)
+#
+# 与论文 (§2.3.4 / §4.2.1) 的已知偏离:
+#   - 主 KV: bf16 全维, 论文为 bf16 (RoPE 64 维) + fp8 (其余) mixed; 偏离 ~2× HBM 流量
+#   - Indexer KV: int8 + per-block scale, 对应 LI_KV_DTYPE_INT8=1; 论文为 FP4
+#   - Synthetic 数据: 全 randn, 不区分 RoPE/非 RoPE 维
+#   - sinks 默认 -inf (≡ 无 sink); 论文 CSA/HCA core attention 带可学习 sink (前 2 层 SWA 未明确)
+# README §"已知偏离" 同步声明; 任何 long-context 性能结论需考虑这些偏差.
+
+model:
+  num_heads_q: 64                # CSA/HCA core attention query heads (n_h)
+  num_heads_kv: 1
+  head_dim: 512
+  softmax_scale: 0.044194173824065346    # 1/sqrt(head_dim); 显式避免下游推断
+  index_n_heads: 64              # indexer query heads (n^I_h); 与 num_heads_q 同值但语义独立
+  index_head_dim: 128
+  index_topk: 512                # Flash; Pro 用 1024
+  sliding_window_size: 128
+
+runtime:
+  page_size: 128
+  batch_size: 1
+  device: npu:0
+  dtypes:
+    q: bfloat16
+    ori_kv: bfloat16             # 论文 mixed bf16+fp8; 本 bench 全 bf16
+    cmp_kv: bfloat16
+    out: bfloat16
+    indexer_kv: int8             # LI_KV_DTYPE_INT8=1
+    indexer_weight: float16
+
+bench:
+  seq_len: 32768
+  q_len: 1                       # 1=decode; >1=chunked prefill (P3)
+  q_len_sweep: [1]               # 主线只跑 decode
+  warmup: 30
+  repeat: 1000                   # P0 后正式默认; M=1 GEMV-scale kernel 抖动大
+  quick_mode_repeat: 100         # CLI --quick-mode
+  quick_mode_warmup: 10
+  seed: 42
+  sanity: false
+
+# DSv4-Flash 主 stack layer 分布 (config.json compress_ratios)
+# 仅作信息; microbench synthetic 不区分层
+layer_layout_info:
+  total_layers_in_main: 43             # ⚠ len(compress_ratios)=44; L43 待 P1 dump 确认 (MTP head / padding / nextn?)
+  swa_layer_ids: [0, 1]                # ratio=1 pure SWA
+  csa_layer_count_in_main: 20          # 或 21; 取决于 L43 归属
+  hca_layer_count_in_main: 20          # 或 21
+
+metadata_keys:
+  # 所有值需对照 ascend_backend.py / nsa_indexer.py; CANN 升级时核对枚举重映射
+  ori_mask_mode: 4               # ascend_backend SparseAttnSharedkv kwargs; "sliding causal"
+  cmp_mask_mode: 3               # 同上; "compressed causal"
+  layout_q: TND                  # T=tokens, N=heads, D=dim
+  layout_kv: PA_ND               # PA=paged
+  layout_li_key: PA_BSND         # nsa_indexer.py::forward_npu_dsv4_fusion
+  sparse_mode: 3                 # nsa_indexer; "topk sparse"
+  key_quant_mode: 0              # nsa_indexer; 0=per-block scale
+  query_quant_mode: 0            # nsa_indexer; 0=dynamic per-token
+
+# 历史 bug 修复点 (审核报告 §6.2); 改之前必须先看报告
+invariants:
+  page_table_value_domain: physical_page_id    # not logical_index (B1)
+  seqused_kv_shape: "[B]"                       # not "[seq_len]" (B2)
+  li_key_scale_shape: "[P, page_size, 1, 1]"   # 4D buffer
+  li_key_scale_squeeze_dim: -2                  # squeeze 后传 indexer; not -1 (B3)
+  cmp_kv_c4_second_dim_semantics: TBD           # 128 vs 32; P1 dump 生产 buffer 钉死 (B4)
+  sinks_default: "-inf"                         # ≡ 无 sink; 生产 SWA 实际值待 ckpt dump
+
+# P0/P1 诊断旋钮; 默认 null = 跟随 bench.seq_len 自然推导
+diag:
+  override_seqused_kv: null              # 设 128 跑极端测试 (P0 B)
+  override_actual_seq_lengths_key: null  # 设 c4_len 跑变体 (P0 C)
+  override_c4_cols: null                 # 设 4/16/64 排除 kernel floor 假说 (P1.1)
+  page_table_unique_pages: false         # true = 每 logical col 一个 unique physical page (P1.2)
+  page_table_seed: 42
+
+# Roofline 下界 (与 moe yaml 一致); 用于 isolated bench 是否打满判断
+roofline:
+  hbm_peak_tb_s: 1.6
+  hbm_peak_source: "Ascend 910B vendor spec, confirm via npu-smi at P1"
+  hbm_effective_tb_s: 1.0                # P1 measure_hbm_effective_tb_s 校准后回填
+
+msprof:
+  enabled: false
+  profiler_level: "Level1"
+  aic_metrics: "PipeUtilization"
+  skip_first: 5
+  warmup: 2
+  active: 10
+  out_dir: "./npu_results"
+  record_shapes: true
+  with_stack: false

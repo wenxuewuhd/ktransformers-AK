@@ -1,0 +1,41 @@
+{
+  "kind": "csa",
+  "seq_len": 32768,
+  "batch_size": 1,
+  "skip_indexer": false,
+  "attn_us": {
+    "mean": 157.18170005083084,
+    "device_mean_us": 157.18170005083084,
+    "device_p50_us": 155.03999590873718,
+    "device_p95_us": 162.1699973940849,
+    "device_p99_us": 207.82599821686745,
+    "device_max_us": 212.11999654769897,
+    "device_std_us": 10.105597595868124,
+    "host_mean_us": 248.53789899498224,
+    "mean_us": 157.18170005083084,
+    "p50_us": 155.03999590873718,
+    "p99_us": 207.82599821686745,
+    "n": 1000
+  },
+  "indexer_us": {
+    "mean": 264.9807204455137,
+    "device_mean_us": 264.9807204455137,
+    "device_p50_us": 260.3999972343445,
+    "device_p95_us": 305.0310045480728,
+    "device_p99_us": 317.85100996494293,
+    "device_max_us": 334.65999364852905,
+    "device_std_us": 13.510134832596487,
+    "host_mean_us": 362.33922746032476,
+    "mean_us": 264.9807204455137,
+    "p50_us": 260.3999972343445,
+    "p99_us": 317.85100996494293,
+    "n": 1000
+  },
+  "isolated_device_sum_us": {
+    "device_mean_us": 422.16242049634457,
+    "device_std_us": 16.871480254101964,
+    "host_mean_us": 610.877126455307,
+    "mean_us": 422.16242049634457,
+    "note": "NOT end-to-end; sum of independently timed indexer + attn"
+  }
+}

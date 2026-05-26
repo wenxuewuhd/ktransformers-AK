@@ -1,0 +1,228 @@
+{
+  "scenario": "c4_cols_sweep",
+  "warmup": 30,
+  "repeat": 100,
+  "results": [
+    {
+      "test": "c4_cols_sweep",
+      "override_c4_cols": 4,
+      "error": "npuSynchronizeDevice:build/CMakeFiles/torch_npu.dir/compiler_depend.ts:575 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 507015\n[ERROR] 2026-05-26-05:51:17 (PID:575255, Device:0, RankID:-1) ERR00100 PTA call acl api failed\n[Error]: The aicore execution is abnormal. \n        Rectify the fault based on the error information in the ascend log.\nEZ9999: Inner Error!\nEZ9999[PID: 575255] 2026-05-26-05:51:17.508.154 (EZ9999):  The error from device(chipId:0, dieId:0), serial number is 5, there is an exception of fftsplus aicore error, core id is 9, error code = 0x800000, dump info: pc start: 0x12c081299b60, current: 0x12c08129b280, vec error info: 0, mte error info: 0x6b030000cc, ifu error info: 0x2000069d43780, ccu error info: 0xb81a9f9f00000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c140004080.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]\n        TraceBack (most recent call last):\n       The extend info: errcode:(0x800000, 0, 0) errorStr: The DDR address of the MTE instruction is out of range. fixp_error0 info: 0x30000cc, fixp_error1 info: 0x6b, fsmId:0, tslot:1, thread:0, ctxid:0, blk:0, sublk:0, subErrType:4.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:360]\n       Kernel task happen error, retCode=0x26, [aicore exception].[FUNC:PreCheckTaskErr][FILE:davinci_kernel_task.cc][LINE:1493]\n       rtDeviceSynchronizeWithTimeout execution failed, reason=aicore exception[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]\n       wait for compute device to finish failed, runtime result = 507015.[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]\n",
+      "diag_snapshot": {
+        "override_seqused_kv": null,
+        "override_actual_seq_lengths_key": null,
+        "override_c4_cols": 4,
+        "page_table_unique_pages": false,
+        "page_table_seed": 42
+      }
+    },
+    {
+      "test": "c4_cols_sweep",
+      "override_c4_cols": 16,
+      "error": "npuSynchronizeDevice:build/CMakeFiles/torch_npu.dir/compiler_depend.ts:575 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 507015\n[ERROR] 2026-05-26-05:51:43 (PID:575507, Device:0, RankID:-1) ERR00100 PTA call acl api failed\n[Error]: The aicore execution is abnormal. \n        Rectify the fault based on the error information in the ascend log.\nEZ9999: Inner Error!\nEZ9999[PID: 575507] 2026-05-26-05:51:43.934.008 (EZ9999):  The error from device(chipId:0, dieId:0), serial number is 6, there is an exception of fftsplus aicore error, core id is 8, error code = 0x800000, dump info: pc start: 0x12c081299b60, current: 0x12c08129af84, vec error info: 0, mte error info: 0x6a0300009f, ifu error info: 0x2000069d43780, ccu error info: 0x85fb997000000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c140004080.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]\n        TraceBack (most recent call last):\n       The extend info: errcode:(0x800000, 0, 0) errorStr: The DDR address of the MTE instruction is out of range. fixp_error0 info: 0x300009f, fixp_error1 info: 0x6a, fsmId:1, tslot:1, thread:0, ctxid:0, blk:0, sublk:0, subErrType:4.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:360]\n       Kernel task happen error, retCode=0x26, [aicore exception].[FUNC:PreCheckTaskErr][FILE:davinci_kernel_task.cc][LINE:1493]\n       rtDeviceSynchronizeWithTimeout execution failed, reason=aicore exception[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]\n       wait for compute device to finish failed, runtime result = 507015.[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]\n",
+      "diag_snapshot": {
+        "override_seqused_kv": null,
+        "override_actual_seq_lengths_key": null,
+        "override_c4_cols": 16,
+        "page_table_unique_pages": false,
+        "page_table_seed": 42
+      }
+    },
+    {
+      "test": "c4_cols_sweep",
+      "seq_len": 32768,
+      "c4_cols": 64,
+      "c4_pages": 1,
+      "seqused_kv": 32768,
+      "diag_snapshot": {
+        "override_seqused_kv": null,
+        "override_actual_seq_lengths_key": null,
+        "override_c4_cols": 64,
+        "page_table_unique_pages": false,
+        "page_table_seed": 42
+      },
+      "indexer_us": {
+        "mean": 273.0635988712311,
+        "device_mean_us": 273.0635988712311,
+        "device_p50_us": 271.6199904680252,
+        "device_p95_us": 283.20500552654266,
+        "device_p99_us": 289.05178815126425,
+        "device_max_us": 304.0800094604492,
+        "device_std_us": 6.699514937159331,
+        "host_mean_us": 379.46371361613274,
+        "mean_us": 273.0635988712311,
+        "p50_us": 271.6199904680252,
+        "p99_us": 289.05178815126425,
+        "n": 100
+      },
+      "indexer_summary": "273.1 \u00b1 6.7 (p95=283.2, n=100)",
+      "override_c4_cols": 64,
+      "swa_attn_us": {
+        "mean": 138.61340001225471,
+        "device_mean_us": 138.61340001225471,
+        "device_p50_us": 136.49000227451324,
+        "device_p95_us": 147.26199805736542,
+        "device_p99_us": 152.74899482727054,
+        "device_max_us": 159.58000719547272,
+        "device_std_us": 5.286533018400931,
+        "host_mean_us": 232.5906790792942,
+        "mean_us": 138.61340001225471,
+        "p50_us": 136.49000227451324,
+        "p99_us": 152.74899482727054,
+        "n": 100
+      },
+      "swa_summary": "138.6 \u00b1 5.3 (p95=147.3, n=100)"
+    },
+    {
+      "test": "c4_cols_sweep",
+      "seq_len": 32768,
+      "c4_cols": 256,
+      "c4_pages": 2,
+      "seqused_kv": 32768,
+      "diag_snapshot": {
+        "override_seqused_kv": null,
+        "override_actual_seq_lengths_key": null,
+        "override_c4_cols": 256,
+        "page_table_unique_pages": false,
+        "page_table_seed": 42
+      },
+      "indexer_us": {
+        "mean": 271.89039915800095,
+        "device_mean_us": 271.89039915800095,
+        "device_p50_us": 270.10001242160797,
+        "device_p95_us": 286.51301115751266,
+        "device_p99_us": 298.6930099129677,
+        "device_max_us": 301.9599914550781,
+        "device_std_us": 8.4746684083047,
+        "host_mean_us": 378.6920476704836,
+        "mean_us": 271.89039915800095,
+        "p50_us": 270.10001242160797,
+        "p99_us": 298.6930099129677,
+        "n": 100
+      },
+      "indexer_summary": "271.9 \u00b1 8.5 (p95=286.5, n=100)",
+      "override_c4_cols": 256,
+      "swa_attn_us": {
+        "mean": 142.93360024690628,
+        "device_mean_us": 142.93360024690628,
+        "device_p50_us": 140.34999907016754,
+        "device_p95_us": 153.86700257658958,
+        "device_p99_us": 159.43800121545794,
+        "device_max_us": 163.2000058889389,
+        "device_std_us": 5.908592048129008,
+        "host_mean_us": 240.62372744083405,
+        "mean_us": 142.93360024690628,
+        "p50_us": 140.34999907016754,
+        "p99_us": 159.43800121545794,
+        "n": 100
+      },
+      "swa_summary": "142.9 \u00b1 5.9 (p95=153.9, n=100)"
+    },
+    {
+      "test": "c4_cols_sweep",
+      "seq_len": 32768,
+      "c4_cols": 1024,
+      "c4_pages": 8,
+      "seqused_kv": 32768,
+      "diag_snapshot": {
+        "override_seqused_kv": null,
+        "override_actual_seq_lengths_key": null,
+        "override_c4_cols": 1024,
+        "page_table_unique_pages": false,
+        "page_table_seed": 42
+      },
+      "indexer_us": {
+        "mean": 248.43560054898262,
+        "device_mean_us": 248.43560054898262,
+        "device_p50_us": 245.65999954938889,
+        "device_p95_us": 258.3189934492111,
+        "device_p99_us": 280.0956079363829,
+        "device_max_us": 406.3799977302551,
+        "device_std_us": 17.41654591517439,
+        "host_mean_us": 358.0367472022772,
+        "mean_us": 248.43560054898262,
+        "p50_us": 245.65999954938889,
+        "p99_us": 280.0956079363829,
+        "n": 100
+      },
+      "indexer_summary": "248.4 \u00b1 17.4 (p95=258.3, n=100)",
+      "override_c4_cols": 1024,
+      "swa_attn_us": {
+        "mean": 127.31599971652031,
+        "device_mean_us": 127.31599971652031,
+        "device_p50_us": 126.13999843597412,
+        "device_p95_us": 137.17399388551712,
+        "device_p99_us": 140.24420127272606,
+        "device_max_us": 142.63999462127686,
+        "device_std_us": 4.63858230807244,
+        "host_mean_us": 223.6167062073946,
+        "mean_us": 127.31599971652031,
+        "p50_us": 126.13999843597412,
+        "p99_us": 140.24420127272606,
+        "n": 100
+      },
+      "swa_summary": "127.3 \u00b1 4.6 (p95=137.2, n=100)"
+    },
+    {
+      "test": "c4_cols_sweep",
+      "seq_len": 32768,
+      "c4_cols": 8192,
+      "c4_pages": 64,
+      "seqused_kv": 32768,
+      "diag_snapshot": {
+        "override_seqused_kv": null,
+        "override_actual_seq_lengths_key": null,
+        "override_c4_cols": 8192,
+        "page_table_unique_pages": false,
+        "page_table_seed": 42
+      },
+      "indexer_us": {
+        "mean": 261.07139974832535,
+        "device_mean_us": 261.07139974832535,
+        "device_p50_us": 259.5600038766861,
+        "device_p95_us": 271.7509999871254,
+        "device_p99_us": 282.4287876486779,
+        "device_max_us": 289.2400026321411,
+        "device_std_us": 6.941839014348408,
+        "host_mean_us": 368.7656857073307,
+        "mean_us": 261.07139974832535,
+        "p50_us": 259.5600038766861,
+        "p99_us": 282.4287876486779,
+        "n": 100
+      },
+      "indexer_summary": "261.1 \u00b1 6.9 (p95=271.8, n=100)",
+      "override_c4_cols": 8192,
+      "swa_attn_us": {
+        "mean": 136.47360056638718,
+        "device_mean_us": 136.47360056638718,
+        "device_p50_us": 134.5899999141693,
+        "device_p95_us": 145.6520028412342,
+        "device_p99_us": 153.26379522681236,
+        "device_max_us": 155.61999380588531,
+        "device_std_us": 5.200212256839269,
+        "host_mean_us": 231.73481225967407,
+        "mean_us": 136.47360056638718,
+        "p50_us": 134.5899999141693,
+        "p99_us": 153.26379522681236,
+        "n": 100
+      },
+      "swa_summary": "136.5 \u00b1 5.2 (p95=145.7, n=100)"
+    }
+  ],
+  "p1_1_floor_evidence": {
+    "indexer_min_us": 248.43560054898262,
+    "indexer_max_us": 273.0635988712311,
+    "spread_pct": 9.913232349883245,
+    "floor_confirmed": false,
+    "verdict": "floor refuted",
+    "kernel_errors": [
+      4,
+      16
+    ],
+    "successful_cols": [
+      64,
+      256,
+      1024,
+      8192
+    ]
+  }
+}

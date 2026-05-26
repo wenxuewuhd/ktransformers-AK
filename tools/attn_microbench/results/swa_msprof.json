@@ -1,0 +1,19 @@
+{
+  "kind": "swa",
+  "mode": "msprof_hardware_only",
+  "seq_len": 32768,
+  "batch_size": 1,
+  "attn_hw": {
+    "device_mean_us": 21.5722,
+    "device_std_us": 1.227222620391264,
+    "device_p50_us": 21.430500000000002,
+    "device_p95_us": 23.48,
+    "device_p99_us": 23.624,
+    "device_max_us": 23.66,
+    "device_min_us": 19.88,
+    "matched_rows": 10,
+    "op_pattern": "SparseAttnSharedkv",
+    "source_csv": "kernel_details:npu_results/swa_attn_seq32768/05d710313bd1_728663_20260526073447340_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
+  },
+  "trace_dir": "npu_results/swa_attn_seq32768"
+}

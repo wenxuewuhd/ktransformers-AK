@@ -1,0 +1,5 @@
+npu_results/
+extra-info/
+__pycache__/
+*.pyc
+*.log

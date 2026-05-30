@@ -344,9 +344,13 @@ bool llamafile_sgemm(long m, long n, long k, const void* A, long lda, const void
     if ((Btype == GGML_TYPE_Q8_0 || Btype == GGML_TYPE_Q8_1) && Ctype == GGML_TYPE_F32) {
         // assert(QK8_0 == QK8_1 == QK4_0 == QK4_1 == QK5_0 == QK5_1 == 32);
         assert((QK8_0 == 32) && (QK8_1 == 32) && (QK4_0 == 32) && (QK4_1 == 32) && (QK5_0 == 32) && (QK5_1 == 32));
+        // Kunpeng 920 / Cortex-A76: dotprod yes, i8mm no. iqk_mul_mat_arm82 Q8_0×Q8_0
+        // can return NaN on this class of CPUs; prefer tinyBLAS_Q0_ARM (NEON SDOT).
+#if defined(__ARM_FEATURE_MATMUL_INT8)
         if (iqk_mul_mat(m, n, k * QK8_0, Atype, A, B, (float*)C, ldc, ith, nth)) {
             return true;
         }
+#endif
     }
 #endif
 #endif

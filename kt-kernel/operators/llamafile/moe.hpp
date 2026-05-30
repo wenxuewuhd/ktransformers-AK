@@ -50,8 +50,7 @@ inline void debug_quant(void* input, ggml_type type) {
 //     `Atype=BF16, Btype=F32, Ctype=F32` 路径（tinyblas_cpu_sgemm.inc line 125-133）。
 //
 //   * SVE 机器走原 BF16-BF16 path（vec_dot_type 不改），不打扰原性能优化。
-//   * 其他 weight type（Q8_0/Q4_K/…）走原 vec_dot_type，不动；
-//     若 Q8_0 NaN 仍存在，单独在 sgemm 内部修复，而非这里。
+//   * Q8_0：见下方 kt_llamafile_sgemm（aarch64 无 SVE 时走 ggml_vec_dot_q8_0_q8_0）。
 // ---------------------------------------------------------------------------
 static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
 #if defined(__aarch64__) && !defined(__ARM_FEATURE_SVE)
@@ -61,6 +60,46 @@ static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
 #endif
   return ggml_internal_get_type_traits(weight_type).vec_dot_type;
 }
+
+// Kunpeng 920 (aarch64, dotprod, no SVE/i8mm): iqk_mul_mat and tinyBLAS_Q0_ARM both
+// produce NaN for Q8_0×Q8_0. Use ggml's vec_dot (same as llama.cpp) for MoE GEMMs.
+#if defined(__aarch64__) && !defined(__ARM_FEATURE_SVE)
+static inline bool kt_llamafile_sgemm(long m, long n, long k, const void* A, long lda, const void* B, long ldb,
+                                      void* C, long ldc, int ith, int nth, int task, ggml_type Atype,
+                                      ggml_type Btype, ggml_type Ctype, int precision) {
+  if (Atype == GGML_TYPE_Q8_0 && Btype == GGML_TYPE_Q8_0 && Ctype == GGML_TYPE_F32 && ith == 0 && nth == 1) {
+    const int ne = static_cast<int>(k * ggml_blck_size(GGML_TYPE_Q8_0));
+    const size_t bx = static_cast<size_t>(lda) * sizeof(block_q8_0);
+    const size_t by = static_cast<size_t>(ldb) * sizeof(block_q8_0);
+    auto* c = static_cast<float*>(C);
+    const auto* a = static_cast<const block_q8_0*>(A);
+    const auto* b = static_cast<const block_q8_0*>(B);
+    for (long j = 0; j < n; ++j) {
+      const auto* b_col = b + ldb * j;
+      for (long i = 0; i < m; ++i) {
+        float sum = 0.f;
+        ggml_vec_dot_q8_0_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
+        if (!std::isfinite(sum)) {
+          sum = 0.f;  // defensive; should not happen with valid weights/activations
+        }
+        c[ldc * j + i] = sum;
+      }
+    }
+    (void)task;
+    (void)precision;
+    return true;
+  }
+  return llamafile_sgemm(m, n, k, A, lda, B, ldb, C, ldc, ith, nth, task, static_cast<int>(Atype),
+                         static_cast<int>(Btype), static_cast<int>(Ctype), precision);
+}
+#else
+static inline bool kt_llamafile_sgemm(long m, long n, long k, const void* A, long lda, const void* B, long ldb,
+                                      void* C, long ldc, int ith, int nth, int task, ggml_type Atype,
+                                      ggml_type Btype, ggml_type Ctype, int precision) {
+  return llamafile_sgemm(m, n, k, A, lda, B, ldb, C, ldc, ith, nth, task, static_cast<int>(Atype),
+                         static_cast<int>(Btype), static_cast<int>(Ctype), precision);
+}
+#endif
 
 class LLAMA_MOE_TP {
  private:
@@ -218,6 +257,10 @@ class LLAMA_MOE_TP {
         new uint8_t[size * ggml_type_size((ggml_type)config.gate_type) / ggml_blck_size((ggml_type)config.gate_type)];
     m_local_down_proj_ =
         new uint8_t[size * ggml_type_size((ggml_type)config.down_type) / ggml_blck_size((ggml_type)config.down_type)];
+    if (std::getenv("KT_DEBUG_Q8")) {
+      fprintf(stderr, "[llama moe tp=%d] gate_type=%d up=%d down=%d hidden=%d (Q8_0=%d)\n", tp_part_idx,
+              config.gate_type, config.up_type, config.down_type, config.hidden_type, (int)GGML_TYPE_Q8_0);
+    }
   }
 
   void load_weights(int complete_intermediate_size, int offset) {
@@ -354,7 +397,6 @@ class LLAMA_MOE_TP {
       m_expert_id_map_[activated_expert] = expert_ids[i];
       activated_expert++;
     }
-
     int nth = config_.intermediate_size / config_.m_block;
 
     // Only process activated (CPU) experts; skip GPU experts entirely to keep buffers aligned.
@@ -375,7 +417,7 @@ class LLAMA_MOE_TP {
                                                    ggml_blck_size((ggml_type)config_.gate_type);
 
             float* gate_output_ptr = s_gate_output_[act_idx] + ith * config_.m_block;
-            auto ok = llamafile_sgemm(
+            auto ok = kt_llamafile_sgemm(
                 config_.m_block, 1, config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_proj_ptr,
                 config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_input_ptr,
                 config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_output_ptr, config_.m_block, 0,
@@ -392,7 +434,7 @@ class LLAMA_MOE_TP {
                                                  ggml_blck_size((ggml_type)config_.up_type);
 
             float* up_output_ptr = s_up_output_[act_idx] + ith * config_.m_block;
-            llamafile_sgemm(config_.m_block, 1, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type),
+            kt_llamafile_sgemm(config_.m_block, 1, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type),
                             up_proj_ptr, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_input_ptr,
                             config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_output_ptr,
                             config_.m_block, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.up_type,
@@ -455,7 +497,7 @@ class LLAMA_MOE_TP {
                                                                      ggml_blck_size((ggml_type)config_.down_type);
 
             float* down_output_ptr = s_down_output_[expert_idx] + ith * config_.m_block;
-            llamafile_sgemm(
+            kt_llamafile_sgemm(
                 config_.m_block, 1, config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type),
                 down_proj_ptr, config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type),
                 s_down_input_[expert_idx], config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type),
@@ -649,7 +691,7 @@ class LLAMA_MOE_TP {
           //   printf("matrix size: m:%d, n:%d, k:%d\n", m_block, m_local_num_[expert_idx],
           //          config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type));
           // }
-          llamafile_sgemm(m_block, m_local_num_[expert_idx],
+          kt_llamafile_sgemm(m_block, m_local_num_[expert_idx],
                           config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_proj_ptr,
                           config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_input_ptr,
                           config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_output_ptr,
@@ -664,7 +706,7 @@ class LLAMA_MOE_TP {
                                                                ggml_blck_size((ggml_type)config_.up_type);
 
           float* up_output_ptr = m_local_up_output_ptr_[expert_idx] + ith * m_block;
-          llamafile_sgemm(
+          kt_llamafile_sgemm(
               m_block, m_local_num_[expert_idx], config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type),
               up_proj_ptr, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_input_ptr,
               config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_output_ptr,
@@ -717,7 +759,7 @@ class LLAMA_MOE_TP {
                                                                    ggml_blck_size((ggml_type)config_.down_type);
 
           float* down_output_ptr = m_local_down_output_ptr_[expert_idx] + ith * m_block;
-          llamafile_sgemm(m_block, m_local_num_[expert_idx],
+          kt_llamafile_sgemm(m_block, m_local_num_[expert_idx],
                           config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_proj_ptr,
                           config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_input_ptr,
                           config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_output_ptr,

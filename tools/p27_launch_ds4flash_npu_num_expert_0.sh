@@ -27,7 +27,9 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-export PYTHONPATH="${REPO}/third_party/sglang/python:${REPO}/kt-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
+# shellcheck source=tools/p27_ensure_kt_kernel.sh
+source "${SCRIPT_DIR}/p27_ensure_kt_kernel.sh"
+p27_ensure_kt_kernel "$REPO"
 
 # ---------- 选定 Python 解释器 ----------
 # 现象：本镜像默认 PATH 里 ``python3`` 指 ``/usr/bin/python3``（系统 python，没装
@@ -71,11 +73,10 @@ fi
 
 MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeek-V4-Flash-W8A8}"
 # 勿用 KT_GGUF_TEMPLATE="${KT:-...dsv4_layer{layer_idx}.gguf}"：bash 会把 {layer_idx} 的第一个 ``}`` 当成 ``${...:-}`` 的结束符，路径会变成 ``...{layer_idx.gguf}``。
-# 默认走 BF16：aarch64（K920 / Cortex-A76 无 i8mm）上 tinyBLAS_Q0_ARM Q8_0 内核仍 NaN
-# （见 Handoff 附录 Z.5），BF16 路径已经被 B+ 5 层抽样验证 cosine ≥ 0.999996。
-# 老的 Q8_0 模板：'/workspace/models/cache/dsv4_layer{layer_idx}.gguf'（layout 已修，但 ARM 内核还没修，谨慎使用）
+# 默认 Q8_0（批量 convert 输出 dsv4_layer{L}.gguf）。须先 cp 新 kt_kernel_ext.so 到 kt-kernel/python/（手册 §2.4）。
+# BF16 回退：export KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
 if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
-  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
+  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
 fi
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
@@ -101,6 +102,18 @@ export USE_FUSED_TRANSPOSE_BATCHMATMUL="${USE_FUSED_TRANSPOSE_BATCHMATMUL:-1}"
 export USE_ROPE_PARTIAL_IN_PLACE_ASCENDC="${USE_ROPE_PARTIAL_IN_PLACE_ASCENDC:-1}"
 export ASCEND_USE_FIA="${ASCEND_USE_FIA:-1}"
 
+export SGLANG_NPU_PROFILE_ENABLE="${SGLANG_NPU_PROFILE_ENABLE:-0}"
+export SGLANG_NPU_PROFILE_DECODE_TOKEN="${SGLANG_NPU_PROFILE_DECODE_TOKEN:-2}"
+export SGLANG_NPU_PROFILE_DIR="${SGLANG_NPU_PROFILE_DIR:-./npu_results_dbg}"
+export SGLANG_NPU_PROFILE_LEVEL="${SGLANG_NPU_PROFILE_LEVEL:-0}"
+export SGLANG_NPU_PROFILE_ANALYSE="${SGLANG_NPU_PROFILE_ANALYSE:-0}"
+export SGLANG_NPU_PROFILE_DISABLE_GRAPH="${SGLANG_NPU_PROFILE_DISABLE_GRAPH:-1}"
+export SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER="${SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER:-1}"
+if [[ "${SGLANG_NPU_PROFILE_ENABLE}" == "1" && "${EXTRA_FLAGS:-}" != *"--disable-cuda-graph"* ]]; then
+  EXTRA_FLAGS="${EXTRA_FLAGS:+$EXTRA_FLAGS }--disable-cuda-graph"
+  echo "[p27] SGLANG_NPU_PROFILE_ENABLE=1: auto append EXTRA_FLAGS=--disable-cuda-graph"
+fi
+
 # 可选：若机器上存在 CANN set_env，则加载（失败则忽略）。
 if [[ -f "${ASCEND_TOOLKIT_HOME}/set_env.sh" ]]; then
   # shellcheck source=/dev/null
@@ -123,7 +136,9 @@ fi
 echo "[p27] REPO=$REPO"
 echo "[p27] PYTHONPATH head: ${PYTHONPATH%%:*}"
 echo "[p27] chunked-prefill-size=${CHUNKED_PREFILL_SIZE}（正数须为 page_size 倍数；见脚本头注释）"
+echo "[p27] kt-weight-path template=${KT_GGUF_TEMPLATE}"
 echo "[p27] quantization=${QUANTIZATION} IS_DEEPSEEK_V4=${IS_DEEPSEEK_V4:-}"
+echo "[p27] SGLANG_NPU_PROFILE_ENABLE=${SGLANG_NPU_PROFILE_ENABLE} DECODE_TOKEN=${SGLANG_NPU_PROFILE_DECODE_TOKEN}"
 "${PYTHON_BIN}" -c "import sglang; print('[p27] sglang file:', sglang.__file__)"
 
 # EXTRA_FLAGS 用于临时附加任意 sglang.launch_server 参数（不需要改脚本本体），例如：
@@ -164,3 +179,4 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
 # cuda-graph 已启用：kt-kernel ACL callback worker + kt_ep_wrapper NPU graph
 # host callback（见 kt-kernel/cpu_backend/ascend_callback_worker.*）。
 # 调试同步路径：KT_FORCE_SYNC_SUBMIT=1；回退无 graph：EXTRA_FLAGS="--disable-cuda-graph"
+# 生产勿开 KT_DEBUG_HYBRID_MOE / KT_DEBUG_MOE_OUT。graph 性能用 msprof，勿长期开 SGLANG_NPU_PROFILE_ENABLE。

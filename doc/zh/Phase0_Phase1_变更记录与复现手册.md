@@ -1,7 +1,8 @@
 # Phase 0 / Phase 1 变更记录与复现手册
 
-> **目的**：在动手 Phase 2（多 GGUF loader 等）之前，把截至 **Phase 1.2 完成** 为止的**所有工程向改动**、**系统依赖**与**逐步验证方法**固化到一处，便于新环境/新同事 **按步骤复现**。  
-> **说明**：本文以**源码与脚本**为主；**权重文件**（HF W8A8、生成的 GGUF）体积巨大，需自备路径，不随仓库分发。
+> **目的**：把 Phase 0 / 1 / 2（含 **2026-05 任务 3：K920 Q8_0 CPU MoE**）的**工程向改动**、**编译**、**分层校验**与**整网 e2e** 固化到一处，便于新环境按步骤复现。  
+> **说明**：本文以**源码与脚本**为主；**权重文件**（HF W8A8、生成的 GGUF）体积巨大，需自备路径，不随仓库分发。  
+> **任务 3 速查**：代码 §11.2 → 编译 §2.4 / §11.3 → B+ §11.4 → 整网 §11.5。
 
 ---
 
@@ -13,7 +14,7 @@
 
 ```bash
 export REPO=/workspace/code/ktransformer/ktransformers-AK
-export PYTHONPATH="$REPO/third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 **自检**（应打印出带 `ktransformers-AK/third_party/sglang` 的路径，而不是 `/sgl-workspace/...` 或纯 site-packages）：
@@ -23,6 +24,10 @@ python3 -c "import sglang; print(sglang.__file__)"
 ```
 
 本手册里凡写 `python -m sglang.launch_server`、`tools/run_p22_smoke_checks.sh` 等，均**默认**已按上式设置 `PYTHONPATH`；若你直接打 `sglang` 命令却看不到 Phase 2 行为，多半就是加载了**错误那份** SGLang。
+
+**容器重启后**：不必重编的情况下，优先读 **[P27_容器重启后复现手册](./P27_容器重启后复现手册.md)**（`libhwloc15` → `p27_e2e_preflight.sh` → graph launch → F2）。
+
+**kt-kernel 扩展模块**（`kt_kernel_ext`）与 SGLang 不同：即使 `PYTHONPATH` 含 `kt-kernel/python`，**新编的 `.so` 仍须落到该目录内**才会被加载（外置 CMake 目录不会自动生效）。详见 **§2.4**。
 
 ---
 
@@ -56,6 +61,8 @@ git log -3 --oneline
 | `kt-kernel/setup.py` | 修改 | `CPUINFER_USE_ASCEND_NPU`、CANN 探测、`LLAMA_ARM_*`、aarch64 默认 `KML=OFF` |
 | `kt-kernel/install.sh` | 修改 | aarch64 上探测 ARM feature / CANN、`CPUINFER_ENABLE_KML=OFF` 等 export |
 | `third_party/llamafile/iqk_mul_mat_arm82.cpp` | 修改 | 取消注释 `#define iqk_mul_mat iqk_mul_mat_arm82` 等，修复 `_arm82` 符号缺失导致的 `dlopen` 失败 |
+| `kt-kernel/operators/llamafile/moe.hpp` | 修改（任务 3） | `kt_effective_vec_dot_type`（aarch64 无 SVE 时 BF16 权重视作 F32 输入）；`kt_llamafile_sgemm` 对 Q8_0×Q8_0 走 `ggml_vec_dot_q8_0_q8_0`；MoE 内 `llamafile_sgemm` 调用改经 `kt_llamafile_sgemm` |
+| `kt-kernel/python/utils/llamafile.py` | 修改（任务 3） | `gate_type/up_type/down_type` 显式 `int()`；`chunked_prefill_size<=0` 回落 2048；可选 `KT_DEBUG_Q8=1` 打印 ggml 类型 |
 | `kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/**` | 恢复（可选） | 历史提交曾删除；`git checkout <parent> -- ...` 恢复后 **默认不参与编译**（SVE 汇编与 K920 不兼容），供 Phase 4 参考 |
 
 ### 2.2 系统依赖（非 Git，复现时按需）
@@ -91,13 +98,19 @@ cmake /workspace/code/ktransformer/ktransformers-AK/kt-kernel \
 cmake --build . --parallel "$(nproc)"
 ```
 
-**Python 冒烟**（将 `sys.path` 指向 build 目录或 `pip install -e . --no-deps` 后已安装扩展）：
+**编译产物必须同步到包目录**（见 §2.4）：CMake 默认把 `.so` 留在 build 目录（如 `/tmp/kt_kernel_build`），**改代码后若只 `cmake --build` 不拷贝，Python 仍会加载旧库**。
+
+**Python 冒烟**（与 P2.7 / `KTMoEWrapper` 一致：走 `kt-kernel/python` 包路径，不要只 `sys.path.insert(0, "/tmp/kt_kernel_build")`）：
 
 ```bash
+export REPO=/workspace/code/ktransformer/ktransformers-AK
+cp -f /tmp/kt_kernel_build/kt_kernel_ext*.so "$REPO/kt-kernel/python/"
+export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel/python"
+
 /usr/local/python3.11.14/bin/python3 - <<'PY'
-import sys
-sys.path.insert(0, "/tmp/kt_kernel_build")  # 或 site-packages
-import kt_kernel_ext as ext
+from kt_kernel import kt_kernel_ext as ext
+import kt_kernel_ext
+print("ext path:", kt_kernel_ext.__file__)
 assert hasattr(ext, "moe") and hasattr(ext.moe, "MOE")
 ci = ext.CPUInfer(8)
 assert hasattr(ci, "submit_with_cuda_stream")
@@ -111,7 +124,55 @@ PY
 ldd /tmp/kt_kernel_build/kt_kernel_ext*.so | grep -E 'ascendcl|hwloc|numa'
 ```
 
-**期望**：`import` 无 `undefined symbol: iqk_mul_mat_moe_arm82`；`ldd` 可见 `libascendcl.so`（若启用 NPU 选项）。
+**期望**：`import` 无 `undefined symbol: iqk_mul_mat_moe_arm82`；`ldd` 可见 `libascendcl.so`（若启用 NPU 选项）；`kt_kernel_ext.__file__` 落在 **`$REPO/kt-kernel/python/`** 且修改时间不早于本次 `cmake --build`。
+
+### 2.4 kt-kernel 编译产物与 Python 加载路径（必读）
+
+与 §0 中 SGLang 的 `PYTHONPATH` 问题类似：**仅把 `/tmp/kt_kernel_build` 写在 `PYTHONPATH` 最前，并不能让已安装的 `kt_kernel` 包加载到新编的 `kt_kernel_ext`**。
+
+| 项 | 说明 |
+|----|------|
+| **实际加载路径** | `from kt_kernel import kt_kernel_ext` 会解析到 **`kt-kernel/python/kt_kernel_ext.cpython-*.so`**（与 `kt_kernel/__init__.py` 同目录的扩展模块），**不会**因为 `PYTHONPATH` 里有 build 目录就自动改用 `/tmp/kt_kernel_build` 下的 `.so`。 |
+| **典型踩坑** | 在 `/tmp/kt_kernel_build` 里反复 `cmake --build`，但 `kt-kernel/python/` 里仍是数小时前的旧 `.so` → 代码/调试日志“不生效”、Q8_0 MoE 仍 NaN 等。 |
+| **推荐流程** | 编完后**显式覆盖**包内 `.so`，再跑 B+ / e2e。 |
+
+**标准流程（CMake 外置 build 目录，内网 pip 超时时常用）**：
+
+```bash
+export REPO=/workspace/code/ktransformer/ktransformers-AK
+export PYBIN=/usr/local/python3.11.14/bin/python3.11
+
+mkdir -p /tmp/kt_kernel_build && cd /tmp/kt_kernel_build
+cmake "$REPO/kt-kernel" \
+  -DKTRANSFORMERS_USE_ASCEND_NPU=ON \
+  -DLLAMA_NATIVE=OFF \
+  -DLLAMA_ARM_DOTPROD=ON -DLLAMA_ARM_FP16=ON \
+  -DLLAMA_ARM_SVE=OFF -DLLAMA_ARM_BF16=OFF -DLLAMA_ARM_I8MM=OFF \
+  -DKTRANSFORMERS_CPU_USE_KML=OFF -DKTRANSFORMERS_CPU_MOE_KERNEL=OFF \
+  -DPYTHON_EXECUTABLE="$PYBIN" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build . --parallel "$(nproc)"
+
+# 关键：同步到 Python 包目录（改 moe.hpp / ext_bindings.cpp 后务必执行）
+cp -f /tmp/kt_kernel_build/kt_kernel_ext*.so "$REPO/kt-kernel/python/"
+```
+
+**等价方式**：在 `kt-kernel` 目录执行 `pip install -e . --no-deps`（`setup.py` / `build_ext --inplace` 会把扩展写回 `kt-kernel/python/`），前提是 pip 源可用。
+
+**自检（每次改 C++ 后建议跑）**：
+
+```bash
+export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel/python"
+$PYBIN -c "from kt_kernel import kt_kernel_ext; print(kt_kernel_ext.__file__)"
+ls -la "$REPO/kt-kernel/python/kt_kernel_ext"*.so /tmp/kt_kernel_build/kt_kernel_ext*.so
+```
+
+- `__file__` 必须指向 **`$REPO/kt-kernel/python/...`**。
+- 两个路径下 `.so` 的 **mtime / 大小应一致**（或至少包内文件不早于本次 build）。
+
+**增量编译提示**：改 `operators/llamafile/moe.hpp` 等头文件时，若链接未重编 `ext_bindings.cpp`，可 `touch "$REPO/kt-kernel/ext_bindings.cpp"` 后再 `cmake --build`。
+
+**K920 + Q8_0（LLAMAFILE）**：aarch64 无 SVE/i8mm 时，`kt-kernel/operators/llamafile/moe.hpp` 中 `kt_llamafile_sgemm` 对 Q8_0×Q8_0 走 `ggml_vec_dot_q8_0_q8_0` 回退（避免 llamafile `iqk_mul_mat` / tinyBLAS 路径 NaN）。**须加载含该改动的 `.so`** 后，`tools/p27_cpu_moe_reference_check.py --method LLAMAFILE` 才能 PASS；GGUF 权重本身可用 `tools/p27_verify_q8_gguf_layer.py` 单独校验，**一般无需重转 Q8_0**。
 
 ---
 
@@ -122,7 +183,9 @@ ldd /tmp/kt_kernel_build/kt_kernel_ext*.so | grep -E 'ascendcl|hwloc|numa'
 | 路径 | 摘要 |
 |------|------|
 | `tools/convert_w8a8_to_gguf_q8_0.py` | 单层：从 HF `index.json` 读 `layers.{L}.ffn.experts.*` 或 `model.layers.*`，反量化 W8A8，`gguf` 写 `blk.{L}.ffn_{gate,up,down}_exps.weight`（Q8_0） |
-| `tools/batch_convert_w8a8_layers_mp.py` | **层间多进程**：`ProcessPoolExecutor` + 子进程调单层脚本；`--skip-existing`、`--verify-sample` |
+| `tools/batch_convert_w8a8_layers_mp.py` | **层间多进程**：`ProcessPoolExecutor` + 子进程调单层脚本；`--skip-existing`、`--verify-sample`；`--quant q8_0\|bf16` |
+| `tools/p27_verify_q8_gguf_layer.py` | 单层 GGUF vs W8A8 dequant 对账（不跑 kt-kernel MoE） |
+| `tools/p27_cpu_moe_reference_check.py` | **B+**：纯 PyTorch ref vs `KTMoEWrapper(LLAMAFILE)`；需 NPU stream + `KT_FORCE_SYNC_SUBMIT=1` |
 | `third_party/llama.cpp/gguf-py/gguf/gguf_reader.py` | **NumPy 2**：`ndarray.newbyteorder` 移除后用 `_np_apply_byteorder` + `view(dtype.newbyteorder(...))` |
 
 ### 3.2 权重与输出路径约定
@@ -219,6 +282,7 @@ done
 6. **Phase 2-B**（多 GGUF 同进程）：见 §8.2，`phase12_...py` 带 `--second-gguf` / `--second-layer-idx`。
 7. **P2.2**（KT EP 设备无关）：见 §8.4；`bash tools/run_p22_smoke_checks.sh`。
 8. **NPU 回归**（可选）：`import torch; import torch_npu`、原 8 卡启动脚本抽测。
+9. **任务 3 Q8_0（K920）**：§11 全流程——编译同步 `.so` → 批量 GGUF → B+ 抽样 → `p27_e2e_preflight` → `p27_launch_*` + F2 curl。
 
 ---
 
@@ -232,6 +296,8 @@ done
 | `import torch` 报 torch_npu undefined symbol | torch 与 torch_npu 主版本不一致 | 恢复 **torch 2.8.x** 与现有 **torch_npu** 匹配 |
 | `--verify-reader` 崩在 NumPy 2 | `GGUFReader` 旧 API | 已修 `gguf_reader.py` 中 `_np_apply_byteorder` |
 | `import kt_kernel_ext` 缺 `iqk_mul_mat_moe_arm82` | llamafile 宏未定义 | 已修 `iqk_mul_mat_arm82.cpp` |
+| **改 kt-kernel C++ 后行为不变 / 调试日志不出现** | 只编了 `/tmp/kt_kernel_build`，`kt-kernel/python/*.so` 仍是旧的 | 见 §2.4：`cp` 新 `.so` 到 `kt-kernel/python/`，`print(kt_kernel_ext.__file__)` 自检 |
+| **Q8_0 LLAMAFILE MoE 输出全 NaN** | 旧 `.so` 上 K920 的 Q8×Q8 sgemm 路径坏 | 更新 `.so`（含 `moe.hpp` vec_dot 回退）+ §2.4 同步；权重用 `p27_verify_q8_gguf_layer.py` 排查 |
 | **改 Phase 2 后行为与文档不一致** | 实际跑的是 `/sgl-workspace/sglang` 或 pip 里的包，未加载 `third_party/sglang` | 见 `Phase0_Phase1_变更记录与复现手册.md` §0：`PYTHONPATH` + `print(sglang.__file__)` 自检 |
 
 ---
@@ -338,8 +404,11 @@ rsync -a --delete --exclude='.git' /sgl-workspace/sglang/ third_party/sglang/
 | `third_party/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py` | 修改 | （a）`KTMoEWrapper` 构造参数适配本机 `kt_kernel 2026.x` wheel：传 `gpu_experts_mask: BoolTensor` 与 `numa_nodes=None`，而非 `num_gpu_experts: int`；（b）`load_weights/submit/sync` 内 stream 调用全部换成 `kt_accel.kt_current_stream_handle / kt_device_synchronize`；（c）权重路径走 `resolve_kt_weight_path_for_layer` 以支持 `{layer_idx}` / 单个 `{}` 占位符；（d）`mask_cpu_expert_ids` 重写为 `mask_cpu_expert_routing`：用 `torch.where` 把 CPU expert id 与 weight 同时改写为 `(0, 0.0)`，规避 NPU `npu_moe_init_routing/compute_expert_tokens` 对负 id 不支持，以及 `torchair` 对 `aten.index_put.default` 的不支持 |
 | `third_party/sglang/python/sglang/srt/hardware_backend/npu/allocator_npu.py` | 修改 | import 期一次性探测 `triton.runtime.driver.driver.active`；探测失败（NPU 现状）就让 `alloc_extend` 跳过 `< 200 pages` 的 `@triton.jit` 快路径，统一走同文件已存在的 `alloc_extend_naive`（纯 torch，分配 KV 索引，与 forward 数值无关） |
 | `third_party/sglang/python/sglang/srt/mem_cache/common.py` | 修改 | 同样的 driver 探测；新增 `_write_req_to_token_pool_torch` / `_write_req_to_token_pool_only_alloc_size_torch` 两个 torch 等价实现；`write_multi_cache_indices`（baseline 漏判 `support_triton('ascend')`、6 处无脑调 triton）、`write_cache_indices`、`get_last_loc` 三处统一在 driver 不可用时落 torch 分支 |
-| `tools/p27_launch_ds4flash_npu.sh` | 修改 | （a）`PYTHON_BIN` 探测：依次试 `python3` / `python3.11` / `/usr/local/python3.11.14/bin/python3.11` 等，找第一个能 `import numpy/torch/torch_npu/sglang` 的；脚本里所有 `python3 -c` / `-m sglang.launch_server` 改成 `${PYTHON_BIN}`，避免 `source set_env.sh` 后 PATH 被改、`python3` 跑到 `/usr/bin/python3`（没装 numpy）。（b）参数与基线 8 卡 `launch_ds4flash_sglang.sh` 取「单卡子集」对齐：补 `--cuda-graph-bs 1` / `--disable-radix-cache` / `--max-prefill-tokens 65535` / `--context-length 65536` / `--watchdog-timeout 18000` / `--skip-server-warmup`。（c）引入 `EXTRA_FLAGS` 变量便于临时叠 `--disable-cuda-graph` 等调试 flag |
+| `tools/p27_launch_ds4flash_npu.sh` | 修改 | 同下；`--kt-num-gpu-experts 32`（hybrid）。**2026-05-19** 默认 `KT_GGUF_TEMPLATE` 改为 Q8_0 `dsv4_layer{layer_idx}.gguf`（原 `_bf16.gguf`），见 §11.1 |
+| `tools/p27_launch_ds4flash_npu_num_expert_0.sh` | 修改 | （a）`PYTHON_BIN` 探测：依次试 `python3` / `python3.11` / `/usr/local/python3.11.14/bin/python3.11` 等，找第一个能 `import numpy/torch/torch_npu/sglang` 的；脚本里所有 `python3 -c` / `-m sglang.launch_server` 改成 `${PYTHON_BIN}`，避免 `source set_env.sh` 后 PATH 被改、`python3` 跑到 `/usr/bin/python3`（没装 numpy）。（b）参数与基线 8 卡 `launch_ds4flash_sglang.sh` 取「单卡子集」对齐：补 `--cuda-graph-bs 1` / `--disable-radix-cache` / `--max-prefill-tokens 65535` / `--context-length 65536` / `--watchdog-timeout 18000` / `--skip-server-warmup`。（c）引入 `EXTRA_FLAGS` 变量便于临时叠 `--disable-cuda-graph` 等调试 flag |
 | `tools/p27_curl_generate.sh` | 沿用 | 对已起服务发一发 `/generate`，无改动 |
+| `tools/p27_curl_f2_prompts.sh` | **新建** | Handoff Z.8 四 prompt 整网冒烟（§11.5） |
+| `tools/p27_e2e_preflight.sh` | **新建** | e2e 前 43 层 GGUF + `kt_kernel_ext` 路径检查（§11.4⑤） |
 
 > **绝大多数原 fork 的 fallback 补丁（`tilelang` / `deep_gemm` / `complex64` / `_real_freqs_for_npu` / `_fused_rope_torch_fallback` 等）随 baseline 切换被自动撤回**，仅保留 KT/NPU 同步与 Triton 兜底两小块下游 patch。详细背景见 `Handoff §6.10`。
 
@@ -403,7 +472,7 @@ def mask_cpu_expert_routing(topk_ids, topk_weights, num_gpu_experts):
 ```bash
 # 1) 确认 PYTHONPATH 与 PYTHON_BIN：脚本会自检，但建议事先在 shell 里也指向
 export REPO=/workspace/code/ktransformer/ktransformers-AK
-export PYTHONPATH="$REPO/third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
 
 # 2) 启动单卡服务（脚本内部自动 source CANN set_env、自动锁 PYTHON_BIN）
 ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/p27.log
@@ -427,14 +496,274 @@ output_ids: [223, 223, 3, 223, 223, 3, ...]   # 全是空格(223) 与 "!"(3)
 
 服务从 import → load_weights → npu graph capture → 接 prefill → 完成 decode 全链都跑通，**数值环节出错**。这与 Triton fallback 无关（fallback 只动 KV 索引），属于下一阶段工作；具体诊断顺序与对照实验见 `Handoff §6.11`。
 
-### 9.7 P2.7 验收（更新）
+### 9.7 P2.7 验收（历史快照，2026-05-13）
 
 - [x] `sglang serve` 起来后接受 HTTP 请求，返回 200 OK
 - [x] HBM 占用观测：`max_total_num_tokens=4276224, avail mem=7.92 GB`（mem_fraction_static=0.85 下 NPU 剩 ~8 GB）
 - [x] 服务在「卡死 import / aclnnMatmul aicore exception / 0 active drivers」三类典型 NPU 错误后都已能稳定启动
-- [ ] **生成内容语义有效**（与 8 卡基线同 prompt 同 seed 输出"接近"，容许 Q8_0 量化误差）—— **未达成，下一阶段**
-- [ ] tokens/sec baseline 数据采集（先把数值修对再录）
+
+> **2026-05-19 更新**：BF16 GGUF layout 修复后 F2/F3 四 prompt e2e 已通过；退化 `!` 问题已关闭。见 `Handoff` 附录 Z.7–Z.10。Q8_0 与 graph 见下文 §10。
 
 ---
 
-**文档维护**：Phase 2 其它子项完成后，可继续在本文 §8/§9 下追加小节。
+## 10. 任务 2：NPU Graph + KT CPU MoE（2026-05，已完成）
+
+详 **`Handoff` 附录 Z.14**。摘要：
+
+| 项 | 内容 |
+|----|------|
+| Commits | 主仓 `29c082e`；`third_party/sglang` `db577d2e8` |
+| kt-kernel | `ascend_callback_worker.{h,cpp}` + `experts_base` pin/graph API |
+| sglang | `kt_ep_wrapper.py`：decode `_launch_host_func` + `run_pinned_forward_sync` |
+| launch | 默认 **开启** cuda-graph；`PYTHONPATH` 含 `kt-kernel/python` |
+
+**部署前必做**：
+
+```bash
+cd $REPO/kt-kernel
+export CPUINFER_USE_ASCEND_NPU=1
+python setup.py build_ext --inplace
+```
+
+**复现（graph on，卡 2 示例）**：
+
+```bash
+export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel/python"
+ASCEND_RT_VISIBLE_DEVICES=2 bash $REPO/tools/p27_launch_ds4flash_npu_num_expert_0.sh
+# 期望：capture ~7–11s；Decode npu graph: True；无 ERR 107027
+# 四个 curl：见 Handoff Z.8
+```
+
+**调试**：`KT_FORCE_SYNC_SUBMIT=1`；`EXTRA_FLAGS="--disable-cuda-graph"`；`KT_DEBUG_HYBRID_MOE=1`（N=32）。
+
+**任务 3（Q8_0）**：详见 **§11**（含代码、编译、B+、整网）。layer3 B+ 在同步新 `kt_kernel_ext.so` 后 cosine≥0.99；e2e 与 Handoff Z.5 / Z.8 对齐。
+
+---
+
+## 11. 任务 3：K920 Q8_0 CPU MoE + 整网验证（2026-05）
+
+### 11.1 双通路权重（拉 `p27_launch_*` 时必读）
+
+整网服务**同时**加载两套权重，互不替代：
+
+| 启动参数 | 典型值 | 管什么 | 格式 |
+|----------|--------|--------|------|
+| `--model-path` | `/workspace/models/DeepSeek-V4-Flash-W8A8` | NPU 主干（Attention、Dense、Gate、非 offload 部分） | HF **W8A8** + `--quantization compressed-tensors` |
+| `--kt-weight-path` | `KT_GGUF_TEMPLATE` 模板 | **CPU routed expert**（256×FFN，按层 mmap） | 你 convert 的 **GGUF**（Q8_0 或 BF16） |
+
+- `--dtype bfloat16` 是**激活计算精度**，不是「整模权重目录为 bf16」。
+- **以前 launch 默认 `..._bf16.gguf`**：仅指 **CPU MoE 的 GGUF**；NPU 侧**一直是 W8A8**。
+- **2026-05-19 起** `p27_launch_ds4flash_npu*.sh` 默认 `KT_GGUF_TEMPLATE=/workspace/models/cache/dsv4_layer{layer_idx}.gguf`（批量 convert 的 **Q8_0**）。BF16 CPU expert 需手动 `export KT_GGUF_TEMPLATE='..._bf16.gguf'`。
+
+`kt_ep_wrapper.resolve_kt_weight_path_for_layer(template, layer_idx)` 把 `{layer_idx}` 展开为每层文件路径。
+
+### 11.2 代码改动清单（任务 3）
+
+| 路径 | 摘要 |
+|------|------|
+| `kt-kernel/operators/llamafile/moe.hpp` | **根因修复**：鲲鹏 920（`armv8.2-a+dotprod`，**无 SVE / 无 i8mm**）上 llamafile `iqk_mul_mat` / `tinyBLAS_Q0_ARM` 对 Q8_0×Q8_0 出 NaN；`kt_llamafile_sgemm` 在 `ith==0 && nth==1` 时对 Q8_0 走 `ggml_vec_dot_q8_0_q8_0`。同文件 `kt_effective_vec_dot_type`：BF16 权重视作 F32 激活以走已支持的 NEON 路径。 |
+| `kt-kernel/python/utils/llamafile.py` | `moe_config.gate_type/up_type/down_type = int(...)`；`chunked_prefill_size<=0` → 2048（防 C++ buffer 按 qlen=1 分配越界，见 Handoff Z.9）。 |
+| `tools/p27_verify_q8_gguf_layer.py` | 离线验证 GGUF 与 W8A8 dequant 一致（排除「转坏了」） |
+| `tools/p27_cpu_moe_reference_check.py` | 单层 B+（与 e2e 同 `KTMoEWrapper` 路径） |
+| `tools/p27_e2e_preflight.sh` | e2e 前：43 层 GGUF 是否存在 + `kt_kernel_ext.__file__` 是否在 `kt-kernel/python/` |
+| `tools/p27_curl_f2_prompts.sh` | Handoff Z.8 四个 `/generate` prompt |
+| `tools/p27_launch_ds4flash_npu_num_expert_0.sh` | **N=0** 全 CPU expert；默认 Q8_0 `KT_GGUF_TEMPLATE`；启动时打印 `kt-weight-path template=...` |
+| `tools/p27_launch_ds4flash_npu.sh` | **N=32** hybrid（`--kt-num-gpu-experts 32`）；默认同上 Q8_0 模板 |
+
+**不必重转 GGUF 的典型情况**：`p27_verify_q8_gguf_layer.py` 已通过，仅 B+ NaN → 几乎都是 **未 `cp` 新 `.so`**（§2.4）。
+
+**输入仍是 HF W8A8**：`convert_w8a8_to_gguf_q8_0.py` / `batch_convert_w8a8_layers_mp.py` 读 safetensors（`int8` + `weight_scale`），**不会**再生成一套「批量 W8 中间文件」；输出仅为 per-layer `.gguf`。
+
+### 11.3 编译与同步（每次改 C++ 后）
+
+与 §2.4 相同，此处给任务 3 常用一条龙：
+
+```bash
+export REPO=/workspace/code/ktransformer/ktransformers-AK
+export PYBIN=/usr/local/python3.11.14/bin/python3.11
+
+mkdir -p /tmp/kt_kernel_build && cd /tmp/kt_kernel_build
+cmake "$REPO/kt-kernel" \
+  -DKTRANSFORMERS_USE_ASCEND_NPU=ON \
+  -DLLAMA_NATIVE=OFF \
+  -DLLAMA_ARM_DOTPROD=ON -DLLAMA_ARM_FP16=ON \
+  -DLLAMA_ARM_SVE=OFF -DLLAMA_ARM_BF16=OFF -DLLAMA_ARM_I8MM=OFF \
+  -DKTRANSFORMERS_CPU_USE_KML=OFF -DKTRANSFORMERS_CPU_MOE_KERNEL=OFF \
+  -DPYTHON_EXECUTABLE="$PYBIN" \
+  -DCMAKE_BUILD_TYPE=Release
+
+# 改 moe.hpp 等头文件后若未自动重链：
+touch "$REPO/kt-kernel/ext_bindings.cpp"
+cmake --build . --parallel "$(nproc)"
+
+cp -f /tmp/kt_kernel_build/kt_kernel_ext*.so "$REPO/kt-kernel/python/"
+
+export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel/python"
+$PYBIN -c "from kt_kernel import kt_kernel_ext; print(kt_kernel_ext.__file__)"
+# 必须落在 $REPO/kt-kernel/python/ 且 mtime 不早于本次 build
+```
+
+等价：`cd $REPO/kt-kernel && pip install -e . --no-deps`（pip 源可用时）。
+
+### 11.4 分层校验（建议顺序）
+
+统一环境（B+ / 部分工具）：
+
+```bash
+export REPO=/workspace/code/ktransformer/ktransformers-AK
+export PYBIN=/usr/local/python3.11.14/bin/python3.11
+export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel/python"
+export KT_FORCE_SYNC_SUBMIT=1
+export ASCEND_RT_VISIBLE_DEVICES=1   # B+ 需真实 NPU stream；无卡见 p27_cpu_moe_reference_check.py 说明
+```
+
+**① 权重：单层 GGUF vs W8A8（可选，~10s）**
+
+```bash
+$PYBIN $REPO/tools/p27_verify_q8_gguf_layer.py \
+  --w8a8 /workspace/models/DeepSeek-V4-Flash-W8A8 \
+  --gguf /workspace/models/cache/dsv4_layer3.gguf \
+  --layer-idx 3 --expert-idx 38
+```
+
+期望：cosine≈1.0，`finite=True`。若命名是 `dsv4_layer3_q8_0.gguf`，改 `--gguf` 路径即可。
+
+**② 批量转换 0–42 层（磁盘 ~295 GiB Q8_0）**
+
+```bash
+$PYBIN $REPO/tools/batch_convert_w8a8_layers_mp.py \
+  --input /workspace/models/DeepSeek-V4-Flash-W8A8 \
+  --output-dir /workspace/models/cache \
+  --layer-start 0 --layer-end 42 \
+  --quant q8_0 --jobs 4 --skip-existing --verify-sample 3
+```
+
+输出默认：`/workspace/models/cache/dsv4_layer{L}.gguf`（**无** `_q8_0` 后缀）。
+
+**③ B+：单层（改代码后必跑）**
+
+```bash
+cd $REPO
+$PYBIN tools/p27_cpu_moe_reference_check.py \
+  --w8a8 /workspace/models/DeepSeek-V4-Flash-W8A8 \
+  --gguf /workspace/models/cache/dsv4_layer3.gguf \
+  --layer-idx 3 --batch 4 --seed 1 --method LLAMAFILE
+```
+
+期望：`cosine_sim >= 0.990`，`finite(cand)=True`，`RESULT: PASS`。
+
+**④ B+：全量转完后随机抽 5 层**
+
+```bash
+export GGUF_DIR=/workspace/models/cache
+export GGUF_SUFFIX=    # 若文件名为 dsv4_layer{L}_q8_0.gguf 则 export GGUF_SUFFIX=_q8_0
+
+cd $REPO
+for L in 0 10 21 32 42; do
+  echo "========== B+ layer $L =========="
+  $PYBIN tools/p27_cpu_moe_reference_check.py \
+    --w8a8 /workspace/models/DeepSeek-V4-Flash-W8A8 \
+    --gguf "${GGUF_DIR}/dsv4_layer${L}${GGUF_SUFFIX}.gguf" \
+    --layer-idx "$L" --batch 4 --seed 1 --method LLAMAFILE || exit 1
+done
+```
+
+真随机（种子 42）：
+
+```bash
+LAYERS=$($PYBIN -c "import random; random.seed(42); print(' '.join(map(str, sorted(random.sample(range(43), 5)))))")
+for L in $LAYERS; do
+  $PYBIN tools/p27_cpu_moe_reference_check.py \
+    --w8a8 /workspace/models/DeepSeek-V4-Flash-W8A8 \
+    --gguf "${GGUF_DIR}/dsv4_layer${L}${GGUF_SUFFIX}.gguf" \
+    --layer-idx "$L" --batch 4 --seed 1 --method LLAMAFILE || exit 1
+done
+```
+
+**⑤ e2e 前静态检查（不跑模型）**
+
+```bash
+bash $REPO/tools/p27_e2e_preflight.sh
+# 自定义：GGUF_SUFFIX=_q8_0 GGUF_DIR=/path bash ...
+```
+
+检查：43 个 `.gguf` 存在且 ≥6GiB；`kt_kernel_ext` 路径；`/tmp/kt_kernel_build` 是否有未 `cp` 的新 `.so`。
+
+### 11.5 整网拉起与 HTTP 冒烟
+
+**终端 1 — 起服务（F2：全 CPU expert，推荐先过）**
+
+```bash
+export REPO=/workspace/code/ktransformer/ktransformers-AK
+export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel/python"
+
+# 物理卡按机器改
+NPU_DEVICE_ID=1 bash $REPO/tools/p27_launch_ds4flash_npu_num_expert_0.sh 2>&1 | tee /tmp/p27_n0.log
+```
+
+启动日志应含：
+
+- `[p27] quantization=compressed-tensors`（NPU W8A8）
+- `[p27] kt-weight-path template=/workspace/models/cache/dsv4_layer{layer_idx}.gguf`（CPU Q8_0 GGUF）
+- 约 7–11 分钟后：`The server is fired up and ready to roll!`
+
+**非默认 GGUF 命名时**（启动前 export）：
+
+```bash
+# BF16 CPU expert 回退
+export KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
+# 或手工命名 Q8_0
+export KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_q8_0.gguf'
+```
+
+**调试**（先排除 graph / stream）：
+
+```bash
+KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" \
+  NPU_DEVICE_ID=1 bash $REPO/tools/p27_launch_ds4flash_npu_num_expert_0.sh
+```
+
+**Hybrid（32 GPU expert + 其余 CPU）**
+
+```bash
+NPU_DEVICE_ID=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/p27_n32.log
+```
+
+**终端 2 — HTTP**
+
+```bash
+# 单条
+bash $REPO/tools/p27_curl_generate.sh
+
+# F2 四 prompt（Handoff Z.8，整网判据）
+HOST=127.0.0.1 PORT=8000 bash $REPO/tools/p27_curl_f2_prompts.sh
+```
+
+人工看 JSON 里 `text`：无整段 `! ! !`、无乱码即可（base 模型不考核指令遵循）。详见 Handoff Z.8。
+
+### 11.6 工具脚本索引
+
+| 脚本 | 阶段 |
+|------|------|
+| `tools/convert_w8a8_to_gguf_q8_0.py` | 单层 W8A8 → GGUF |
+| `tools/batch_convert_w8a8_layers_mp.py` | 0–42 层批量 convert |
+| `tools/p27_verify_q8_gguf_layer.py` | GGUF 权重 sanity |
+| `tools/p27_cpu_moe_reference_check.py` | 单层 B+ |
+| `tools/p27_e2e_preflight.sh` | e2e 前文件 + `.so` 检查 |
+| `tools/p27_launch_ds4flash_npu_num_expert_0.sh` | 整网 serve（N=0） |
+| `tools/p27_launch_ds4flash_npu.sh` | 整网 serve（N=32） |
+| `tools/p27_curl_generate.sh` | 单条 generate |
+| `tools/p27_curl_f2_prompts.sh` | F2 四 prompt |
+| `tools/phase12_llamafile_moe_smoke.py` | 轻量 forward（无 B+ 对账） |
+
+### 11.7 任务 3 验收勾选
+
+- [ ] `cp` 后 `kt_kernel_ext.__file__` 在 `kt-kernel/python/`，且含 Q8 vec_dot 修复
+- [ ] 43 层 `dsv4_layer{L}.gguf` 齐全（`p27_e2e_preflight.sh`）
+- [ ] 至少 1 层 + 抽样多层 B+ `RESULT: PASS`
+- [ ] `p27_launch_ds4flash_npu_num_expert_0.sh` 起服 + F2 四 curl 正文正常
+- [ ] （可选）`p27_launch_ds4flash_npu.sh` hybrid + 四 curl
+
+---
+
+**文档维护**：Phase 2 / Graph / Q8 子项完成后，在 §8–§11 追加实测数据。

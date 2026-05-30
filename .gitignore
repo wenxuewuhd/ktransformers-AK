@@ -31,6 +31,7 @@ CMakeFiles/
 kvc2/
 sched/
 *.png
-model/DeepSeek-R1-GGUF/model/w8a8/
+model/DeepSeek-R1-GGUF/
+model/w8a8/
 # Local Ascend CANN/NNAL install under acsend/ (large; do not commit)
 acsend/Ascend/

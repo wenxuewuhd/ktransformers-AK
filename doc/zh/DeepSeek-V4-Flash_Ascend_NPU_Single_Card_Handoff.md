@@ -27,15 +27,23 @@
 
 **目标**：让 DeepSeek-V4-Flash（671B MoE，256 routed experts/层）在**单卡 Atlas 910B (64 GB HBM) + 鲲鹏 920 (1.5 TB DRAM, 192 cores, 8 NUMA)** 上跑起来，方式是把约 16/256 个"热"expert 留 NPU，剩 240/256 走 CPU 端 `kt-kernel`（llamafile GGUF Q8_0 backend, NEON SDOT）。
 
-**当前进度**（2026-05-13）：
-- ✅ Phase 0 完成：`kt_kernel_ext.cpython-311-aarch64-linux-gnu.so` 在 K920+CANN 上编出来、import 通、`CPUInfer/MOEConfig/MOE` 全 OK。
-- ✅ Phase 1.1 + 1.2 完成：W8A8→GGUF Q8_0 转换器 + Llamafile MoE 单层冒烟，43 层 GGUF 已经预生成至 `/workspace/models/cache/`。
-- ✅ Phase 2-B + P2.2 + P2.3 完成：`third_party/sglang` 已切到 baseline **`iforgetmyname/sglang@dsv4_release`**，KT 在 baseline 上 backport 了 `kt_accel.py` 与 `kt_ep_wrapper.py` 三处 NPU-friendly 改动；详见 `Phase0_Phase1_变更记录与复现手册.md §8 / §9`。
-- ✅ **P2.7 wiring 打通**：单卡 NPU + KT(LLAMAFILE) + DSv4-Flash W8A8 服务可以起、能接 `/generate` 并返回 200 OK，e2e_latency ≈ 2.3s。
-- ⏳ **当前阻塞**：生成内容是退化 token（"  !  !  !  !  …" 全是空格 / `!`），属于**数值问题**而非 wiring 问题。诊断与对照实验计划见 §6.11。
-- ⏳ 之后：Phase 3 CPU↔NPU 异步 overlap（性能）、Phase 4 KML 精度回归（可选）。
+**当前进度**（2026-05-19，以 git 为准）：
+- ✅ Phase 0 / 1 / 2（F1–F3）：BF16 GGUF 43 层、N=0 与 N=32 hybrid e2e、layout + `chunked_prefill_size` 等见附录 Z。
+- ✅ **任务 2（NPU Graph + KT CPU MoE）**：ACL callback worker + `kt_ep_wrapper` host callback；launch **默认开启** cuda-graph；卡 2 上 Graph capture ~7–11s、F2 四 prompt 通过（N=0 / N=32）。详 **附录 Z.14**。
+- ⏳ **任务 3（Q8_0）进行中**：aarch64 `tinyBLAS_Q0_ARM` 仍 NaN；BF16 为 regression 基线。详 Z.5 / Z.12。
+- ⏳ **后续**：mxfp4 原生权重、Graph 性能调参（`TASK_QUEUE_ENABLE`、多 `cuda_graph_bs`）、EPLB 动态 mask 等。详 Z.12。
 
-**关键约束**：K920 是 ARMv8.2-A + NEON SDOT，**没有 SVE / BF16 / I8MM**。kt-kernel 自带的 `Int8_KERNEL_MOE`/`Int4_KERNEL_MOE` 是纯 SVE 汇编写的，在 K920 上跑不通，所以 CPU 这条腿先走 **llamafile GGUF Q8_0**（NEON SDOT 路径），Phase 4 再考虑用 KML libkblas 的 `cblas_gemm_s8s8s32` 替换核心 GEMM 做精度回归。
+**Commits（任务 2 参考）**：主仓 `29c082e`；子模块 `third_party/sglang` `db577d2e8`（`kt_ep_wrapper` graph 路径）。
+
+**部署前编译 kt-kernel（NPU callback 必选）**：
+
+```bash
+cd kt-kernel
+export CPUINFER_USE_ASCEND_NPU=1
+python setup.py build_ext --inplace
+```
+
+**关键约束**：K920 无 SVE/i8mm；CPU offload 当前生产路径为 **BF16 GGUF**（~555 GiB）。Q8_0 修通后可降到 ~280 GiB。MOE_INT8/KML 在 K920 不可用。
 
 ---
 
@@ -1073,33 +1081,33 @@ ${PYTHON_BIN} $REPO/tools/phase12_llamafile_moe_smoke.py \
 
 **目标**：让 CPU expert 计算和 NPU expert 计算真正并行，性能提升预期 1.5-2x。
 
-### 7.1 关键工作
+### 7.0 已完成（任务 2，2026-05）—— Graph 下 CPU MoE 正确性
 
-1. **落地 CANN callback 子线程**：
-   - 在主进程启动时，spawn 一个 `_npu_callback_worker` 线程
-   - 该线程调用 `aclrtSubscribeReport(threadId, stream)` 注册关心的 stream
-   - 然后死循环调用 `aclrtProcessReport(timeout_ms=100)` 消费 callback queue
-   - C++ 侧暴露 `kt_kernel_ext.CPUInfer.subscribe_npu_callback(stream_handle)` Python API
+下列项已在 **附录 Z.14** 落地并 e2e 验证，与 §7.1 原「callback 子线程」为同一基础设施：
 
-2. **`submit_with_cuda_stream` 真生效**：
-   - 当前 Phase 0 的桩位已经把 `cudaLaunchHostFunc → aclrtLaunchCallback` 调用通了
-   - 没有 subscriber 时它会卡（callback 永不 fire），有了 subscriber 才会触发
-   - 改 `kt_ep_wrapper.py` 里 NPU 路径的 `submit/sync_with_cuda_stream` 调用，传入正确的 stream handle
+| 项 | 状态 |
+|----|------|
+| `ascend_callback_worker.{h,cpp}` + `init_ascend_callback_worker` | ✅ |
+| `cudaLaunchHostFunc` 前自动 `subscribe` stream | ✅ |
+| `experts_base.py`：NPU 默认 **不** bypass；`submit_with_cuda_stream` + pin buffer API | ✅ |
+| `kt_ep_wrapper.py`：decode graph 用 `_launch_host_func` + `run_pinned_forward_sync` | ✅ |
+| Prefill：仍 async `submit_forward` / `sync_forward`（日志 `Prefill npu graph: False`） | ✅ |
+| Launch 去掉 `--disable-cuda-graph`；`PYTHONPATH` 含 `kt-kernel/python` | ✅ |
 
-3. **Stream 顺序**：
-   - NPU 计算 stream → record event A
-   - CPU 计算用 `submit_with_cuda_stream(stream)` 排在 event A 之后
-   - 最终 sync 在主 stream 上
+**尚未完成（仍属 Phase 3 性能目标）**：decode 时 CPU/NPU **时间线重叠** 的系统性 profiling、shared-expert 双 stream 与 SGLang 调度对齐、`TASK_QUEUE_ENABLE=0` 对照等（见 Z.12）。
 
-4. **Perf profile**：用 `npu-smi profile` 或 sglang 自带 profiler 看 timeline，确认 CPU/NPU bar 重叠
+### 7.1 剩余关键工作（性能向）
 
-### 7.2 风险
+1. **Prefill / Decode 路径统一策略**：`KT_FORCE_SYNC_SUBMIT=1` 与 graph 路径的 perf 对比。
+2. **Stream 顺序与 overlap**：NPU main stream + CPU callback 与 shared experts 并行（参考旧 `ascend_experts.py` 双 stream）。
+3. **Perf profile**：`npu-smi` / sglang profiler，确认 replay 时 CPU bar 与 NPU bar 重叠比例。
+4. **多 `cuda_graph_bs`**：当前验证以 bs=1 为主；扩展 batch 档位需补 pin buffer 与 capture 回归。
 
-- ACL callback 必须 spawn 在 **non-aclrt 线程**（不能是 stream owner 线程），否则死锁
-- `aclrtProcessReport` timeout 设置不当会浪费 CPU 周期
-- pybind11 的 GIL 在 callback 里要正确释放
+### 7.2 风险（仍适用）
 
-预估代码量：~500-1000 行 C++ + Python。
+- ACL callback worker 须在 **独立线程** `aclrtProcessReport`，不可与 stream owner 同线程死锁。
+- Graph capture 期间勿对 capturing stream 调 `torch.npu.synchronize`（已用 `_wait_device` 跳过）。
+- 部署环境必须 **重编** `kt_kernel_ext`（`CPUINFER_USE_ASCEND_NPU=1`），否则无 `init_ascend_callback_worker`。
 
 ---
 
@@ -1298,7 +1306,10 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/cann-8.5.0/lib64:/usr/local/kml/lib:$LD
 | `tools/phase12_llamafile_moe_smoke.py` | 1.2 | `KTMoEWrapper(LLAMAFILE)` 单层 forward 冒烟（含 `--second-gguf` Phase 2-B 覆盖） |
 | `tools/kt_accel_stream_smoke.py` | 2.2 | 仅测 `kt_accel` stream/event/sync 抽象，不依赖权重 |
 | `tools/run_p22_smoke_checks.sh` | 2.2 | P2.2 三段冒烟（kt_accel + import kt_ep_wrapper + phase12） |
-| `tools/p27_launch_ds4flash_npu.sh` | 2.7 | 单卡 NPU + KT(LLAMAFILE) sglang serve 拉起；含 `PYTHON_BIN` 探测、CANN env、与基线 8 卡参数对齐 |
+| `tools/p27_launch_ds4flash_npu.sh` | 2.7 + Z.14 | 单卡 NPU + KT；**默认开启 cuda-graph**；`PYTHONPATH` 含 `kt-kernel/python` |
+| `tools/p27_launch_ds4flash_npu_num_expert_0.sh` | F2 + Z.14 | 同上，`--kt-num-gpu-experts 0` |
+| `kt-kernel/cpu_backend/ascend_callback_worker.{h,cpp}` | Z.14 | ACL `SubscribeReport` + `ProcessReport` 后台线程 |
+| `kt-kernel/python/experts_base.py` | Z.14 | callback worker 初始化；pin buffer；`run_pinned_forward_sync` |
 | `tools/p27_curl_generate.sh` | 2.7 | 对已起服务发 `/generate` 冒烟 |
 | `third_party/sglang/python/sglang/srt/utils/kt_accel.py` | 2.2 + 2.9 | CUDA↔NPU stream/event/同步抽象（baseline 没有，自 archive backport） |
 | `third_party/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py` | 2.2 + 2.3 + 2.9 | KT EP wrapper：per-layer 模板、`KTMoEWrapper` 签名适配本机 wheel、stream → `kt_accel`、`mask_cpu_expert_routing` 替代 `mask_cpu_expert_ids` |
@@ -1313,7 +1324,7 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/cann-8.5.0/lib64:/usr/local/kml/lib:$LD
 |---|---|---|
 | `tools/p27_dump_tensors.py`（建议） | 2.11 | 加载同 model + 同 prompt forward 1 token，dump embedding / 中间层 attn_out / lm_head 输入 hidden 等关键张量，便于与 8 卡基线对账 |
 | `tools/p27_curl_generate.sh` 扩展 | 2.11 | 加 `temperature 0 / top_p 1.0 / seed` 参数，保证生成可复现 |
-| Phase 3 callback subscriber | 3 | `aclrtSubscribeReport` + `aclrtProcessReport` 后台线程（详 §7） |
+| Phase 3 overlap / perf | 3 | callback 已落地（Z.14）；剩余 timeline overlap、多 graph_bs（详 §7.1、Z.12） |
 | Phase 4 KML W8A8 backend | 4 | `cblas_gemm_s8s8s32` 替代 Q8_0（详 §8） |
 
 ---
@@ -1525,11 +1536,17 @@ static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
 `llamafile_sgemm` 里抛 `"llamafile not supported"`（aarch64 无 SVE 时
 BF16×BF16 走不通）。Z.2 + Z.4 两个 fix 必须叠加，缺一不可。
 
-### Z.5 已确认仍未解决
+### Z.5 Q8_0 aarch64（K920）NaN — 已修 ✅（2026-05-19）
 
-- **Q8_0 在 aarch64（K920 Cortex-A76，无 SVE / 无 i8mm）全 NaN**：与 GGUF
-  layout 正交，是 `third_party/llamafile/iqk_mul_mat_arm.inc` `tinyBLAS_Q0_ARM`
-  内核本身的 bug。Phase 3 之前要么修 ARM Q8_0 内核，要么全模型走 BF16。
+- **根因**：`iqk_mul_mat_arm82` 与 `tinyBLAS_Q0_ARM` 在 K920（dotprod、无 SVE/i8mm）
+  上对 Q8_0×Q8_0 均产出 NaN；与 GGUF layout 正交（BF16 同 layout cosine≈1）。
+- **修复（两层）**：
+  1. `third_party/llamafile/tinyblas_cpu_sgemm.inc`：无 `__ARM_FEATURE_MATMUL_INT8`
+     时不走 `iqk_mul_mat`。
+  2. `kt-kernel/operators/llamafile/moe.hpp`：`kt_llamafile_sgemm` 在 aarch64 无 SVE
+     上对 Q8_0×Q8_0 回退 `ggml_vec_dot_q8_0_q8_0`（与 llama.cpp 一致）。
+- **验证**：`KT_FORCE_SYNC_SUBMIT=1` + `p27_cpu_moe_reference_check.py` layer 3
+  `dsv4_layer3_q8_0.gguf`，cosine ≥ 0.99。
 - **MOE_INT8 backend 在 K920 不可编**：KML `prefillgemm` 用 SVE/i8mm 内联
   汇编（`usdot`, `ptrue`, `ld1b`），K920 不支持。已撤回 KML 修改尝试。
 
@@ -1705,34 +1722,27 @@ python3 -m py_compile python/sglang/srt/models/deepseek_v4.py   # OK
 **防再次踩坑**：编辑 `third_party/sglang/` 子树后务必跑 `git diff` 看一眼，
 最好在 IDE 工作区设置里关掉这棵子树的 format on save / auto-indent。
 
-### Z.12 后续工作（仅记录，本次未动）
+### Z.12 后续工作计划（2026-05-19）
 
-按优先级：
+| 优先级 | 任务 | 状态 | 说明 |
+|--------|------|------|------|
+| P0 | **任务 3：Q8_0 GGUF** | ⏳ 进行中 | 修 `tinyBLAS_Q0_ARM` NaN → 单层 B+ → 43 层 → e2e；磁盘 ~280 GiB |
+| P1 | **Graph 性能** | 待办 | `TASK_QUEUE_ENABLE=0` 对照；多 `cuda_graph_bs`；decode ~3 tok/s 基线再优化 |
+| P1 | **Phase 3 overlap** | 部分完成 | callback 已有（Z.14）；补 CPU/NPU timeline 重叠与 shared-expert 双 stream |
+| P2 | **mxfp4 原生权重** | 待权重 | NPU MoE 换 mxfp4；重算 `kt-num-gpu-experts` / HBM；CPU 仍可保留 Q8_0/BF16 GGUF |
+| P3 | CPU fp32 中间优化 | 低 | K920 无 BFDOT，收益不确定；**低于 Q8_0** |
+| P3 | EPLB 动态 `gpu_experts_mask` | 低 | 当前硬编码「前 N 个 expert 上 NPU」 |
+| — | MOE_INT8 / KML | 不做 | K920 无 SVE/i8mm |
 
-1. **CPU MoE 计算仍走 fp32 累加**（BF16 → fp32 → mul → fp32 → bf16 输出）。
-   目前精度 OK（cosine 0.999996），但单 token throughput 受限于 fp32 SIMD
-   宽度。后续可以评估：
-   - 用 NEON BF16 软实现 `vdot`（K920 无 SVE2、无 BFDOT 指令，需要纯软实现，
-     收益要 benchmark）；
-   - 把 `kt-kernel/operators/llamafile/moe.hpp` 里 `m_local_intermediate_fp32_`
-     等 fp32 中间 buffer 改成 bf16；
-   - 改完后必须重跑 `tools/p27_cpu_moe_reference_check.py` 抽样验证
-     cosine ≥ 0.99。
-2. **CUDA / NPU Graph capture + KT CPU MoE**（任务 2，2026-05 落地）：
-   - `kt-kernel/cpu_backend/ascend_callback_worker.{h,cpp}`：`aclrtSubscribeReport` +
-     后台 `aclrtProcessReport` 线程；`cudaLaunchHostFunc` 前自动 subscribe stream。
-   - `experts_base.py`：NPU 默认走 `submit_with_cuda_stream`（`KT_FORCE_SYNC_SUBMIT=1` 可回退）。
-   - `kt_ep_wrapper.py`：graph capture 路径 `copy_inputs` + `torch_npu.npu._launch_host_func`
-     + `run_pinned_forward_sync`；`cuda_graph_runner` 已调用 `KTMoEWrapper.set_capture_batch_sizes`。
-   - `tools/p27_launch_ds4flash_npu*.sh` 已去掉 `--disable-cuda-graph`。
-   - **回归**：`ASCEND_RT_VISIBLE_DEVICES=<卡> bash tools/p27_launch_ds4flash_npu_num_expert_0.sh`
-     后跑 Z.8 四个 curl prompt；无 ERR 107027、输出语义连贯即通过。
-3. **aarch64 Q8_0 内核仍 NaN**（`tinyBLAS_Q0_ARM`）。若不修，BF16 GGUF 是单卡
-   场景唯一可用编码，磁盘占用 ~555 GiB。修了可以省 ~50% 容量到 ~280 GiB。
-4. **`gpu_experts_mask` "前 N 个" 是默认硬编码**。如果将来要做 EPLB / 热点
-   expert 优先 HBM，需要 KT EP wrapper 支持从 sglang scheduler 接收动态 mask。
+**调试环境变量（保留）**：
 
-### Z.13 关键命令汇总（F1 + F2 + F3 复现）
+| 变量 | 作用 |
+|------|------|
+| `KT_FORCE_SYNC_SUBMIT=1` | 强制 prefill/非 graph 走同步 `submit/sync` |
+| `EXTRA_FLAGS="--disable-cuda-graph"` | 回退无 graph eager |
+| `KT_DEBUG_HYBRID_MOE=1` | N=32 时打印 hybrid 路由 |
+
+### Z.13 关键命令汇总（F1 + F2 + F3 + Graph 复现）
 
 ```bash
 # F1：全模型 BF16 GGUF（在 repo 根 / 任意目录，~30-60 分钟）
@@ -1750,7 +1760,54 @@ for i in 1 2 3 4; do ...curl... done   # 见 Z.8 / Z.10
 
 # F3：N=32 hybrid offload server（前台）
 ASCEND_RT_VISIBLE_DEVICES=2 bash tools/p27_launch_ds4flash_npu.sh
+
+# 任务 2：Graph on（默认，无需 EXTRA_FLAGS）
+# 部署前编译 kt-kernel：
+cd kt-kernel && CPUINFER_USE_ASCEND_NPU=1 python setup.py build_ext --inplace
+cd ..
+ASCEND_RT_VISIBLE_DEVICES=2 bash tools/p27_launch_ds4flash_npu_num_expert_0.sh
+# 期望：Graph capture ~7–11s；日志 Decode npu graph: True；无 ERR 107027
+# 另开终端跑 Z.8 四个 curl prompt
 ```
+
+### Z.14 任务 2：NPU Graph Capture + KT CPU MoE（已完成 ✅）
+
+**目标**：单卡 Ascend NPU + K920 CPU MoE（LLAMAFILE / **BF16 GGUF**），开启 SGLang decode **NPUGraph** 时 CPU expert 仍被触发且输出正确。
+
+**Commits**：主仓 `ktransformers-AK` `29c082e`；子模块 `third_party/sglang` `db577d2e8`（`kt_ep_wrapper.py` graph 路径）。
+
+#### Z.14.1 实现要点
+
+| 组件 | 改动摘要 |
+|------|----------|
+| **kt-kernel** | 新增 `cpu_backend/ascend_callback_worker.{h,cpp}`：`aclrtSubscribeReport` + 独立线程 `aclrtProcessReport`；`ascend_npu.h` 在 `cudaLaunchHostFunc` 前对 stream 自动 subscribe；`ext_bindings.cpp` 暴露 `init_ascend_callback_worker` / `shutdown_ascend_callback_worker` |
+| **experts_base.py** | 关闭 NPU 默认 bypass（`KT_FORCE_SYNC_SUBMIT=1` 可强制回退）；恢复 `submit_with_cuda_stream`；pin buffer 辅助 API；`run_pinned_forward_sync`；修复 7 元组 unpack、deferred submit 遗漏 |
+| **kt_ep_wrapper.py**（sglang 子模块） | **Graph decode**：`copy_inputs` + `torch_npu.npu._launch_host_func` → `run_pinned_forward_sync`；**Prefill**：仍 `submit_forward` / `sync_forward` 异步路径 |
+| **launch 脚本** | 去掉 `--disable-cuda-graph`；`export PYTHONPATH=.../sglang/python:.../kt-kernel/python` |
+
+#### Z.14.2 验证结果（`ASCEND_RT_VISIBLE_DEVICES=2`，graph on）
+
+| 项 | 结果 |
+|----|------|
+| Graph capture | ~7–11 s，bs=1，无 ERR 107027 |
+| N=0 全 CPU offload | F2 四个 curl prompt 通过 |
+| N=32 hybrid | 同上 + `KT_DEBUG_HYBRID_MOE=1` 可查路由 |
+| 日志特征 | `Prefill npu graph: False`，`Decode npu graph: True` |
+| Decode 吞吐（参考） | ~3 tok/s（单并发，未做进一步调参） |
+
+#### Z.14.3 本任务明确未做
+
+- Q8_0 ARM 内核（→ 任务 3）
+- `TASK_QUEUE_ENABLE=0` 与 launch 默认 `=1` 的对照
+- 多档 `--cuda-graph-bs` / 大于 1 的 batch graph
+- 与 8 卡基线 token-level 逐 token 对账
+
+#### Z.14.4 部署检查清单
+
+1. `cd kt-kernel && CPUINFER_USE_ASCEND_NPU=1 python setup.py build_ext --inplace`
+2. `python -c "import kt_kernel_ext; kt_kernel_ext.init_ascend_callback_worker"`（或 import `kt_kernel` 触发 `experts_base` 自动 init）
+3. `CHUNKED_PREFILL_SIZE` 保持 **2048**（勿 -1）
+4. 回退测试：`EXTRA_FLAGS="--disable-cuda-graph"` 或 `KT_FORCE_SYNC_SUBMIT=1`
 
 ---
 

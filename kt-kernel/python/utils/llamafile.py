@@ -234,10 +234,20 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         moe_config.down_proj = down_data.data_ptr()
 
         # Set quantization types
-        moe_config.gate_type = gate_type
-        moe_config.up_type = up_type
-        moe_config.down_type = down_type
-        moe_config.hidden_type = hidden_type
+        moe_config.gate_type = int(gate_type)
+        moe_config.up_type = int(up_type)
+        moe_config.down_type = int(down_type)
+        moe_config.hidden_type = int(ggml_type.BF16)
+        import os
+
+        if os.environ.get("KT_DEBUG_Q8"):
+            print(
+                f"[LlamafileMoEWrapper] layer {self.layer_idx} ggml types: "
+                f"gate={moe_config.gate_type} up={moe_config.up_type} "
+                f"down={moe_config.down_type} hidden={moe_config.hidden_type} "
+                f"(expect Q8_0={int(ggml_type.Q8_0)})",
+                flush=True,
+            )
 
         # Create MoE module
         self.moe = MOE(moe_config)

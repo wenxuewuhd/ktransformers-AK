@@ -9,7 +9,7 @@
 // time. Without this rename, .inc emits the un-suffixed iqk_mul_mat / _moe
 // and `kt_kernel_ext.so` reports `undefined symbol: iqk_mul_mat_moe_arm82`
 // at import time.
-#define iqk_mul_mat iqk_mul_mat_arm82
-#define iqk_mul_mat_moe iqk_mul_mat_moe_arm82
+//#define iqk_mul_mat iqk_mul_mat_arm82
+//#define iqk_mul_mat_moe iqk_mul_mat_moe_arm82
 #include "iqk_mul_mat_arm.inc"
 #endif  // __aarch64__

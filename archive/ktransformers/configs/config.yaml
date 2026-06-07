@@ -64,8 +64,8 @@ async_server:
   max_batch_size: 4  # decode count + prefill count, in one mini batch
 
 attn:
-  page_size: 256
-  chunk_size: 256
+  page_size: 128
+  chunk_size: 16384
 kvc2:
   gpu_only: true 
   utilization_percentage: 1.0

@@ -264,9 +264,6 @@ class LLAMA_MOE_TP {
   }
 
   void load_weights(int complete_intermediate_size, int offset) {
-    auto local_gate_proj = m_local_gate_proj_;
-    auto local_up_proj = m_local_up_proj_;
-    auto local_down_proj = m_local_down_proj_;
     auto& config = config_;
     // printf("gate load weights:");
     // debug_quant(config.gate_proj, (ggml_type)config.gate_type);
@@ -295,30 +292,57 @@ class LLAMA_MOE_TP {
     uint8_t* down_proj = (uint8_t*)config.down_proj + offset * ggml_type_size((ggml_type)config.down_type) /
                                                           ggml_blck_size((ggml_type)config.down_type);
 
-    for (int i = 0; i < config.expert_num; ++i) {
-      memcpy(local_gate_proj, gate_proj,
-             config.intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.gate_type) /
-                 ggml_blck_size((ggml_type)config.gate_type));
-      memcpy(local_up_proj, up_proj,
-             config.intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.up_type) /
-                 ggml_blck_size((ggml_type)config.up_type));
+    // Per-expert byte strides. The source tensors are laid out with the FULL
+    // intermediate_size (complete_intermediate_size); this TP only owns the
+    // [offset, offset+intermediate_size) block — hence the base-pointer offset
+    // above (src strides) and the smaller local destination strides below.
+    const size_t gate_dst_stride = (size_t)config.intermediate_size * config.hidden_size *
+                                   ggml_type_size((ggml_type)config.gate_type) /
+                                   ggml_blck_size((ggml_type)config.gate_type);
+    const size_t gate_src_stride = (size_t)complete_intermediate_size * config.hidden_size *
+                                   ggml_type_size((ggml_type)config.gate_type) /
+                                   ggml_blck_size((ggml_type)config.gate_type);
+    const size_t up_dst_stride = (size_t)config.intermediate_size * config.hidden_size *
+                                 ggml_type_size((ggml_type)config.up_type) / ggml_blck_size((ggml_type)config.up_type);
+    const size_t up_src_stride = (size_t)complete_intermediate_size * config.hidden_size *
+                                 ggml_type_size((ggml_type)config.up_type) / ggml_blck_size((ggml_type)config.up_type);
+    const size_t down_dst_row = (size_t)config.intermediate_size * ggml_type_size((ggml_type)config.down_type) /
+                                ggml_blck_size((ggml_type)config.down_type);
+    const size_t down_src_row = (size_t)complete_intermediate_size * ggml_type_size((ggml_type)config.down_type) /
+                                ggml_blck_size((ggml_type)config.down_type);
+    const size_t down_dst_stride = (size_t)config.hidden_size * down_dst_row;
+    const size_t down_src_stride = (size_t)config.hidden_size * down_src_row;
+
+    uint8_t* const local_gate_base = m_local_gate_proj_;
+    uint8_t* const local_up_base = m_local_up_proj_;
+    uint8_t* const local_down_base = m_local_down_proj_;
+
+    // Copy one expert's gate/up/down into the (disjoint) local buffers. Experts
+    // write non-overlapping destination regions and read disjoint source spans,
+    // so this is embarrassingly parallel across i.
+    auto copy_expert = [&](int i) {
+      memcpy(local_gate_base + (size_t)i * gate_dst_stride, gate_proj + (size_t)i * gate_src_stride, gate_dst_stride);
+      memcpy(local_up_base + (size_t)i * up_dst_stride, up_proj + (size_t)i * up_src_stride, up_dst_stride);
+      uint8_t* ld = local_down_base + (size_t)i * down_dst_stride;
+      uint8_t* sd = down_proj + (size_t)i * down_src_stride;
       for (int j = 0; j < config.hidden_size; ++j) {
-        memcpy(local_down_proj, down_proj,
-               config.intermediate_size * ggml_type_size((ggml_type)config.down_type) /
-                   ggml_blck_size((ggml_type)config.down_type));
-        local_down_proj += config.intermediate_size * ggml_type_size((ggml_type)config.down_type) /
-                           ggml_blck_size((ggml_type)config.down_type);
-        down_proj += complete_intermediate_size * ggml_type_size((ggml_type)config.down_type) /
-                     ggml_blck_size((ggml_type)config.down_type);
+        memcpy(ld, sd, down_dst_row);
+        ld += down_dst_row;
+        sd += down_src_row;
       }
-      local_gate_proj += config.intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.gate_type) /
-                         ggml_blck_size((ggml_type)config.gate_type);
-      local_up_proj += config.intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.up_type) /
-                       ggml_blck_size((ggml_type)config.up_type);
-      gate_proj += complete_intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.gate_type) /
-                   ggml_blck_size((ggml_type)config.gate_type);
-      up_proj += complete_intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.up_type) /
-                 ggml_blck_size((ggml_type)config.up_type);
+    };
+
+    // P1: parallelize the per-expert reshuffle across this NUMA subpool's worker
+    // threads. The legacy serial loop left each TP's load 1-wide (8-wide overall
+    // via do_numa_job) on a 192-core box. Mirrors forward()'s
+    // get_subpool(tp_part_idx)->do_work_stealing_job nesting inside do_numa_job.
+    // KT_PARALLEL_LOAD=0 restores the serial loop (A/B + safety fallback).
+    const char* serial_env = std::getenv("KT_PARALLEL_LOAD");
+    if (serial_env && serial_env[0] == '0') {
+      for (int i = 0; i < config.expert_num; ++i) copy_expert(i);
+    } else {
+      config_.pool->get_subpool(tp_part_idx)->do_work_stealing_job(config.expert_num,
+                                                                   [&](int i) { copy_expert(i); });
     }
   }
 

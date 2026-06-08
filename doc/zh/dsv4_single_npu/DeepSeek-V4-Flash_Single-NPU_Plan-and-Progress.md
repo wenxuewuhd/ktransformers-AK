@@ -271,7 +271,7 @@ curl -sS -X POST http://127.0.0.1:8000/generate -H 'Content-Type: application/js
 
 ### 6.3 ✅ graph capture 修复(2026-06-08 已闭合)
 
-> 原专项文档 [doc/zh/graph_mode_fix_handoff.md](../graph_mode_fix_handoff.md) 的 5 个嫌疑点经实测**均非真因**——
+> 原专项文档 [graph_mode_fix_handoff.md](graph_mode_fix_handoff.md) 的 5 个嫌疑点经实测**均非真因**——
 > 真因是两个之前未被点名的点(改动一、改动五)。下面是最终修好的全部改动与实测。
 
 **真因(两层)**:

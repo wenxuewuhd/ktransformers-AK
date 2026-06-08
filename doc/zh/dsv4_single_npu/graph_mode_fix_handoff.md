@@ -1,10 +1,13 @@
 # Handoff — 修复 NPU graph capture 崩溃(坑⑥ `aclrtMemcpy 107030`)
 
-> 目标:让 DeepSeek-V4-Flash 单卡 910B + KT CPU-MoE 在 **cuda-graph(NPU graph)ON** 下能干净
-> 完成 graph capture 并跑通,恢复生产性能路径(基线 ~3.6 tok/s),取代当前 eager 回退。
+> ✅ **已闭合(2026-06-08)**:真因与最终改动见总纲 [§6.3](DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md)。
+> 本文保留为**定位过程记录**——下面 §4 列的 5 个初始嫌疑点经实测**均非真因**,真因是另两处(mask H2D + torchair 跨 stream)。
+>
+> 目标(已达成):让 DeepSeek-V4-Flash 单卡 910B + KT CPU-MoE 在 **cuda-graph(NPU graph)ON** 下能干净
+> 完成 graph capture 并跑通,恢复生产性能路径(基线 ~3.6 tok/s),取代 eager 回退。
 >
 > 仓库:`/workspace/code/ktransformers-AK`,分支 `dsv4_one_card_dev`。
-> 环境固化见 `doc/zh/DeepSeek-V4-Flash_单卡910B_从0拉起服务全记录.md`(坑①~⑦)。
+> 环境固化见同目录 `DeepSeek-V4-Flash_单卡910B_从0拉起服务全记录.md`(坑①~⑦)。
 
 ---
 

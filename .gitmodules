@@ -10,5 +10,5 @@
 	branch = fix-precision-mla-merge-main
 [submodule "third_party/sglang"]
 	path = third_party/sglang
-	url = ssh://git@codehub-dg-y.huawei.com:2222/src-device-chipset/sglang-dsv4-npu.git
+	url = git@github.com:wenxuewuhd/sglang-dsv4.git
 	branch = dsv4_release

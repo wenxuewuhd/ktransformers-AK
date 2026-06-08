@@ -332,18 +332,12 @@ class LLAMA_MOE_TP {
       }
     };
 
-    // P1: parallelize the per-expert reshuffle across this NUMA subpool's worker
+    // Parallelize the per-expert reshuffle across this NUMA subpool's worker
     // threads. The legacy serial loop left each TP's load 1-wide (8-wide overall
     // via do_numa_job) on a 192-core box. Mirrors forward()'s
     // get_subpool(tp_part_idx)->do_work_stealing_job nesting inside do_numa_job.
-    // KT_PARALLEL_LOAD=0 restores the serial loop (A/B + safety fallback).
-    const char* serial_env = std::getenv("KT_PARALLEL_LOAD");
-    if (serial_env && serial_env[0] == '0') {
-      for (int i = 0; i < config.expert_num; ++i) copy_expert(i);
-    } else {
-      config_.pool->get_subpool(tp_part_idx)->do_work_stealing_job(config.expert_num,
-                                                                   [&](int i) { copy_expert(i); });
-    }
+    config_.pool->get_subpool(tp_part_idx)->do_work_stealing_job(config.expert_num,
+                                                                 [&](int i) { copy_expert(i); });
   }
 
   void warm_up() {

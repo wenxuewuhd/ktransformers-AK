@@ -1111,22 +1111,16 @@ class GGUFLoader:
         n_bytes = n_elements * type_size // block_size
 
         data_bytes = mmap_data[offset : offset + n_bytes]
-        # P0 zero-copy: the returned tensor is only ever consumed as a *read-only source*
-        # by the C++ MoE load_weights reshuffle (llamafile/moe.hpp:266 memcpy SOURCE), which
-        # makes the single necessary copy into its NUMA-local buffers. The old
-        # ``np.frombuffer(...).copy()`` here added a redundant SINGLE-THREADED full copy of
-        # every layer's 6.85GB into anonymous RAM (~7.5s/layer, ~70% of load time) before C++
-        # copied it again. Hand C++ a tensor that views the mmap directly instead.
-        # The mmap stays alive in GGUFLoader.file_data_map; the wrapper also pins the tensors
-        # in self.weights_to_keep until cpu_infer.sync() returns. Set KT_ZEROCOPY_LOAD=0 to
-        # restore the legacy copy (for A/B comparison).
-        if os.environ.get("KT_ZEROCOPY_LOAD", "1") == "1":
-            # np.frombuffer over the memmap slice is a read-only view (no copy);
-            # torch.from_numpy shares that buffer, so data.data_ptr() points into the mmap.
-            arr = np.frombuffer(data_bytes, dtype=np.uint8)
-            data = torch.from_numpy(arr)
-        else:
-            data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8).copy())
+        # Zero-copy: the returned tensor is only ever consumed as a *read-only source* by the
+        # C++ MoE load_weights reshuffle (llamafile/moe.hpp memcpy SOURCE), which makes the
+        # single necessary copy into its NUMA-local buffers. So view the mmap directly instead
+        # of copying every layer's ~6.85GB single-threaded into anonymous RAM. The mmap stays
+        # alive in GGUFLoader.file_data_map; the wrapper pins the tensors in
+        # self.weights_to_keep until cpu_infer.sync() returns.
+        # (np.frombuffer over the memmap slice = read-only view, no copy; torch.from_numpy
+        # shares that buffer so data.data_ptr() points into the mmap. Use from_numpy, NOT
+        # torch.frombuffer — the latter is redirected to NPU by torch_npu's transfer_to_npu.)
+        data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8))
 
         return data, ggml_type
 

@@ -1,3 +1,6 @@
+> ⚠️ **历史文档(2026-05-12,规划期)**。现行总纲见 [doc/zh/dsv4_single_npu/DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md](dsv4_single_npu/DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md)。
+> Phase 0~2 已完成、Phase 4(KML)现已"不做";部分量化结论已被取代,见总纲 §3。保留作历史/Phase 计划记录。
+
 # DeepSeek-V4-Flash · 单卡 Ascend NPU + Kunpeng K920 CPU offload 接手文档
 
 > 给后续 Claude Code / 协作者的完整状态快照。

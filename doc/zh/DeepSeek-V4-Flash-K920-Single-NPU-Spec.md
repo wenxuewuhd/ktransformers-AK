@@ -1,3 +1,6 @@
+> ⚠️ **历史文档(2026-05-12,规划期)**。现行总纲见 [doc/zh/dsv4_single_npu/DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md](dsv4_single_npu/DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md)。
+> 本文部分量化结论(Q8_0 NaN / 必须 BF16 / KML Phase 4)**已被实测取代**,见总纲 §3;接口契约多已落进代码。保留作历史/决策记录。
+
 # DeepSeek-V4-Flash 单卡 Ascend NPU + Kunpeng K920 CPU offload · 实施规格说明书
 
 > **本文档面向 Claude Code（"实施方"），实施方在一台无 NPU、无 K920、无 CANN、无 DSv4 权重的开发机上盲写代码，无法在本地验证；最终代码要回到一个有 1× 910B + Kunpeng-920 + CANN 8.5.0 的容器（"验证环境"）由用户跑通。**

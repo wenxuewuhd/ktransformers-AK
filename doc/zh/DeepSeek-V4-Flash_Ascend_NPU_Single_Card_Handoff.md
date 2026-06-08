@@ -1,3 +1,6 @@
+> ℹ️ **现行总纲见 [doc/zh/dsv4_single_npu/DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md](dsv4_single_npu/DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md)**。
+> 本文保留为**详细修复日志**(33 条 Z.* 取证级记录),总纲只对其一行带过;查具体 fix 根因/复现仍看本文。量化部分以总纲 §3 为最新。
+
 # DeepSeek-V4-Flash 单卡 Ascend NPU + Kunpeng CPU MoE Offload 实施手册
 
 > **本文档目的**：给后续接手的 AI/工程师一个**完整自包含**的项目交接文档，无需重新对话即可继续后面的实现。Phase 0 已完成并验证，本文记录到当前为止的所有决策、改动、验证结果，以及 Phase 1~4 的细节方案。

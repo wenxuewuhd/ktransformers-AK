@@ -50,6 +50,42 @@ class GGMLQuantizationType(IntEnum):
     BF16 = 30
 
 
+# (block_size, type_size) per GGML quant type — bytes per `block_size` elements.
+# Module-level so both the real loader and the dummy-weight fabrication path
+# (KT_DUMMY_CPU_WEIGHTS) share one source of truth.
+GGML_QUANT_SIZES = {
+    GGMLQuantizationType.F32: (1, 4),
+    GGMLQuantizationType.F16: (1, 2),
+    GGMLQuantizationType.BF16: (1, 2),
+    GGMLQuantizationType.Q4_0: (32, 2 + 16),
+    GGMLQuantizationType.Q4_1: (32, 2 + 2 + 16),
+    GGMLQuantizationType.Q5_0: (32, 2 + 4 + 16),
+    GGMLQuantizationType.Q5_1: (32, 2 + 2 + 4 + 16),
+    GGMLQuantizationType.Q8_0: (32, 2 + 32),
+    GGMLQuantizationType.Q8_1: (32, 4 + 4 + 32),
+    GGMLQuantizationType.Q2_K: (256, 2 + 2 + 256 // 16 + 256 // 4),
+    GGMLQuantizationType.Q3_K: (256, 2 + 256 // 4 + 256 // 8 + 12),
+    GGMLQuantizationType.Q4_K: (256, 2 + 2 + 256 // 2 + 12),
+    GGMLQuantizationType.Q5_K: (256, 2 + 2 + 256 // 2 + 256 // 8 + 12),
+    GGMLQuantizationType.Q6_K: (256, 2 + 256 // 2 + 256 // 4 + 256 // 16),
+    GGMLQuantizationType.Q8_K: (256, 4 + 256 + 256 // 8),
+    GGMLQuantizationType.IQ2_XXS: (256, 2 + 256 // 4),
+    GGMLQuantizationType.IQ2_XS: (256, 2 + 256 // 4 + 256 // 32),
+    GGMLQuantizationType.IQ3_XXS: (256, 2 + 256 // 4 + 256 // 8),
+    GGMLQuantizationType.IQ1_S: (256, 2 + 256 // 8 + 256 // 16),
+    GGMLQuantizationType.IQ4_NL: (32, 2 + 16),
+    GGMLQuantizationType.IQ3_S: (256, 2 + 256 // 4 + 256 // 8 + 256 // 32 + 4),
+    GGMLQuantizationType.IQ2_S: (256, 2 + 256 // 4 + 256 // 16),
+    GGMLQuantizationType.IQ4_XS: (256, 2 + 2 + 256 // 2 + 256 // 64),
+    GGMLQuantizationType.I8: (1, 1),
+    GGMLQuantizationType.I16: (1, 2),
+    GGMLQuantizationType.I32: (1, 4),
+    GGMLQuantizationType.I64: (1, 8),
+    GGMLQuantizationType.F64: (1, 8),
+    GGMLQuantizationType.IQ1_M: (256, 256 // 8 + 256 // 16 + 256 // 32),
+}
+
+
 def translate_name_to_gguf(name):
     """
     Translate PyTorch tensor name to GGUF format
@@ -1075,44 +1111,40 @@ class GGUFLoader:
         n_elements = info["n_elements"]
         ggml_type = info["dtype"]
 
-        GGML_QUANT_SIZES = {
-            GGMLQuantizationType.F32: (1, 4),
-            GGMLQuantizationType.F16: (1, 2),
-            GGMLQuantizationType.BF16: (1, 2),
-            GGMLQuantizationType.Q4_0: (32, 2 + 16),
-            GGMLQuantizationType.Q4_1: (32, 2 + 2 + 16),
-            GGMLQuantizationType.Q5_0: (32, 2 + 4 + 16),
-            GGMLQuantizationType.Q5_1: (32, 2 + 2 + 4 + 16),
-            GGMLQuantizationType.Q8_0: (32, 2 + 32),
-            GGMLQuantizationType.Q8_1: (32, 4 + 4 + 32),
-            GGMLQuantizationType.Q2_K: (256, 2 + 2 + 256 // 16 + 256 // 4),
-            GGMLQuantizationType.Q3_K: (256, 2 + 256 // 4 + 256 // 8 + 12),
-            GGMLQuantizationType.Q4_K: (256, 2 + 2 + 256 // 2 + 12),
-            GGMLQuantizationType.Q5_K: (256, 2 + 2 + 256 // 2 + 256 // 8 + 12),
-            GGMLQuantizationType.Q6_K: (256, 2 + 256 // 2 + 256 // 4 + 256 // 16),
-            GGMLQuantizationType.Q8_K: (256, 4 + 256 + 256 // 8),
-            GGMLQuantizationType.IQ2_XXS: (256, 2 + 256 // 4),
-            GGMLQuantizationType.IQ2_XS: (256, 2 + 256 // 4 + 256 // 32),
-            GGMLQuantizationType.IQ3_XXS: (256, 2 + 256 // 4 + 256 // 8),
-            GGMLQuantizationType.IQ1_S: (256, 2 + 256 // 8 + 256 // 16),
-            GGMLQuantizationType.IQ4_NL: (32, 2 + 16),
-            GGMLQuantizationType.IQ3_S: (256, 2 + 256 // 4 + 256 // 8 + 256 // 32 + 4),
-            GGMLQuantizationType.IQ2_S: (256, 2 + 256 // 4 + 256 // 16),
-            GGMLQuantizationType.IQ4_XS: (256, 2 + 2 + 256 // 2 + 256 // 64),
-            GGMLQuantizationType.I8: (1, 1),
-            GGMLQuantizationType.I16: (1, 2),
-            GGMLQuantizationType.I32: (1, 4),
-            GGMLQuantizationType.I64: (1, 8),
-            GGMLQuantizationType.F64: (1, 8),
-            GGMLQuantizationType.IQ1_M: (256, 256 // 8 + 256 // 16 + 256 // 32),
-        }
-
         block_size, type_size = GGML_QUANT_SIZES[ggml_type]
         n_bytes = n_elements * type_size // block_size
 
         data_bytes = mmap_data[offset : offset + n_bytes]
         data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8).copy())
 
+        return data, ggml_type
+
+    def get_dummy_tensor_and_ggml_type(self, name: str):
+        """Fabricate a zero buffer matching a tensor's on-disk byte layout.
+
+        Used only by the ``KT_DUMMY_CPU_WEIGHTS`` fast-iteration path: it reads
+        tensor metadata (shape / quant type / element count) from the cheap
+        ``tensor_info`` map and allocates a same-sized ``uint8`` buffer WITHOUT
+        touching the mmap'd weight bytes. This skips the multi-GB GGUF disk read
+        so graph capture can be iterated quickly; the returned values are
+        meaningless and must NOT be used for accuracy validation.
+
+        Returns ``(data, ggml_type)`` with the same contract as
+        ``get_undequanted_tensor_and_ggml_type``.
+        """
+        name = translate_name_to_gguf(name)
+
+        if name not in self.tensor_info:
+            raise KeyError(f"Tensor '{name}' not found in GGUF files")
+
+        info = self.tensor_info[name]
+        n_elements = info["n_elements"]
+        ggml_type = info["dtype"]
+
+        block_size, type_size = GGML_QUANT_SIZES[ggml_type]
+        n_bytes = n_elements * type_size // block_size
+
+        data = torch.zeros(n_bytes, dtype=torch.uint8)
         return data, ggml_type
 
 

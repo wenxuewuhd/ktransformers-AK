@@ -61,6 +61,20 @@ def _ensure_ascend_callback_worker() -> None:
         atexit.register(kt_kernel_ext.shutdown_ascend_callback_worker)
 
 
+def _sglang_is_capture_mode() -> bool:
+    """True when sglang is inside ``model_capture_mode()`` (graph capture).
+
+    kt-kernel must remain importable standalone, so the sglang dependency is
+    optional and any failure is treated as "not capturing".
+    """
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        return bool(get_is_capture_mode())
+    except Exception:
+        return False
+
+
 def _wait_device(device: torch.device) -> None:
     """Block until pending async copies on `device`'s current stream finish.
 
@@ -75,6 +89,15 @@ def _wait_device(device: torch.device) -> None:
                 return
         except Exception:
             pass
+        # Defensive fallback: torch.npu.is_current_stream_capturing() reliability
+        # during torch_npu graph capture is unconfirmed; if it returns False (or
+        # raises) while capturing, the synchronize() below would attempt a
+        # stream sync on a captured stream and crash (107027/107030). Mirror the
+        # capture detection used by kt_ep_wrapper._npu_use_graph_host_callback by
+        # also consulting sglang's global capture flag, which model_capture_mode()
+        # sets reliably around the whole capture loop.
+        if _sglang_is_capture_mode():
+            return
         torch.npu.synchronize(device)
     elif device.type == "cuda":
         try:
@@ -82,6 +105,8 @@ def _wait_device(device: torch.device) -> None:
                 return
         except Exception:
             pass
+        if _sglang_is_capture_mode():
+            return
         torch.cuda.synchronize(device)
 
 

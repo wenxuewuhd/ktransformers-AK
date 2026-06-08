@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Dict, List, Optional
 
 import torch
@@ -32,6 +33,15 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
     """
 
     _gguf_loaders_by_path: Dict[str, GGUFLoader] = {}
+
+    # --- 加载计时累加器（KT_TIME_LOAD=1 时打印；默认开启）---
+    # read    : GGUF mmap 读 + np.frombuffer().copy()（B1，单线程冗余拷贝）
+    # construct: C++ MOE(config) 构造（TP split 打印所在）
+    # load    : C++ load_weights_task + sync（B2，8 线程 NUMA 重排拷贝）
+    _t_read: float = 0.0
+    _t_construct: float = 0.0
+    _t_load: float = 0.0
+    _t_layers: int = 0
 
     def __init__(
         self,
@@ -183,12 +193,17 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
 
         base_key = f"blk.{self.layer_idx}"
 
+        _time_load = os.environ.get("KT_TIME_LOAD", "1") == "1"
+        _t0 = time.perf_counter()
+
         # Load quantized tensors from GGUF
         gate_data, gate_type = self.gguf_loader.get_undequanted_tensor_and_ggml_type(f"{base_key}.ffn_gate_exps.weight")
 
         up_data, up_type = self.gguf_loader.get_undequanted_tensor_and_ggml_type(f"{base_key}.ffn_up_exps.weight")
 
         down_data, down_type = self.gguf_loader.get_undequanted_tensor_and_ggml_type(f"{base_key}.ffn_down_exps.weight")
+
+        _t_read = time.perf_counter() - _t0
 
         # Keep tensors alive
         self.weights_to_keep = (gate_data, up_data, down_data)
@@ -238,7 +253,6 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         moe_config.up_type = int(up_type)
         moe_config.down_type = int(down_type)
         moe_config.hidden_type = int(ggml_type.BF16)
-        import os
 
         if os.environ.get("KT_DEBUG_Q8"):
             print(
@@ -250,11 +264,30 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
             )
 
         # Create MoE module
+        _t1 = time.perf_counter()
         self.moe = MOE(moe_config)
+        _t_construct = time.perf_counter() - _t1
 
         # Load weights
+        _t2 = time.perf_counter()
         self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
         self.cpu_infer.sync()
+        _t_load = time.perf_counter() - _t2
 
         # Drop original weights after loading
         self.weights_to_keep = None
+
+        if _time_load:
+            cls = LlamafileMoEWrapper
+            cls._t_read += _t_read
+            cls._t_construct += _t_construct
+            cls._t_load += _t_load
+            cls._t_layers += 1
+            print(
+                f"[KT_TIME_LOAD] layer {self.layer_idx:>3}: "
+                f"read={_t_read:6.3f}s construct={_t_construct:6.3f}s load={_t_load:6.3f}s "
+                f"| total={_t_read + _t_construct + _t_load:6.3f}s "
+                f"|| cum: read={cls._t_read:7.2f}s construct={cls._t_construct:7.2f}s "
+                f"load={cls._t_load:7.2f}s over {cls._t_layers} layers",
+                flush=True,
+            )

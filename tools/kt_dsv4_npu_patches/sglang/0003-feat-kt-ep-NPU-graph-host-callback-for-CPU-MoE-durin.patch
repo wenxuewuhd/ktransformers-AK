@@ -1,0 +1,211 @@
+From db577d2e82439876e7b7a93fc11ea7dd2a5a747f Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Tue, 19 May 2026 05:01:04 +0000
+Subject: [PATCH 3/5] feat(kt-ep): NPU graph host callback for CPU MoE during
+ capture
+
+Use torch_npu._launch_host_func + pinned buffers so CPU experts run inside
+NPUGraph replay; complements kt-kernel ACL callback worker on prefill path.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 126 +++++++++++++++++-
+ 1 file changed, 120 insertions(+), 6 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 6a200bf4a..91f50a715 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -8,8 +8,9 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
+ """
+ 
+ import logging
++import os
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, Optional, Tuple
++from typing import TYPE_CHECKING, Optional, Set, Tuple
+ 
+ import torch
+ 
+@@ -17,6 +18,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
+ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+ from sglang.srt.utils import get_compiler_backend
+ from sglang.srt.utils.kt_accel import (
++    kt_current_stream,
+     kt_current_stream_handle,
+     kt_device_synchronize,
+ )
+@@ -39,6 +41,44 @@ except ImportError:
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Streams subscribed for ACL aclrtProcessReport (torch_npu graph host callbacks).
++_npu_report_subscribed: Set[int] = set()
++
++
++def _npu_use_graph_host_callback(device: torch.device) -> bool:
++    """True when MoE CPU work must be enqueued via ``_launch_host_func`` (graph capture)."""
++    if device.type != "npu":
++        return False
++    try:
++        if torch.npu.is_current_stream_capturing():
++            return True
++    except Exception:
++        pass
++    try:
++        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
++
++        return get_is_capture_mode()
++    except Exception:
++        return False
++
++
++def _ensure_npu_subscribe_report(stream) -> None:
++    """Register ``stream`` with torch_npu ACL report thread (idempotent)."""
++    key = int(stream.npu_stream)
++    if key in _npu_report_subscribed:
++        return
++    import torch_npu
++
++    torch_npu.npu._subscribe_report(stream)
++    _npu_report_subscribed.add(key)
++
++
++@torch.no_grad()
++def _kt_npu_graph_host_forward(args) -> None:
++    """Host callback: run CPU MoE on pinned buffers (used during NPUGraph capture)."""
++    wrapper, hidden_states, stream_handle = args
++    wrapper.run_pinned_forward_sync(hidden_states, stream_handle)
++
+ 
+ def resolve_kt_weight_path_for_layer(weight_path_template: str, layer_idx: int) -> str:
+     """Expand ``--kt-weight-path`` for per-layer split GGUFs (e.g. DeepSeek-V4-Flash).
+@@ -193,6 +233,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         method = KTEPWrapperMethod(gpu_method, kt_config)
+     """
+ 
++    _hybrid_debug_logged_layers: Set[int] = set()
++
+     def __init__(
+         self,
+         gpu_method: FusedMoEMethodBase,
+@@ -372,13 +414,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             x, topk_ids, topk_weights, kt_current_stream_handle(x.device)
+         )
+ 
+-    def sync(self, x: torch.Tensor) -> torch.Tensor:
++    def sync(self, x: torch.Tensor, *, cpu_already_synced: bool = False) -> torch.Tensor:
+         """Synchronize and retrieve CPU expert computation results.
+ 
+         This method waits for the CPU computation to complete and returns the results.
+ 
+         Args:
+             x: Reference tensor for shape and device information
++            cpu_already_synced: If True, only copy pinned CPU output to device (graph host path).
+ 
+         Returns:
+             CPU expert computation results
+@@ -386,9 +429,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         if self.tp_rank != 0 or self.wrapper is None:
+             return torch.zeros_like(x)
+ 
+-        # Wait for CPU computation and retrieve results
++        if cpu_already_synced:
++            return self.wrapper.copy_forward_output_to_device(x)
+         return self.wrapper.sync_forward(x, kt_current_stream_handle(x.device))
+ 
++    def _submit_cpu_npu_graph(
++        self,
++        dispatch_output: "StandardDispatchOutput",
++        x: torch.Tensor,
++    ) -> None:
++        """Enqueue CPU MoE via ``_launch_host_func`` so it is captured in NPUGraph."""
++        import torch_npu
++
++        assert self.wrapper is not None
++        topk_weights, topk_ids, _ = dispatch_output.topk_output
++        stream = kt_current_stream(x.device)
++        _ensure_npu_subscribe_report(stream)
++        stream_handle = kt_current_stream_handle(x.device)
++        self.wrapper.copy_inputs_to_cpu_buffers(x, topk_ids, topk_weights)
++        torch_npu.npu._launch_host_func(
++            stream,
++            _kt_npu_graph_host_forward,
++            (self.wrapper, x, stream_handle),
++        )
++
+     def apply(
+         self,
+         layer: torch.nn.Module,
+@@ -413,8 +477,49 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         x = dispatch_output.hidden_states
+         topk_output = dispatch_output.topk_output
+ 
+-        # Step 1: Submit CPU expert computation (non-blocking)
+-        if self.tp_rank == 0:
++        debug_mode = os.environ.get("KT_DEBUG_HYBRID_MOE", "")
++        layer_idx = self.kt_config.layer_idx
++        should_log = False
++        if debug_mode == "all":
++            should_log = self.tp_rank == 0
++        elif debug_mode == "1":
++            should_log = (
++                self.tp_rank == 0 and layer_idx not in KTEPWrapperMethod._hybrid_debug_logged_layers
++            )
++
++        if should_log:
++            topk_ids_dbg = topk_output.topk_ids
++            topk_w_dbg = topk_output.topk_weights
++            n_gpu = self.num_gpu_experts
++            is_gpu = topk_ids_dbg < n_gpu
++            n_slots = topk_ids_dbg.numel()
++            n_gpu_slots = int(is_gpu.sum().item())
++            n_cpu_slots = n_slots - n_gpu_slots
++            gpu_w_sum = float(topk_w_dbg[is_gpu].sum().item()) if n_gpu_slots else 0.0
++            cpu_w_sum = float(topk_w_dbg[~is_gpu].sum().item()) if n_cpu_slots else 0.0
++            cpu_expert_ids = topk_ids_dbg[~is_gpu].unique().tolist() if n_cpu_slots else []
++            gpu_expert_ids = topk_ids_dbg[is_gpu].unique().tolist() if n_gpu_slots else []
++            print(
++                f"[KT_HYBRID] layer={layer_idx} num_gpu_experts={n_gpu} qlen={x.shape[0]} "
++                f"routes: gpu={n_gpu_slots}/{n_slots} cpu={n_cpu_slots}/{n_slots} "
++                f"weight_sum: gpu={gpu_w_sum:.4f} cpu={cpu_w_sum:.4f} "
++                f"gpu_expert_ids(sample)={gpu_expert_ids[:12]} "
++                f"cpu_expert_ids(sample)={cpu_expert_ids[:12]}",
++                flush=True,
++            )
++            if debug_mode == "1":
++                KTEPWrapperMethod._hybrid_debug_logged_layers.add(layer_idx)
++
++        use_npu_graph = (
++            self.tp_rank == 0
++            and self.wrapper is not None
++            and _npu_use_graph_host_callback(x.device)
++        )
++
++        # Step 1: Submit CPU expert computation (non-blocking, or graph host callback)
++        if use_npu_graph:
++            self._submit_cpu_npu_graph(dispatch_output, x)
++        elif self.tp_rank == 0:
+             self.submit(layer, dispatch_output)
+ 
+         # Step 2 & 3: GPU expert computation — only if we actually have GPU experts.
+@@ -452,7 +557,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         # Step 4: Synchronize CPU results and merge with GPU results
+         if self.tp_rank == 0:
+-            cpu_output = self.sync(x)
++            cpu_output = self.sync(x, cpu_already_synced=use_npu_graph)
++            if should_log:
++                gpu_norm = float(output.float().norm().item())
++                cpu_norm = float(cpu_output.float().norm().item())
++                print(
++                    f"[KT_HYBRID] layer={layer_idx} merge: "
++                    f"||gpu_out||={gpu_norm:.4f} ||cpu_out||={cpu_norm:.4f} "
++                    f"gpu_method={type(self.gpu_method).__name__}",
++                    flush=True,
++                )
+             output = output + cpu_output
+ 
+         return StandardCombineInput(hidden_states=output)
+-- 
+2.34.1

@@ -1,0 +1,2357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 10/13] =?UTF-8?q?feat(moe=5Fmicrobench):=20=E6=96=B0?= (part 3/4)
+
+diff --git a/tools/moe_microbench/moe_bench/roofline.py b/tools/moe_microbench/moe_bench/roofline.py
+new file mode 100644
+index 0000000..c09d484
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/roofline.py
+@@ -0,0 +1,70 @@
++from __future__ import annotations
++
++import time
++
++from moe_bench.config import MoEConfig
++
++
++def routed_weight_bytes(cfg: MoEConfig) -> tuple[int, int]:
++    """grouped GEMM up / down weight bytes."""
++    H, I, E = cfg.hidden_size, cfg.moe_intermediate_size, cfg.n_active_experts
++    bpw = cfg.roofline_bytes_per_weight
++    up = E * H * (2 * I) * bpw
++    down = E * I * H * bpw
++    return up, down
++
++
++def shared_weight_bytes(cfg: MoEConfig) -> tuple[int, int]:
++    """dense shared expert gate_up + down weight bytes."""
++    H, S = cfg.hidden_size, cfg.shared_intermediate_size
++    bpw = cfg.roofline_bytes_per_weight
++    gate_up = H * (2 * S) * bpw
++    down = S * H * bpw
++    return gate_up, down
++
++
++def lower_bound_us(weight_bytes: int, hbm_tb_s: float) -> float:
++    return weight_bytes / (hbm_tb_s * 1e12) * 1e6
++
++
++def utilizations(actual_us: float, weight_bytes: int, cfg: MoEConfig) -> dict:
++    lb_peak = lower_bound_us(weight_bytes, cfg.roofline_hbm_peak_tb_s)
++    lb_eff = lower_bound_us(weight_bytes, cfg.roofline_hbm_effective_tb_s)
++    return {
++        "lb_peak_us": lb_peak,
++        "lb_effective_us": lb_eff,
++        "util_vs_peak": actual_us / lb_peak if lb_peak else None,
++        "util_vs_achievable": actual_us / lb_eff if lb_eff else None,
++    }
++
++
++def measure_hbm_effective_tb_s(device, size_mb: int = 256) -> float:
++    """D2 校准: x.clone() 双向 memcpy 测可达 HBM 带宽.
++
++    注意: 双向 memcpy (read+write)，pure-read 场景可能偏低 10–20%。
++    """
++    import torch
++
++    dev = torch.device(device)
++    n = size_mb * 1024 * 1024 // 2
++    x = torch.empty(n, dtype=torch.bfloat16, device=dev)
++    if dev.type == "npu":
++        import torch_npu
++
++        torch_npu.npu.synchronize()
++        for _ in range(5):
++            _ = x.clone()
++        torch_npu.npu.synchronize()
++        t0 = time.perf_counter()
++        for _ in range(20):
++            _ = x.clone()
++        torch_npu.npu.synchronize()
++    else:
++        for _ in range(5):
++            _ = x.clone()
++        t0 = time.perf_counter()
++        for _ in range(20):
++            _ = x.clone()
++    dt = (time.perf_counter() - t0) / 20
++    bytes_moved = 2 * size_mb * 1024 * 1024
++    return bytes_moved / dt / 1e12
+diff --git a/tools/moe_microbench/moe_bench/sanity.py b/tools/moe_microbench/moe_bench/sanity.py
+new file mode 100644
+index 0000000..4f2f3b7
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/sanity.py
+@@ -0,0 +1,18 @@
++from __future__ import annotations
++
++import torch
++
++
++def sanity_check(name: str, o: torch.Tensor) -> dict:
++    finite = torch.isfinite(o)
++    all_finite = bool(finite.all().item())
++    return {
++        "kind": name,
++        "shape": list(o.shape),
++        "dtype": str(o.dtype),
++        "nan_count": int((~finite).sum().item()) if o.numel() else 0,
++        "has_nan": not all_finite,
++        "mean": float(o.float().mean().item()) if all_finite else float("nan"),
++        "std": float(o.float().std().item()) if all_finite else float("nan"),
++        "abs_max": float(o.float().abs().max().item()) if all_finite else float("inf"),
++    }
+diff --git a/tools/moe_microbench/moe_bench/synthetic.py b/tools/moe_microbench/moe_bench/synthetic.py
+new file mode 100644
+index 0000000..70264cd
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/synthetic.py
+@@ -0,0 +1,178 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import torch
++
++from moe_bench.config import MoEConfig
++
++
++@dataclass
++class MoESyntheticTensors:
++    x_bf16: torch.Tensor
++    x_int8: torch.Tensor
++    x_scale: torch.Tensor
++    w_gate_up: torch.Tensor
++    w_gate_up_scale: torch.Tensor
++    w_down: torch.Tensor
++    w_down_scale: torch.Tensor
++    group_list: torch.Tensor
++    mid_bf16: torch.Tensor
++    mid_int8: torch.Tensor
++    mid_scale: torch.Tensor
++    w_shared_gate_up: torch.Tensor
++    w_shared_gate_up_scale: torch.Tensor
++    w_shared_down: torch.Tensor
++    w_shared_down_scale: torch.Tensor
++
++
++def _act_dtype(name: str) -> torch.dtype:
++    return {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(name, torch.float32)
++
++
++def _quantize_weight_per_channel(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """Per-output-channel W8 from bf16 master weight [out, in]."""
++    absmax = w_bf16.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
++    scale = (absmax / 127.0).to(torch.float32)
++    w_int8 = (w_bf16 / scale).round().clamp(-127, 127).to(torch.int8)
++    return w_int8, scale
++
++
++def _rand_weight(
++    shape: tuple[int, ...],
++    *,
++    dtype: torch.dtype,
++    device: torch.device,
++    gen: torch.Generator,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    w_bf16 = torch.randn(shape, dtype=dtype, device=device, generator=gen)
++    return _quantize_weight_per_channel(w_bf16)
++
++
++def _make_group_list(cfg: MoEConfig, device: torch.device) -> torch.Tensor:
++    counts = [cfg.tokens_per_expert] * cfg.n_active_experts
++    return torch.tensor(counts, dtype=torch.int64, device=device)
++
++
++def build_synthetic(
++    cfg: MoEConfig,
++    *,
++    seed: int | None = None,
++    device: str | None = None,
++) -> MoESyntheticTensors:
++    dev = torch.device(device if device is not None else cfg.device)
++    adt = _act_dtype(cfg.act_dtype)
++    gen = torch.Generator(device=dev)
++    gen.manual_seed(cfg.seed if seed is None else seed)
++
++    N = cfg.N
++    H = cfg.hidden_size
++    I = cfg.moe_intermediate_size
++    S = cfg.shared_intermediate_size
++    E = cfg.n_active_experts
++
++    x_bf16 = torch.randn((N, H), dtype=adt, device=dev, generator=gen)
++    x_int8 = torch.randint(-127, 128, (N, H), dtype=torch.int8, device=dev, generator=gen)
++    x_scale = torch.full((N,), 0.1, dtype=torch.float32, device=dev)
++
++    gate_up_parts: list[torch.Tensor] = []
++    gate_up_scale_parts: list[torch.Tensor] = []
++    down_parts: list[torch.Tensor] = []
++    down_scale_parts: list[torch.Tensor] = []
++    for _ in range(E):
++        wi, ws = _rand_weight((2 * I, H), dtype=adt, device=dev, gen=gen)
++        gate_up_parts.append(wi)
++        gate_up_scale_parts.append(ws)
++        w_hi, ws = _rand_weight((H, I), dtype=adt, device=dev, gen=gen)
++        down_parts.append(w_hi.t().contiguous())
++        down_scale_parts.append(ws)
++    w_gate_up = torch.stack(gate_up_parts, dim=0)
++    w_gate_up_scale = torch.stack(gate_up_scale_parts, dim=0)
++    w_down = torch.stack(down_parts, dim=0)
++    w_down_scale = torch.stack(down_scale_parts, dim=0)
++
++    mid_bf16 = torch.randn((N, I), dtype=adt, device=dev, generator=gen)
++    mid_int8 = torch.randint(-127, 128, (N, I), dtype=torch.int8, device=dev, generator=gen)
++    mid_scale = torch.full((N,), 0.1, dtype=torch.float32, device=dev)
++
++    w_shared_gate_up, w_shared_gate_up_scale = _rand_weight((2 * S, H), dtype=adt, device=dev, gen=gen)
++    w_shared_hi, w_shared_down_scale = _rand_weight((H, S), dtype=adt, device=dev, gen=gen)
++    w_shared_down = w_shared_hi.t().contiguous()
++
++    group_list = _make_group_list(cfg, dev)
++
++    return MoESyntheticTensors(
++        x_bf16=x_bf16,
++        x_int8=x_int8,
++        x_scale=x_scale,
++        w_gate_up=w_gate_up,
++        w_gate_up_scale=w_gate_up_scale,
++        w_down=w_down,
++        w_down_scale=w_down_scale,
++        group_list=group_list,
++        mid_bf16=mid_bf16,
++        mid_int8=mid_int8,
++        mid_scale=mid_scale,
++        w_shared_gate_up=w_shared_gate_up,
++        w_shared_gate_up_scale=w_shared_gate_up_scale,
++        w_shared_down=w_shared_down,
++        w_shared_down_scale=w_shared_down_scale,
++    )
++
++
++def assert_shapes(cfg: MoEConfig, t: MoESyntheticTensors) -> None:
++    N = cfg.N
++    H = cfg.hidden_size
++    I = cfg.moe_intermediate_size
++    S = cfg.shared_intermediate_size
++    E = cfg.n_active_experts
++
++    assert cfg.moe_intermediate_size == 2048, "DSv4-Flash 实测 moe_intermediate=2048; 不要回退"
++    assert cfg.n_routed_experts == 256
++    assert cfg.num_experts_per_tok == 6
++    assert cfg.n_shared_experts == 1
++
++    assert N == cfg.n_active_experts * cfg.tokens_per_expert
++
++    assert t.x_bf16.shape == (N, H)
++    assert t.x_int8.shape == (N, H) and t.x_int8.dtype == torch.int8
++    assert t.x_scale.shape == (N,) and t.x_scale.dtype == torch.float32
++
++    # Routed weights: CANN layout [out, in] per expert (matches ckpt w1/w2/w3)
++    assert t.w_gate_up.shape == (E, 2 * I, H) and t.w_gate_up.dtype == torch.int8
++    assert t.w_gate_up_scale.shape == (E, 2 * I, 1) or t.w_gate_up_scale.shape == (E, 2 * I)
++    assert t.w_down.shape == (E, I, H) and t.w_down.dtype == torch.int8
++    assert t.w_down_scale.shape == (E, H, 1) or t.w_down_scale.shape == (E, H)
++
++    assert t.group_list.shape == (E,)
++    assert bool((t.group_list >= 0).all().item())
++    assert int(t.group_list.sum().item()) == N
++
++    assert t.mid_bf16.shape == (N, I)
++    assert t.mid_int8.shape == (N, I) and t.mid_int8.dtype == torch.int8
++    assert t.w_shared_gate_up.shape == (2 * S, H)
++    assert t.w_shared_gate_up_scale.shape == (2 * S, 1) or t.w_shared_gate_up_scale.shape == (2 * S,)
++    assert t.w_shared_down.shape == (S, H)
++    assert t.w_shared_down_scale.shape == (H, 1) or t.w_shared_down_scale.shape == (H,)
++
++
++def _selftest() -> None:
++    from moe_bench.config import load_config
++
++    for n_active in [1, 2, 3, 4, 5, 6]:
++        cfg = apply_overrides_local(load_config(), n_active_experts=n_active)
++        t = build_synthetic(cfg, seed=42, device="cpu")
++        assert_shapes(cfg, t)
++        print(
++            f"n_active={n_active} N={cfg.N} group_list={t.group_list.tolist()} OK"
++        )
++
++
++def apply_overrides_local(cfg, **kwargs):
++    from moe_bench.config import apply_overrides
++
++    return apply_overrides(cfg, **kwargs)
++
++
++if __name__ == "__main__":
++    _selftest()
+diff --git a/tools/moe_microbench/moe_bench/timing.py b/tools/moe_microbench/moe_bench/timing.py
+new file mode 100644
+index 0000000..0d25ec0
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/timing.py
+@@ -0,0 +1,100 @@
++# NOTE: keep in sync with tools/attn_microbench/attn_bench/timing.py
++# Changes here should be mirrored manually (no shared module by design).
++
++from __future__ import annotations
++
++import statistics
++import time
++from dataclasses import dataclass
++from typing import Callable
++
++import torch
++
++
++@dataclass
++class TimingResult:
++    device_mean_us: float
++    device_p50_us: float
++    device_p95_us: float
++    device_p99_us: float
++    device_max_us: float
++    device_std_us: float
++    host_mean_us: float
++    samples_device: list[float]
++    samples_host: list[float]
++
++    def to_dict(self) -> dict:
++        return {
++            "device_mean_us": self.device_mean_us,
++            "device_p50_us": self.device_p50_us,
++            "device_p95_us": self.device_p95_us,
++            "device_p99_us": self.device_p99_us,
++            "device_max_us": self.device_max_us,
++            "device_std_us": self.device_std_us,
++            "host_mean_us": self.host_mean_us,
++            "n": len(self.samples_device),
++        }
++
++
++def _percentile(values: list[float], p: float) -> float:
++    if not values:
++        return 0.0
++    s = sorted(values)
++    k = (len(s) - 1) * p / 100.0
++    f = int(k)
++    c = min(f + 1, len(s) - 1)
++    if f == c:
++        return s[f]
++    return s[f] + (s[c] - s[f]) * (k - f)
++
++
++def _sync_device(device: torch.device) -> None:
++    if device.type == "npu":
++        import torch_npu
++
++        torch_npu.npu.synchronize()
++    elif device.type == "cuda":
++        torch.cuda.synchronize()
++
++
++def bench_op(fn: Callable[[], None], warmup: int, repeat: int, device: torch.device | None = None) -> TimingResult:
++    if device is None:
++        device = torch.device("npu:0")
++
++    for _ in range(warmup):
++        fn()
++    _sync_device(device)
++
++    samples_device: list[float] = []
++    samples_host: list[float] = []
++    for _ in range(repeat):
++        host_t0 = time.perf_counter()
++        if device.type == "npu":
++            import torch_npu
++
++            start = torch.npu.Event(enable_timing=True)
++            end = torch.npu.Event(enable_timing=True)
++            start.record()
++            fn()
++            end.record()
++            _sync_device(device)
++            host_t1 = time.perf_counter()
++            samples_device.append(start.elapsed_time(end) * 1000.0)
++        else:
++            fn()
++            _sync_device(device)
++            host_t1 = time.perf_counter()
++            samples_device.append((host_t1 - host_t0) * 1e6)
++        samples_host.append((host_t1 - host_t0) * 1e6)
++
++    return TimingResult(
++        device_mean_us=statistics.mean(samples_device),
++        device_p50_us=statistics.median(samples_device),
++        device_p95_us=_percentile(samples_device, 95),
++        device_p99_us=_percentile(samples_device, 99),
++        device_max_us=max(samples_device),
++        device_std_us=statistics.pstdev(samples_device) if len(samples_device) > 1 else 0.0,
++        host_mean_us=statistics.mean(samples_host),
++        samples_device=samples_device,
++        samples_host=samples_host,
++    )
+diff --git a/tools/moe_microbench/results/ANALYSIS_AND_REPRODUCTION.md b/tools/moe_microbench/results/ANALYSIS_AND_REPRODUCTION.md
+new file mode 100644
+index 0000000..5d91539
+--- /dev/null
++++ b/tools/moe_microbench/results/ANALYSIS_AND_REPRODUCTION.md
+@@ -0,0 +1,333 @@
++# MoE Microbench — 分析结论与复现指南
++
++> **实测环境**：Ascend 910B，`ASCEND_RT_VISIBLE_DEVICES=1`，CANN + torch_npu 2.8.0  
++> **模型/ckpt**：DeepSeek-V4-Flash-W8A8（W8A8 int-quantized，非论文 FP4）  
++> **默认场景**：decode `num_tokens=1`，`top_k=6`，`n_active_experts=6`，`N=6`  
++> **层数**：`num_hidden_layers=43`（全 MoE，无 dense 替换层）
++
++---
++
++## 1. 测量口径
++
++### 1.1 测什么 / 不测什么
++
++| 包含 | 不包含 |
++|------|--------|
++| post-dispatch NPU 段：act_quant → gemm_up → silu_mul → gemm_down | gating / routing / dispatch / combine |
++| shared expert dense MLP（与 routed 并行，latency 取 max） | CPU MoE / KT offload 路径 |
++| grouped vs loop 对照 | Attention / embedding / LM head |
++
++### 1.2 双轨计时（D4 + D5）
++
++| 轨道 | 方法 | 代表含义 |
++|------|------|----------|
++| **Python Event**（D4） | `torch.npu.Event` + host wall | SGLang/KT **eager 模式**真实 op 调用成本（含 launch overhead） |
++| **msprof 硬件**（D5） | `torch_npu.profiler` Level1 + `kernel_details.csv` | NPU kernel **纯 device time**（不含 Python/driver） |
++
++两者差额 ≈ **launch overhead**，是 NPUGraph / kernel fusion 的优化目标量。
++
++### 1.3 CANN 实测路径
++
++- `npu_grouped_matmul` 在本环境报 **CANN 161002**，自动 **fallback 到 6× `npu_quant_matmul` loop**
++- msprof 抓到的 op 为 **`QuantBatchMatmul`**（非 GroupedMatmul）
++- 权重 layout：`gate_up [2I,H]`，down `[I,H]`（= ckpt w2.T），per-channel W8 合成
++
++---
++
++## 2. D4 结论（Python Event）
++
++数据来源：[`summary_decode.md`](./summary_decode.md)（`repeat=1000`，warmup=30）
++
++### 2.1 各段耗时（n_active=6）
++
++| segment | device_mean_us | host_mean_us | dispatch_overhead_us | util_vs_achievable |
++|---------|---------------:|-------------:|---------------------:|-------------------:|
++| act_quant_post | 166 | 300 | 134 | — |
++| act_quant_pre | 186 | 313 | 127 | — |
++| gemm_up | **4274** | 4438 | 164 | 50.95% |
++| silu_mul_unfused | 350 | 502 | 152 | — |
++| gemm_down | **4185** | 4351 | 166 | **99.78%** ⚠ |
++| routed_full | **9142** | 9311 | 169 | 72.66% |
++| shared_expert | 979 | 1132 | 153 | 46.67% |
++
++`routed_full` 分解：compute_only ≈ **9105 µs**，post_dispatch ≈ **9142 µs**（act_quant 仅 +37 µs）。
++
++### 2.2 Grouped vs Loop（Python 层）
++
++| target | grouped_us | loop_us | 倍率 |
++|--------|----------:|--------:|-----:|
++| gemm_up | 4508 | **2071** | 2.2× |
++| gemm_down | 4460 | **2038** | 2.2× |
++
++D4 表面结论：loop 路径在 Python 层快约 **2×**。
++
++### 2.3 n_active sweep（Event）
++
++| n_active | gemm_up_us | gemm_down_us | routed_full_us | util_eff |
++|---------:|-----------:|-------------:|---------------:|
++| 1 | 4507 | 4114 | 8472 | — |
++| 6 | 4393 | 4451 | 8981 | 71.4% |
++
++`act_quant(pre)` 固定 `[1,H]`，不随 n_active 变化（N5）。
++
++---
++
++## 3. D5 结论（msprof 硬件层）
++
++数据来源：[`msprof_vs_python_comparison.md`](./msprof_vs_python_comparison.md)
++
++### 3.1 Launch overhead 拆解
++
++| segment | python_event_us | msprof_device_us | overhead_pct |
++|---------|----------------:|-----------------:|-------------:|
++| act_quant_post | 166 | 3.3 | **98.0%** |
++| gemm_up | 4274 | 107.4 | **97.5%** |
++| silu_mul | 350 | 6.7 | **98.1%** |
++| gemm_down | 4185 | 84.2 | **98.0%** |
++| routed_full | 9142 | 202.0 | **97.8%** |
++| shared_expert | 979 | 46.5 | **95.2%** |
++
++**判定**：MoE NPU 段在 eager 模式下 **~95–98% 时间是 Python launch overhead**，真实 kernel 仅占 2–5%。
++
++### 3.2 Roofline（硬件层 @ HBM measured 1.20 TB/s）
++
++| segment | hw_us | lb @ 1.2 TB/s | util_vs_measured |
++|---------|------:|--------------:|-----------------:|
++| gemm_up | 107 | 84 | **78%** |
++| gemm_down | 84 | 42 | **50%** |
++| shared_expert | 47 | 21 | **45%** |
++
++**关键修正（D4 → D5）**：
++
++- D4 报 `gemm_down util_vs_achievable = 99.78%` → **不可信**（Event 含 launch，凑近 roofline 下界）
++- D5 硬件层 `gemm_down util = 49.8%` → kernel **未打满带宽**，仍有 ~2× 优化空间
++
++### 3.3 Grouped vs Loop（硬件层 — 解开 D4 谜团）
++
++| path | python_event_us | hw_device_us | overhead_pct |
++|------|----------------:|-------------:|-------------:|
++| grouped | 4508 | **104.0** | 97.7% |
++| loop | 2071 | **102.2** | 95.1% |
++
++**判定**：`hw_grouped ≈ hw_loop`（104 vs 102 µs）。D4 的 2× 差距 ** entirely 来自 grouped fallback 的 Python 调度路径**，不是 NPU kernel 本身更慢。优化方向：修复 grouped API 或走 loop + 减少 Python 调用次数（NPUGraph）。
++
++### 3.4 n_active 硬件 sweep
++
++数据来源：[`msprof_n_active_sweep.md`](./msprof_n_active_sweep.md)
++
++| n_active | gemm_up_hw | gemm_down_hw | routed_full_hw |
++|---------:|-----------:|-------------:|---------------:|
++| 1 | 16.7 | 13.0 | 37.2 |
++| 6 | 102.5 | 79.3 | 193.0 |
++
++- gemm_up/down hw **近似线性**随 n_active 增长（每增 1 expert ≈ +17 µs up / +13 µs down）
++- util 稳定在 **~50–82%**，不随 n_active 显著升高（M=1 GEMV 形态，固定 launch floor）
++
++---
++
++## 4. 43 层整网折算（MoE FFN only）
++
++### 4.1 单层
++
++| 口径 | routed | shared | **层 latency（max）** |
++|------|-------:|-------:|---------------------:|
++| Python Event (µs) | 9142 | 979 | **9142** |
++| msprof hw (µs) | 202 | 47 | **202** |
++
++shared ≪ routed，整网由 routed 主导。shared ‖ routed 并行，**禁止相加**（A8）。
++
++### 4.2 ×43 层合计
++
++| 口径 | 计算 | 结果 |
++|------|------|------|
++| Python Event | 9142 × 43 | **≈ 393 ms / token** |
++| msprof 硬件 | 202 × 43 | **≈ 8.7 ms / token** |
++| ~~错误：routed+shared~~ | (9142+979)×43 | ~~435 ms~~ ❌ |
++
++### 4.3 瓶颈分解（43 层 Event）
++
++| 段 | 单层 (µs) | ×43 |
++|----|----------:|----:|
++| gemm_up | 4274 | **184 ms** |
++| gemm_down | 4185 | **180 ms** |
++| silu_mul | 350 | 15 ms |
++| act_quant | 166 | 7 ms |
++
++GEMM up+down 占 MoE Event 时间 **~93%**。
++
++### 4.4 若叠加 Attention（粗估，口径不同）
++
++| 组件 | hw @ seq=32k | Event @ seq=32k | 来源 |
++|------|-------------:|----------------:|------|
++| Attention（42 层） | ~2.0 ms | ~11.4 ms | `tools/attn_microbench/results/network_hw_estimate.md` |
++| MoE（43 层） | ~8.7 ms | ~393 ms | 本 bench |
++| **粗加总** | **~10.7 ms** | **~404 ms** | 串行上界 |
++
++decode 短 KV 时 Attention 远小于 2 ms；上表仅作 seq=32k 量级参考。
++
++---
++
++## 5. 优化建议（按优先级）
++
++1. **NPUGraph / op fusion**：launch overhead 占 97%+，单 op 融合 routed_full 可省 ~4× launch
++2. **修复 grouped matmul API**：消除 fallback 的 Python 调度开销（hw 无差异，Event 差 2×）
++3. **gemm_down 带宽**：硬件 util ~50%，非 Event 报的 99%；可查 tile/M 维、weight layout
++4. **CPU offload 命中率**：n_active sweep 显示 linear scaling；命中率 1/6 → 6/6 时 routed_full hw 37→193 µs
++
++---
++
++## 6. 复现指南
++
++### 6.1 环境准备
++
++```bash
++cd tools/moe_microbench
++source env.sh                    # CANN + PYTHON_BIN + PYTHONPATH
++
++npu-smi info                     # 选空卡
++export ASCEND_RT_VISIBLE_DEVICES=1 # 示例：物理 1 号卡
++
++# 验证 NPU
++$PYTHON_BIN -c "import torch, torch_npu; print(torch.npu.is_available())"
++```
++
++依赖：`torch` + `torch_npu` + `pyyaml`；Python 默认 `/usr/local/python3.11.14/bin/python3.11`。
++
++### 6.2 D1 — Dry-run（无 NPU）
++
++```bash
++DRY_RUN=1 python -m moe_bench.synthetic --selftest
++DRY_RUN=1 bash run_all.sh
++```
++
++### 6.3 D2 — NPU smoke
++
++```bash
++python -m moe_bench.bench_gemm_up --sanity --repeat 10 --quick-mode
++python -m moe_bench.bench_gate_up_order_check --ckpt /path/to/DSv4-Flash-W8A8 --layer 3
++python -c "from moe_bench.roofline import measure_hbm_effective_tb_s; print(measure_hbm_effective_tb_s('npu:0'))"
++```
++
++### 6.4 D4 — Python Event 全量 bench
++
++```bash
++# 正式（repeat=1000，约 10–20 min）
++bash run_all.sh
++
++# 快速（repeat=100）
++QUICK=1 bash run_all.sh
++
++# 可选：n_active sweep + torch profile trace
++SWEEP_N_ACTIVE="1 2 3 4 5 6" PROFILE=1 QUICK=1 bash run_all.sh
++```
++
++**输出**：`results/summary_decode.md` + 各段 `*.json`
++
++**单段**：
++
++```bash
++python -m moe_bench.bench_gemm_up --out results/gemm_up.json --quick-mode
++python -m moe_bench.bench_act_quant --out results/act_quant.json   # 含 pre+post 两条
++python -m moe_bench.bench_routed_full --out results/routed_full.json
++```
++
++### 6.5 D5 — msprof 硬件层
++
++```bash
++# 需先存在 D4 Event JSON（run_msprof.sh 用于 comparison 对照）
++bash run_msprof.sh
++
++# 含 n_active sweep
++SWEEP_N_ACTIVE="1 2 3 4 5 6" bash run_msprof.sh
++
++# 单段 smoke
++python -m moe_bench.bench_gemm_up --msprof --msprof-out ./npu_results \
++    --quick-mode --out results/gemm_up_msprof_smoke.json
++```
++
++**输出**：
++
++- `results/*_msprof.json` — 硬件数字
++- `results/msprof_vs_python_comparison.md` — launch 拆解 + roofline 硬件层
++- `results/msprof_n_active_sweep.md` — sweep（若设 `SWEEP_N_ACTIVE`）
++- `./npu_results/` — 原始 trace（**不进 git**）
++
++**pattern 校准**（若 parse 失败）：
++
++```bash
++python -c "
++from pathlib import Path
++from moe_bench.msprof_runner import list_op_types_in_trace
++print(list_op_types_in_trace(Path('./npu_results/gemm_up')))
++"
++cat ./npu_results/gemm_up/op_types_seen.txt
++```
++
++当前环境：`QuantBatchMatmul`，loop fallback 时 `matched_rows=60`（10 steps × 6 experts），聚合后 **~107 µs/call**。
++
++### 6.6 仅从 JSON 重生成报告
++
++```bash
++python -m moe_bench.report \
++  --inputs results/act_quant.json results/gemm_up.json ... \
++  --out results/summary_decode.md
++
++python -m moe_bench.report --mode comparison \
++  --msprof-jsons results/*_msprof.json \
++  --event-jsons results/{act_quant,gemm_up,silu_mul_unfused,gemm_down,routed_full,shared_expert,grouped_vs_loop}.json \
++  --out results/msprof_vs_python_comparison.md
++
++python -m moe_bench.report --mode msprof-n-active-sweep \
++  --inputs results/*_msprof_n*.json \
++  --out results/msprof_n_active_sweep.md
++```
++
++### 6.7 自检清单
++
++| 阶段 | 命令 | 期望 |
++|------|------|------|
++| D1 | `DRY_RUN=1 python -m moe_bench.synthetic --selftest` | n_active=1..6 全 OK |
++| D4 | `test -f results/summary_decode.md` | 8+ 行主表 |
++| D5 smoke | `jq '.mode' results/gemm_up_msprof_smoke.json` | `"msprof_hardware_only"` |
++| D5 | `jq '.device_mean_us > 0' results/gemm_up_msprof.json` | `true` |
++| D5 comparison | `grep overhead_pct results/msprof_vs_python_comparison.md` | 有匹配 |
++
++---
++
++## 7. 输出文件说明
++
++| 文件 | 生成命令 | 内容 |
++|------|----------|------|
++| `summary_decode.md` | `run_all.sh` | Event 计时主表 + sweep + roofline |
++| `msprof_vs_python_comparison.md` | `run_msprof.sh` | launch 拆解 + hw roofline + grouped/loop 判定 |
++| `msprof_n_active_sweep.md` | `SWEEP_N_ACTIVE=... run_msprof.sh` | 硬件 n_active 曲线 |
++| `*.json` | 各 `bench_*.py --out` | 原始 timing JSON（可 jq 二次分析） |
++| `sanity_*.json` | `--sanity` | NaN/abs_max 检查 |
++
++JSON schema（Event）：`device_mean_us / host_mean_us / p50 / p95 / p99 / std / max / n / dispatch_overhead_us`  
++JSON schema（msprof）：`mode=msprof_hardware_only / device_mean_us / matched_rows / op_pattern / trace_dir`
++
++---
++
++## 8. 已知局限
++
++1. **W8A8 vs 论文 FP4**：HBM 流量 ~2×，见根目录 `README.md` N8 对比表
++2. **Synthetic 权重**：shape/dtype 正确，数值为 per-channel 量化随机权重
++3. **不含 Attention**：整网延迟需叠加 `attn_microbench` 结果
++4. **CANN 版本敏感**：grouped API、kernel 名随 CANN 升级可能变化；以 `op_types_seen.txt` 为准
++5. **Event util 不可直接解读为 kernel 效率**：必须用 D5 msprof 硬件数字
++
++---
++
++## 9. 相关文档
++
++| 文档 | 路径 |
++|------|------|
++| 工程 README | [`../README.md`](../README.md) |
++| 实现计划 v4 | [`../IMPLEMENTATION_PLAN_V4.md`](../IMPLEMENTATION_PLAN_V4.md) |
++| 配置 | [`../config/dsv4_flash_moe.yaml`](../config/dsv4_flash_moe.yaml) |
++| Attention 整网 @32k | [`../../attn_microbench/results/network_hw_estimate.md`](../../attn_microbench/results/network_hw_estimate.md) |
++
++---
++
++*生成说明：本文档汇总 D1–D5 闭环实测结论（2026-05-26）。数字以 `results/` 下 JSON 为准；重跑后请同步更新 §2–§4 表格或依赖 report 自动生成。*
+diff --git a/tools/moe_microbench/results/README.md b/tools/moe_microbench/results/README.md
+new file mode 100644
+index 0000000..bae7e8e
+--- /dev/null
++++ b/tools/moe_microbench/results/README.md
+@@ -0,0 +1,83 @@
++# MoE Microbench 分析结果索引
++
++> 工作目录：`tools/moe_microbench/`  
++> **主文档（结论 + 复现）**：[`ANALYSIS_AND_REPRODUCTION.md`](./ANALYSIS_AND_REPRODUCTION.md)
++
++---
++
++## 快速入口
++
++| 主题 | 文档 | 原始数据 |
++|------|------|----------|
++| **结论与复现（必读）** | [`ANALYSIS_AND_REPRODUCTION.md`](./ANALYSIS_AND_REPRODUCTION.md) | — |
++| **Python Event 汇总 @ decode** | [`summary_decode.md`](./summary_decode.md) | `act_quant.json` … `grouped_vs_loop.json` |
++| **Python vs 硬件 launch 拆解** | [`msprof_vs_python_comparison.md`](./msprof_vs_python_comparison.md) | `*_msprof.json` + Event JSON |
++| **n_active 硬件 sweep** | [`msprof_n_active_sweep.md`](./msprof_n_active_sweep.md) | `*_msprof_n{1..6}.json` |
++
++---
++
++## 一键复现
++
++```bash
++cd tools/moe_microbench
++export ASCEND_RT_VISIBLE_DEVICES=<空闲卡>   # 先 npu-smi info
++source env.sh
++
++# D4：Python Event 全量 bench + summary
++bash run_all.sh
++# → results/summary_decode.md
++
++# D5：msprof 硬件层 + comparison（需先跑过 D4 或自带 Event JSON）
++bash run_msprof.sh
++# → results/msprof_vs_python_comparison.md
++
++# D5 + n_active sweep
++SWEEP_N_ACTIVE="1 2 3 4 5 6" bash run_msprof.sh
++# → results/msprof_n_active_sweep.md
++
++# 快速冒烟（repeat=100）
++QUICK=1 bash run_all.sh
++QUICK=1 bash run_msprof.sh
++```
++
++详细分步、自检命令、环境说明见 [`ANALYSIS_AND_REPRODUCTION.md`](./ANALYSIS_AND_REPRODUCTION.md)。
++
++---
++
++## 数据落盘
++
++### 进 git（`results/`）
++
++| 模式 | 文件 | 说明 |
++|------|------|------|
++| Python Event | `{act_quant,gemm_up,silu_mul_*,gemm_down,routed_full,shared_expert,grouped_vs_loop}.json` | D4，`repeat=1000` |
++| msprof 硬件 | `*_msprof.json` | D5，`mode=msprof_hardware_only` |
++| msprof sweep | `*_msprof_n{1..6}.json` | D5.5 |
++| sanity | `sanity_*.json` | `--sanity` 输出 |
++| 报告 | `summary_decode.md`, `msprof_vs_python_comparison.md`, `msprof_n_active_sweep.md` | 生成物 |
++
++### 不进 git（`./npu_results/`）
++
++msprof 原始 trace，见 `.gitignore`：
++
++```text
++npu_results/<bench_name>/*_ascend_pt/ASCEND_PROFILER_OUTPUT/
++├── kernel_details.csv      ← 主解析目标（Duration(us)）
++├── op_statistic.csv
++├── operator_details.csv
++└── step_trace_time.csv
++```
++
++pattern 不匹配时自动生成 `npu_results/<name>/op_types_seen.txt`。
++
++---
++
++## 核心数字（decode bs=1, n_active=6, 2026-05-26 实测）
++
++| 指标 | 单层 routed | 43 层 MoE 合计 |
++|------|------------:|---------------:|
++| Python Event | **9142 µs** | **~393 ms** |
++| msprof 硬件 | **202 µs** | **~8.7 ms** |
++| launch overhead | **~98%** | — |
++
++完整分析见 [`ANALYSIS_AND_REPRODUCTION.md`](./ANALYSIS_AND_REPRODUCTION.md) §3–§5。
+diff --git a/tools/moe_microbench/results/act_quant.json b/tools/moe_microbench/results/act_quant.json
+new file mode 100644
+index 0000000..9d545f6
+--- /dev/null
++++ b/tools/moe_microbench/results/act_quant.json
+@@ -0,0 +1,50 @@
++[
++  {
++    "kind": "act_quant_post",
++    "cfg": {
++      "N": 6,
++      "num_tokens": 1,
++      "H": 4096,
++      "pre_dispatch": false
++    },
++    "shape": [
++      6,
++      4096
++    ],
++    "timing": {
++      "device_mean_us": 166.41220018267632,
++      "device_p50_us": 163.55000436306,
++      "device_p95_us": 178.74599620699883,
++      "device_p99_us": 206.30199477076607,
++      "device_max_us": 354.99998927116394,
++      "device_std_us": 20.553464183363907,
++      "host_mean_us": 300.2379182726145,
++      "n": 100,
++      "dispatch_overhead_us": 133.82571808993816
++    }
++  },
++  {
++    "kind": "act_quant_pre",
++    "cfg": {
++      "N": 6,
++      "num_tokens": 1,
++      "H": 4096,
++      "pre_dispatch": true
++    },
++    "shape": [
++      1,
++      4096
++    ],
++    "timing": {
++      "device_mean_us": 186.41440004110336,
++      "device_p50_us": 185.6900006532669,
++      "device_p95_us": 197.30300158262253,
++      "device_p99_us": 204.28440645337105,
++      "device_max_us": 206.69999718666077,
++      "device_std_us": 6.2147877671437355,
++      "host_mean_us": 313.0783140659332,
++      "n": 100,
++      "dispatch_overhead_us": 126.66391402482986
++    }
++  }
++]
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/act_quant_msprof.json b/tools/moe_microbench/results/act_quant_msprof.json
+new file mode 100644
+index 0000000..d383e2b
+--- /dev/null
++++ b/tools/moe_microbench/results/act_quant_msprof.json
+@@ -0,0 +1,48 @@
++{
++  "kind": "act_quant",
++  "mode": "msprof_hardware_only",
++  "post_hw": {
++    "kind": "act_quant_post",
++    "mode": "msprof_hardware_only",
++    "op_pattern": "DynamicQuant",
++    "device_mean_us": 3.2862,
++    "device_std_us": 1.0849155543174778,
++    "device_p50_us": 2.7705,
++    "device_p95_us": 5.458999999999999,
++    "device_p99_us": 5.6678,
++    "device_max_us": 5.72,
++    "device_min_us": 2.581,
++    "matched_rows": 10,
++    "source_csv": "kernel_details:npu_results/act_quant_post/05d710313bd1_832011_20260526082719855_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++    "trace_dir": "npu_results/act_quant_post",
++    "cfg": {
++      "N": 6,
++      "n_active_experts": 6,
++      "H": 4096,
++      "I": 2048
++    },
++    "pre_dispatch": false
++  },
++  "pre_hw": {
++    "kind": "act_quant_pre",
++    "mode": "msprof_hardware_only",
++    "op_pattern": "DynamicQuant",
++    "device_mean_us": 2.1761000000000004,
++    "device_std_us": 0.09461971253391119,
++    "device_p50_us": 2.1500000000000004,
++    "device_p95_us": 2.3414499999999996,
++    "device_p99_us": 2.42029,
++    "device_max_us": 2.44,
++    "device_min_us": 2.1,
++    "matched_rows": 10,
++    "source_csv": "kernel_details:npu_results/act_quant_pre/05d710313bd1_832011_20260526082724391_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++    "trace_dir": "npu_results/act_quant_pre",
++    "cfg": {
++      "N": 6,
++      "n_active_experts": 6,
++      "H": 4096,
++      "I": 2048
++    },
++    "pre_dispatch": true
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_down.json b/tools/moe_microbench/results/gemm_down.json
+new file mode 100644
+index 0000000..2db3000
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_down.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_down",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4184.893817901611,
++    "device_p50_us": 4178.790092468262,
++    "device_p95_us": 4251.333928108215,
++    "device_p99_us": 4374.794783592225,
++    "device_max_us": 4514.840126037598,
++    "device_std_us": 52.534525503427645,
++    "host_mean_us": 4350.631479173899,
++    "n": 100,
++    "dispatch_overhead_us": 165.73766127228737
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_down_msprof.json b/tools/moe_microbench/results/gemm_down_msprof.json
+new file mode 100644
+index 0000000..83c5e28
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_down_msprof.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_down",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 84.20169999999999,
++  "device_std_us": 0.839795695392636,
++  "device_p50_us": 83.882,
++  "device_p95_us": 85.59,
++  "device_p99_us": 86.00040000000001,
++  "device_max_us": 86.10300000000001,
++  "device_min_us": 83.342,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/gemm_down/05d710313bd1_834190_20260526082827978_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/gemm_down",
++  "cfg": {
++    "N": 6,
++    "n_active_experts": 6,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_down_msprof_n1.json b/tools/moe_microbench/results/gemm_down_msprof_n1.json
+new file mode 100644
+index 0000000..743cb3b
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_down_msprof_n1.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_down",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 13.0305,
++  "device_std_us": 0.1862209708921097,
++  "device_p50_us": 13.0005,
++  "device_p95_us": 13.31345,
++  "device_p99_us": 13.33469,
++  "device_max_us": 13.34,
++  "device_min_us": 12.721,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_1/gemm_down/05d710313bd1_841577_20260526083117516_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_1/gemm_down",
++  "cfg": {
++    "N": 1,
++    "n_active_experts": 1,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_down_msprof_n2.json b/tools/moe_microbench/results/gemm_down_msprof_n2.json
+new file mode 100644
+index 0000000..73c2306
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_down_msprof_n2.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_down",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 26.1564,
++  "device_std_us": 0.29930492812514775,
++  "device_p50_us": 26.1505,
++  "device_p95_us": 26.68055,
++  "device_p99_us": 26.82491,
++  "device_max_us": 26.861,
++  "device_min_us": 25.78,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_2/gemm_down/05d710313bd1_845639_20260526083241113_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_2/gemm_down",
++  "cfg": {
++    "N": 2,
++    "n_active_experts": 2,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_down_msprof_n3.json b/tools/moe_microbench/results/gemm_down_msprof_n3.json
+new file mode 100644
+index 0000000..bb4d751
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_down_msprof_n3.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_down",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 39.0048,
++  "device_std_us": 0.25477393901260764,
++  "device_p50_us": 39.1105,
++  "device_p95_us": 39.261,
++  "device_p99_us": 39.261,
++  "device_max_us": 39.261,
++  "device_min_us": 38.561,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_3/gemm_down/05d710313bd1_848894_20260526083404037_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_3/gemm_down",
++  "cfg": {
++    "N": 3,
++    "n_active_experts": 3,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_down_msprof_n4.json b/tools/moe_microbench/results/gemm_down_msprof_n4.json
+new file mode 100644
+index 0000000..0e21550
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_down_msprof_n4.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_down",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 53.790699999999994,
++  "device_std_us": 0.4126141175481049,
++  "device_p50_us": 53.8315,
++  "device_p95_us": 54.333,
++  "device_p99_us": 54.3546,
++  "device_max_us": 54.36,
++  "device_min_us": 53.06099999999999,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_4/gemm_down/05d710313bd1_852158_20260526083528179_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_4/gemm_down",
++  "cfg": {
++    "N": 4,
++    "n_active_experts": 4,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_down_msprof_n5.json b/tools/moe_microbench/results/gemm_down_msprof_n5.json
+new file mode 100644
+index 0000000..9b9342a
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_down_msprof_n5.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_down",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 67.3675,
++  "device_std_us": 0.4581480655857908,
++  "device_p50_us": 67.471,
++  "device_p95_us": 67.96445,
++  "device_p99_us": 68.05769000000001,
++  "device_max_us": 68.081,
++  "device_min_us": 66.53999999999999,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_5/gemm_down/05d710313bd1_855409_20260526083651196_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_5/gemm_down",
++  "cfg": {
++    "N": 5,
++    "n_active_experts": 5,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_down_msprof_n6.json b/tools/moe_microbench/results/gemm_down_msprof_n6.json
+new file mode 100644
+index 0000000..93956f5
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_down_msprof_n6.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_down",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 79.33319999999999,
++  "device_std_us": 0.6609176650688031,
++  "device_p50_us": 79.1905,
++  "device_p95_us": 80.30845,
++  "device_p99_us": 80.57449,
++  "device_max_us": 80.64099999999999,
++  "device_min_us": 78.2,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_6/gemm_down/05d710313bd1_858650_20260526083813967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_6/gemm_down",
++  "cfg": {
++    "N": 6,
++    "n_active_experts": 6,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up.json b/tools/moe_microbench/results/gemm_up.json
+new file mode 100644
+index 0000000..a269501
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_up",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4274.017019271851,
++    "device_p50_us": 4243.60990524292,
++    "device_p95_us": 4414.990854263306,
++    "device_p99_us": 4587.580227851871,
++    "device_max_us": 5260.799884796143,
++    "device_std_us": 139.56525812640643,
++    "host_mean_us": 4438.2543582469225,
++    "n": 100,
++    "dispatch_overhead_us": 164.2373389750719
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up_msprof.json b/tools/moe_microbench/results/gemm_up_msprof.json
+new file mode 100644
+index 0000000..1b72cab
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up_msprof.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_up",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 107.4163,
++  "device_std_us": 0.7092996616381555,
++  "device_p50_us": 107.18200000000002,
++  "device_p95_us": 108.53265,
++  "device_p99_us": 108.54092999999999,
++  "device_max_us": 108.54299999999999,
++  "device_min_us": 106.62299999999999,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/gemm_up/05d710313bd1_823528_20260526082451076_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/gemm_up",
++  "cfg": {
++    "N": 6,
++    "n_active_experts": 6,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up_msprof_n1.json b/tools/moe_microbench/results/gemm_up_msprof_n1.json
+new file mode 100644
+index 0000000..f78fcb8
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up_msprof_n1.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_up",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 16.7222,
++  "device_std_us": 0.157109388643709,
++  "device_p50_us": 16.68,
++  "device_p95_us": 16.933,
++  "device_p99_us": 16.9546,
++  "device_max_us": 16.96,
++  "device_min_us": 16.52,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_1/gemm_up/05d710313bd1_839853_20260526083054553_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_1/gemm_up",
++  "cfg": {
++    "N": 1,
++    "n_active_experts": 1,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up_msprof_n2.json b/tools/moe_microbench/results/gemm_up_msprof_n2.json
+new file mode 100644
+index 0000000..154c231
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up_msprof_n2.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_up",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 33.6091,
++  "device_std_us": 0.21305184814969386,
++  "device_p50_us": 33.601,
++  "device_p95_us": 33.9289,
++  "device_p99_us": 33.98578,
++  "device_max_us": 34.0,
++  "device_min_us": 33.28,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_2/gemm_up/05d710313bd1_845009_20260526083219015_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_2/gemm_up",
++  "cfg": {
++    "N": 2,
++    "n_active_experts": 2,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up_msprof_n3.json b/tools/moe_microbench/results/gemm_up_msprof_n3.json
+new file mode 100644
+index 0000000..9feaf65
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up_msprof_n3.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_up",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 51.43919999999999,
++  "device_std_us": 0.328440801363045,
++  "device_p50_us": 51.480999999999995,
++  "device_p95_us": 51.83145,
++  "device_p99_us": 51.90309,
++  "device_max_us": 51.921,
++  "device_min_us": 50.86,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_3/gemm_up/05d710313bd1_848272_20260526083342462_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_3/gemm_up",
++  "cfg": {
++    "N": 3,
++    "n_active_experts": 3,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up_msprof_n4.json b/tools/moe_microbench/results/gemm_up_msprof_n4.json
+new file mode 100644
+index 0000000..7aac746
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up_msprof_n4.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_up",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 69.61359999999999,
++  "device_std_us": 0.3400735802734459,
++  "device_p50_us": 69.5325,
++  "device_p95_us": 70.101,
++  "device_p99_us": 70.101,
++  "device_max_us": 70.101,
++  "device_min_us": 69.042,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_4/gemm_up/05d710313bd1_851510_20260526083505358_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_4/gemm_up",
++  "cfg": {
++    "N": 4,
++    "n_active_experts": 4,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up_msprof_n5.json b/tools/moe_microbench/results/gemm_up_msprof_n5.json
+new file mode 100644
+index 0000000..b97899b
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up_msprof_n5.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_up",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 86.95949999999999,
++  "device_std_us": 0.44461584542163957,
++  "device_p50_us": 87.0215,
++  "device_p95_us": 87.5201,
++  "device_p99_us": 87.57122,
++  "device_max_us": 87.58399999999999,
++  "device_min_us": 86.241,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_5/gemm_up/05d710313bd1_854774_20260526083630008_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_5/gemm_up",
++  "cfg": {
++    "N": 5,
++    "n_active_experts": 5,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up_msprof_n6.json b/tools/moe_microbench/results/gemm_up_msprof_n6.json
+new file mode 100644
+index 0000000..7eb63b6
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up_msprof_n6.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_up",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul",
++  "device_mean_us": 102.51379999999999,
++  "device_std_us": 0.6500625816027317,
++  "device_p50_us": 102.38149999999999,
++  "device_p95_us": 103.62100000000001,
++  "device_p99_us": 103.75060000000002,
++  "device_max_us": 103.78300000000002,
++  "device_min_us": 101.52099999999999,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/n_active_6/gemm_up/05d710313bd1_858030_20260526083752889_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/n_active_6/gemm_up",
++  "cfg": {
++    "N": 6,
++    "n_active_experts": 6,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/gemm_up_msprof_smoke.json b/tools/moe_microbench/results/gemm_up_msprof_smoke.json
+new file mode 100644
+index 0000000..d6618a5
+--- /dev/null
++++ b/tools/moe_microbench/results/gemm_up_msprof_smoke.json
+@@ -0,0 +1,22 @@
++{
++  "kind": "gemm_up",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantMatmul",
++  "device_mean_us": 107.41629999999998,
++  "device_std_us": 0.5875885774833348,
++  "device_p50_us": 17.9005,
++  "device_p95_us": 18.80105,
++  "device_p99_us": 19.0302,
++  "device_max_us": 19.16,
++  "device_min_us": 16.821,
++  "matched_rows": 10,
++  "source_csv": "kernel_details:npu_results/gemm_up/05d710313bd1_823528_20260526082451076_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++  "trace_dir": "npu_results/gemm_up",
++  "cfg": {
++    "N": 6,
++    "n_active_experts": 6,
++    "H": 4096,
++    "I": 2048
++  },
++  "gemm_path": "loop_quant_matmul"
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/grouped_vs_loop.json b/tools/moe_microbench/results/grouped_vs_loop.json
+new file mode 100644
+index 0000000..95f97e7
+--- /dev/null
++++ b/tools/moe_microbench/results/grouped_vs_loop.json
+@@ -0,0 +1,59 @@
++{
++  "kind": "grouped_vs_loop",
++  "cfg": {
++    "N": 6,
++    "E_act": 6
++  },
++  "results": [
++    {
++      "target": "up",
++      "grouped": {
++        "device_mean_us": 4508.390197753906,
++        "device_p50_us": 4499.469995498657,
++        "device_p95_us": 4597.10681438446,
++        "device_p99_us": 4626.056299209595,
++        "device_max_us": 4633.619785308838,
++        "device_std_us": 50.45704966014091,
++        "host_mean_us": 4693.7433909624815,
++        "n": 100,
++        "dispatch_overhead_us": 185.35319320857525
++      },
++      "loop": {
++        "device_mean_us": 2070.559594631195,
++        "device_p50_us": 2069.4600343704224,
++        "device_p95_us": 2108.3890438079834,
++        "device_p99_us": 2119.429998397827,
++        "device_max_us": 2124.380111694336,
++        "device_std_us": 19.246556094490753,
++        "host_mean_us": 2213.978376239538,
++        "n": 100,
++        "dispatch_overhead_us": 143.41878160834312
++      }
++    },
++    {
++      "target": "down",
++      "grouped": {
++        "device_mean_us": 4459.610595703125,
++        "device_p50_us": 4460.060119628906,
++        "device_p95_us": 4513.877153396606,
++        "device_p99_us": 4528.5851192474365,
++        "device_max_us": 4548.900127410889,
++        "device_std_us": 35.272587111095945,
++        "host_mean_us": 4615.510758012533,
++        "n": 100,
++        "dispatch_overhead_us": 155.9001623094082
++      },
++      "loop": {
++        "device_mean_us": 2038.4113943576813,
++        "device_p50_us": 2036.7399454116821,
++        "device_p95_us": 2080.091905593872,
++        "device_p99_us": 2122.9777812957764,
++        "device_max_us": 2132.659912109375,
++        "device_std_us": 23.96312766135701,
++        "host_mean_us": 2186.740590259433,
++        "n": 100,
++        "dispatch_overhead_us": 148.32919590175152
++      }
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/grouped_vs_loop_msprof.json b/tools/moe_microbench/results/grouped_vs_loop_msprof.json
+new file mode 100644
+index 0000000..6b7232f
+--- /dev/null
++++ b/tools/moe_microbench/results/grouped_vs_loop_msprof.json
+@@ -0,0 +1,76 @@
++{
++  "kind": "grouped_vs_loop",
++  "mode": "msprof_hardware_only",
++  "cfg": {
++    "N": 6,
++    "E_act": 6
++  },
++  "results": [
++    {
++      "target": "up",
++      "grouped_hw": {
++        "kind": "grouped_up",
++        "mode": "msprof_hardware_only",
++        "op_pattern": "QuantBatchMatmul",
++        "device_mean_us": 104.03609999999999,
++        "device_std_us": 0.5531308073141502,
++        "device_p50_us": 103.8825,
++        "device_p95_us": 104.83555,
++        "device_p99_us": 104.93671000000002,
++        "device_max_us": 104.96200000000002,
++        "device_min_us": 103.26199999999999,
++        "matched_rows": 10,
++        "source_csv": "kernel_details:npu_results/gvl_up_grouped/05d710313bd1_837442_20260526082952799_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++        "trace_dir": "npu_results/gvl_up_grouped"
++      },
++      "loop_hw": {
++        "kind": "loop_up",
++        "mode": "msprof_hardware_only",
++        "op_pattern": "QuantBatchMatmul",
++        "device_mean_us": 102.2138,
++        "device_std_us": 0.6766014779765069,
++        "device_p50_us": 102.31199999999998,
++        "device_p95_us": 103.12955,
++        "device_p99_us": 103.25231,
++        "device_max_us": 103.283,
++        "device_min_us": 100.74200000000002,
++        "matched_rows": 10,
++        "source_csv": "kernel_details:npu_results/gvl_up_loop/05d710313bd1_837442_20260526082957550_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++        "trace_dir": "npu_results/gvl_up_loop"
++      }
++    },
++    {
++      "target": "down",
++      "grouped_hw": {
++        "kind": "grouped_down",
++        "mode": "msprof_hardware_only",
++        "op_pattern": "QuantBatchMatmul",
++        "device_mean_us": 79.69579999999999,
++        "device_std_us": 0.5521870697508212,
++        "device_p50_us": 79.5815,
++        "device_p95_us": 80.70254999999999,
++        "device_p99_us": 80.70290999999999,
++        "device_max_us": 80.70299999999999,
++        "device_min_us": 78.92099999999999,
++        "matched_rows": 10,
++        "source_csv": "kernel_details:npu_results/gvl_down_grouped/05d710313bd1_837442_20260526083002180_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++        "trace_dir": "npu_results/gvl_down_grouped"
++      },
++      "loop_hw": {
++        "kind": "loop_down",
++        "mode": "msprof_hardware_only",
++        "op_pattern": "QuantBatchMatmul",
++        "device_mean_us": 77.9517,
++        "device_std_us": 1.0354084266607047,
++        "device_p50_us": 78.2715,
++        "device_p95_us": 79.328,
++        "device_p99_us": 79.7384,
++        "device_max_us": 79.841,
++        "device_min_us": 76.00200000000001,
++        "matched_rows": 10,
++        "source_csv": "kernel_details:npu_results/gvl_down_loop/05d710313bd1_837442_20260526083006900_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++        "trace_dir": "npu_results/gvl_down_loop"
++      }
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/msprof_n_active_sweep.md b/tools/moe_microbench/results/msprof_n_active_sweep.md
+new file mode 100644
+index 0000000..9b257e3
+--- /dev/null
++++ b/tools/moe_microbench/results/msprof_n_active_sweep.md
+@@ -0,0 +1,12 @@
++# msprof n_active sweep (hardware only)
++
++| n_active | gemm_up_hw | gemm_up_util | gemm_down_hw | gemm_down_util | routed_full_hw |
++|---------:|-----------:|-------------:|-------------:|---------------:|---------------:|
++| 1 | 16.72 | 83.61% | 13.03 | 53.65% | 37.20 |
++| 2 | 33.61 | 83.20% | 26.16 | 53.45% | 70.73 |
++| 3 | 51.44 | 81.54% | 39.00 | 53.77% | 100.62 |
++| 4 | 69.61 | 80.33% | 53.79 | 51.98% | 132.12 |
++| 5 | 86.96 | 80.39% | 67.37 | 51.88% | 163.10 |
++| 6 | 102.51 | 81.83% | 79.33 | 52.87% | 192.99 |
++
++> act_quant(pre) 不随 n_active 变化（固定 [num_tokens, H]）。
+diff --git a/tools/moe_microbench/results/msprof_vs_python_comparison.md b/tools/moe_microbench/results/msprof_vs_python_comparison.md
+new file mode 100644
+index 0000000..3b8f534
+--- /dev/null
++++ b/tools/moe_microbench/results/msprof_vs_python_comparison.md
+@@ -0,0 +1,46 @@
++# msprof vs Python Event Comparison (MoE)
++
++> Python Event = eager end-to-end per op call (D4)  
++> msprof device time = NPU hardware kernel time (Level1, D5)  
++> 两者差额 = launch overhead  
++> **完整结论与复现**：[`ANALYSIS_AND_REPRODUCTION.md`](./ANALYSIS_AND_REPRODUCTION.md)
++
++## Launch Overhead 拆解
++
++| segment | python_event_us | msprof_device_us | launch_overhead_us | overhead_pct |
++|---------|-----------------|------------------|--------------------|--------------|
++| act_quant_post | 166.41 | 3.29 | 163.13 | 98.03% |
++| act_quant_pre | 186.41 | 2.18 | 184.24 | 98.83% |
++| gemm_up | 4274.02 | 107.42 | 4166.60 | 97.49% |
++| silu_mul | 349.99 | 6.71 | 343.27 | 98.08% |
++| gemm_down | 4184.89 | 84.20 | 4100.69 | 97.99% |
++| routed_full | 9142.27 | 202.01 | 8940.26 | 97.79% |
++| shared_expert | 978.65 | 46.51 | 932.13 | 95.25% |
++
++## Roofline 对照 (硬件层, measured @ 1.20 TB/s)
++
++| segment | device_us (hw) | lb @ measured | util_vs_measured |
++|---------|----------------|---------------|------------------|
++| gemm_up | 107.42 | 83.89 | 78.09% |
++| gemm_down | 84.20 | 41.94 | 49.81% |
++| shared_expert | 46.51 | 20.97 | 45.09% |
++
++## Grouped vs Loop 硬件层确认 (D4 谜团)
++
++| path | python_event_us | hw_device_us | overhead_us | overhead_pct |
++|------|-----------------|--------------|-------------|--------------|
++| grouped | 4508.39 | 104.04 | 4404.35 | 97.69% |
++| loop | 2070.56 | 102.21 | 1968.35 | 95.06% |
++
++判定: hw_grouped ≈ hw_loop：差异主要来自 grouped fallback 的 Python 路径开销
++
++## 顶部速览 (overhead_pct)
++- act_quant_post: 98.0%
++- act_quant_pre: 98.8%
++- gemm_up: 97.5%
++- silu_mul: 98.1%
++- gemm_down: 98.0%
++- routed_full: 97.8%
++- shared_expert: 95.2%
++
++gemm_down util_vs_measured = 49.8% (D4 Event util_eff=99.78%)；判定: D4 Event 99.78% 含大量 Python overhead，硬件 util 远低于 Event 报数
+diff --git a/tools/moe_microbench/results/n_active_1/gemm_down.json b/tools/moe_microbench/results/n_active_1/gemm_down.json
+new file mode 100644
+index 0000000..240e47f
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_1/gemm_down.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_down",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4113.659572601318,
++    "device_p50_us": 4106.239795684814,
++    "device_p95_us": 4203.902006149292,
++    "device_p99_us": 4233.383526802064,
++    "device_max_us": 4366.399765014648,
++    "device_std_us": 50.770893556458674,
++    "host_mean_us": 4272.943930700421,
++    "n": 100,
++    "dispatch_overhead_us": 159.28435809910297
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_1/gemm_up.json b/tools/moe_microbench/results/n_active_1/gemm_up.json
+new file mode 100644
+index 0000000..37108bb
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_1/gemm_up.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_up",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4506.948990821838,
++    "device_p50_us": 4493.969917297363,
++    "device_p95_us": 4594.927883148193,
++    "device_p99_us": 4748.091254234315,
++    "device_max_us": 4868.000030517578,
++    "device_std_us": 62.26655576211845,
++    "host_mean_us": 4696.218576282263,
++    "n": 100,
++    "dispatch_overhead_us": 189.26958546042442
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_1/routed_full.json b/tools/moe_microbench/results/n_active_1/routed_full.json
+new file mode 100644
+index 0000000..157b916
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_1/routed_full.json
+@@ -0,0 +1,49 @@
++{
++  "kind": "routed_full",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 8472.43179321289,
++    "device_p50_us": 8470.330238342285,
++    "device_p95_us": 8546.207332611084,
++    "device_p99_us": 8619.27025794983,
++    "device_max_us": 8644.000053405762,
++    "device_std_us": 44.540187745054816,
++    "host_mean_us": 8637.69868388772,
++    "n": 100,
++    "dispatch_overhead_us": 165.26689067482948
++  },
++  "derived": {
++    "routed_full_compute_only_us": 8424.150390625,
++    "routed_full_post_dispatch_us": 8472.43179321289,
++    "dispatch_overhead_us": 165.26689067482948
++  },
++  "segments": {
++    "compute_only": {
++      "device_mean_us": 8424.150390625,
++      "device_p50_us": 8413.729667663574,
++      "device_p95_us": 8512.460136413574,
++      "device_p99_us": 8717.16202735901,
++      "device_max_us": 8954.97989654541,
++      "device_std_us": 81.2970579577117,
++      "host_mean_us": 8597.291624173522,
++      "n": 100,
++      "dispatch_overhead_us": 173.141233548522
++    },
++    "post_dispatch": {
++      "device_mean_us": 8472.43179321289,
++      "device_p50_us": 8470.330238342285,
++      "device_p95_us": 8546.207332611084,
++      "device_p99_us": 8619.27025794983,
++      "device_max_us": 8644.000053405762,
++      "device_std_us": 44.540187745054816,
++      "host_mean_us": 8637.69868388772,
++      "n": 100,
++      "dispatch_overhead_us": 165.26689067482948
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_2/gemm_down.json b/tools/moe_microbench/results/n_active_2/gemm_down.json
+new file mode 100644
+index 0000000..905f624
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_2/gemm_down.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_down",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4243.9435958862305,
++    "device_p50_us": 4241.699934005737,
++    "device_p95_us": 4296.288824081421,
++    "device_p99_us": 4363.689703941345,
++    "device_max_us": 4398.320198059082,
++    "device_std_us": 39.08688400950591,
++    "host_mean_us": 4410.826992243528,
++    "n": 100,
++    "dispatch_overhead_us": 166.8833963572979
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_2/gemm_up.json b/tools/moe_microbench/results/n_active_2/gemm_up.json
+new file mode 100644
+index 0000000..de704c6
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_2/gemm_up.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_up",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4229.1067934036255,
++    "device_p50_us": 4225.830078125,
++    "device_p95_us": 4336.230134963989,
++    "device_p99_us": 4419.921488761902,
++    "device_max_us": 4445.799827575684,
++    "device_std_us": 63.10274899725443,
++    "host_mean_us": 4389.949608594179,
++    "n": 100,
++    "dispatch_overhead_us": 160.84281519055367
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_2/routed_full.json b/tools/moe_microbench/results/n_active_2/routed_full.json
+new file mode 100644
+index 0000000..339751e
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_2/routed_full.json
+@@ -0,0 +1,49 @@
++{
++  "kind": "routed_full",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 9651.292972564697,
++    "device_p50_us": 9700.97017288208,
++    "device_p95_us": 9843.95318031311,
++    "device_p99_us": 9958.15552711487,
++    "device_max_us": 10145.83969116211,
++    "device_std_us": 176.09904929736496,
++    "host_mean_us": 9822.100857272744,
++    "n": 100,
++    "dispatch_overhead_us": 170.8078847080469
++  },
++  "derived": {
++    "routed_full_compute_only_us": 9712.949171066284,
++    "routed_full_post_dispatch_us": 9651.292972564697,
++    "dispatch_overhead_us": 170.8078847080469
++  },
++  "segments": {
++    "compute_only": {
++      "device_mean_us": 9712.949171066284,
++      "device_p50_us": 9690.069675445557,
++      "device_p95_us": 9845.385217666626,
++      "device_p99_us": 9944.500341415405,
++      "device_max_us": 9976.2601852417,
++      "device_std_us": 90.90677271518462,
++      "host_mean_us": 9894.334077835083,
++      "n": 100,
++      "dispatch_overhead_us": 181.38490676879883
++    },
++    "post_dispatch": {
++      "device_mean_us": 9651.292972564697,
++      "device_p50_us": 9700.97017288208,
++      "device_p95_us": 9843.95318031311,
++      "device_p99_us": 9958.15552711487,
++      "device_max_us": 10145.83969116211,
++      "device_std_us": 176.09904929736496,
++      "host_mean_us": 9822.100857272744,
++      "n": 100,
++      "dispatch_overhead_us": 170.8078847080469
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_3/gemm_down.json b/tools/moe_microbench/results/n_active_3/gemm_down.json
+new file mode 100644
+index 0000000..de457c3
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_3/gemm_down.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_down",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4347.693390846252,
++    "device_p50_us": 4321.500062942505,
++    "device_p95_us": 4511.740875244141,
++    "device_p99_us": 4541.791133880616,
++    "device_max_us": 4651.800155639648,
++    "device_std_us": 79.99970622973356,
++    "host_mean_us": 4526.261426508427,
++    "n": 100,
++    "dispatch_overhead_us": 178.56803566217422
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_3/gemm_up.json b/tools/moe_microbench/results/n_active_3/gemm_up.json
+new file mode 100644
+index 0000000..7ce6503
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_3/gemm_up.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_up",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4594.619207382202,
++    "device_p50_us": 4586.220026016235,
++    "device_p95_us": 4702.580094337463,
++    "device_p99_us": 4770.74694633484,
++    "device_max_us": 4902.100086212158,
++    "device_std_us": 63.81318488221891,
++    "host_mean_us": 4766.743816435337,
++    "n": 100,
++    "dispatch_overhead_us": 172.12460905313492
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_3/routed_full.json b/tools/moe_microbench/results/n_active_3/routed_full.json
+new file mode 100644
+index 0000000..9970ae4
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_3/routed_full.json
+@@ -0,0 +1,49 @@
++{
++  "kind": "routed_full",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 9299.771394729614,
++    "device_p50_us": 9277.490139007568,
++    "device_p95_us": 9489.184713363647,
++    "device_p99_us": 9547.633934020996,
++    "device_max_us": 9580.659866333008,
++    "device_std_us": 90.85911494251495,
++    "host_mean_us": 9491.496412083507,
++    "n": 100,
++    "dispatch_overhead_us": 191.72501735389233
++  },
++  "derived": {
++    "routed_full_compute_only_us": 9278.117036819458,
++    "routed_full_post_dispatch_us": 9299.771394729614,
++    "dispatch_overhead_us": 191.72501735389233
++  },
++  "segments": {
++    "compute_only": {
++      "device_mean_us": 9278.117036819458,
++      "device_p50_us": 9250.849723815918,
++      "device_p95_us": 9547.677230834961,
++      "device_p99_us": 9696.715202331543,
++      "device_max_us": 9720.020294189453,
++      "device_std_us": 123.17422231251209,
++      "host_mean_us": 9483.653362840414,
++      "n": 100,
++      "dispatch_overhead_us": 205.53632602095604
++    },
++    "post_dispatch": {
++      "device_mean_us": 9299.771394729614,
++      "device_p50_us": 9277.490139007568,
++      "device_p95_us": 9489.184713363647,
++      "device_p99_us": 9547.633934020996,
++      "device_max_us": 9580.659866333008,
++      "device_std_us": 90.85911494251495,
++      "host_mean_us": 9491.496412083507,
++      "n": 100,
++      "dispatch_overhead_us": 191.72501735389233
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_4/gemm_down.json b/tools/moe_microbench/results/n_active_4/gemm_down.json
+new file mode 100644
+index 0000000..db554fc
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_4/gemm_down.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_down",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4237.992215156555,
++    "device_p50_us": 4229.099988937378,
++    "device_p95_us": 4323.998165130615,
++    "device_p99_us": 4424.103269577026,
++    "device_max_us": 4428.400039672852,
++    "device_std_us": 54.56283819457708,
++    "host_mean_us": 4402.16894261539,
++    "n": 100,
++    "dispatch_overhead_us": 164.17672745883465
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_4/gemm_up.json b/tools/moe_microbench/results/n_active_4/gemm_up.json
+new file mode 100644
+index 0000000..20f4568
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_4/gemm_up.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_up",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4625.386590957642,
++    "device_p50_us": 4617.540121078491,
++    "device_p95_us": 4698.694920539856,
++    "device_p99_us": 4786.661834716797,
++    "device_max_us": 4868.020057678223,
++    "device_std_us": 48.552911153728274,
++    "host_mean_us": 4810.43822132051,
++    "n": 100,
++    "dispatch_overhead_us": 185.0516303628683
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_4/routed_full.json b/tools/moe_microbench/results/n_active_4/routed_full.json
+new file mode 100644
+index 0000000..086deea
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_4/routed_full.json
+@@ -0,0 +1,49 @@
++{
++  "kind": "routed_full",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 8507.596998214722,
++    "device_p50_us": 8502.010345458984,
++    "device_p95_us": 8614.653205871582,
++    "device_p99_us": 8642.098598480225,
++    "device_max_us": 8651.840209960938,
++    "device_std_us": 55.770188027234475,
++    "host_mean_us": 8664.475223049521,
++    "n": 100,
++    "dispatch_overhead_us": 156.87822483479977
++  },
++  "derived": {
++    "routed_full_compute_only_us": 8417.792024612427,
++    "routed_full_post_dispatch_us": 8507.596998214722,
++    "dispatch_overhead_us": 156.87822483479977
++  },
++  "segments": {
++    "compute_only": {
++      "device_mean_us": 8417.792024612427,
++      "device_p50_us": 8396.739959716797,
++      "device_p95_us": 8599.535369873047,
++      "device_p99_us": 8653.173847198486,
++      "device_max_us": 8727.800369262695,
++      "device_std_us": 100.36857504328188,
++      "host_mean_us": 8580.733872950077,
++      "n": 100,
++      "dispatch_overhead_us": 162.9418483376503
++    },
++    "post_dispatch": {
++      "device_mean_us": 8507.596998214722,
++      "device_p50_us": 8502.010345458984,
++      "device_p95_us": 8614.653205871582,
++      "device_p99_us": 8642.098598480225,
++      "device_max_us": 8651.840209960938,
++      "device_std_us": 55.770188027234475,
++      "host_mean_us": 8664.475223049521,
++      "n": 100,
++      "dispatch_overhead_us": 156.87822483479977
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_5/gemm_down.json b/tools/moe_microbench/results/n_active_5/gemm_down.json
+new file mode 100644
+index 0000000..7515883
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_5/gemm_down.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_down",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4150.828399658203,
++    "device_p50_us": 4148.629903793335,
++    "device_p95_us": 4229.775023460388,
++    "device_p99_us": 4260.420932769776,
++    "device_max_us": 4393.179893493652,
++    "device_std_us": 52.774263836514585,
++    "host_mean_us": 4318.685978651047,
++    "n": 100,
++    "dispatch_overhead_us": 167.85757899284363
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_5/gemm_up.json b/tools/moe_microbench/results/n_active_5/gemm_up.json
+new file mode 100644
+index 0000000..e50b055
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_5/gemm_up.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_up",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4413.863196372986,
++    "device_p50_us": 4405.709981918335,
++    "device_p95_us": 4549.531865119934,
++    "device_p99_us": 4630.155119895936,
++    "device_max_us": 4833.620071411133,
++    "device_std_us": 71.4924438804795,
++    "host_mean_us": 4588.6290818452835,
++    "n": 100,
++    "dispatch_overhead_us": 174.76588547229767
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_5/routed_full.json b/tools/moe_microbench/results/n_active_5/routed_full.json
+new file mode 100644
+index 0000000..bc10c50
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_5/routed_full.json
+@@ -0,0 +1,49 @@
++{
++  "kind": "routed_full",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 8663.742055892944,
++    "device_p50_us": 8659.240245819092,
++    "device_p95_us": 8724.730968475342,
++    "device_p99_us": 8752.93065071106,
++    "device_max_us": 8775.779724121094,
++    "device_std_us": 42.18165611900556,
++    "host_mean_us": 8822.343461215496,
++    "n": 100,
++    "dispatch_overhead_us": 158.60140532255173
++  },
++  "derived": {
++    "routed_full_compute_only_us": 8816.82641029358,
++    "routed_full_post_dispatch_us": 8663.742055892944,
++    "dispatch_overhead_us": 158.60140532255173
++  },
++  "segments": {
++    "compute_only": {
++      "device_mean_us": 8816.82641029358,
++      "device_p50_us": 8823.830127716064,
++      "device_p95_us": 8920.506572723389,
++      "device_p99_us": 8971.290655136108,
++      "device_max_us": 9059.479713439941,
++      "device_std_us": 81.55856504297488,
++      "host_mean_us": 9001.441784203053,
++      "n": 100,
++      "dispatch_overhead_us": 184.61537390947342
++    },
++    "post_dispatch": {
++      "device_mean_us": 8663.742055892944,
++      "device_p50_us": 8659.240245819092,
++      "device_p95_us": 8724.730968475342,
++      "device_p99_us": 8752.93065071106,
++      "device_max_us": 8775.779724121094,
++      "device_std_us": 42.18165611900556,
++      "host_mean_us": 8822.343461215496,
++      "n": 100,
++      "dispatch_overhead_us": 158.60140532255173
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_6/gemm_down.json b/tools/moe_microbench/results/n_active_6/gemm_down.json
+new file mode 100644
+index 0000000..cd056fb
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_6/gemm_down.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_down",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4450.586199760437,
++    "device_p50_us": 4438.490152359009,
++    "device_p95_us": 4552.054762840271,
++    "device_p99_us": 4608.490285873414,
++    "device_max_us": 4720.399856567383,
++    "device_std_us": 56.38418301064969,
++    "host_mean_us": 4630.6743659079075,
++    "n": 100,
++    "dispatch_overhead_us": 180.08816614747047
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_6/gemm_up.json b/tools/moe_microbench/results/n_active_6/gemm_up.json
+new file mode 100644
+index 0000000..d88b934
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_6/gemm_up.json
+@@ -0,0 +1,20 @@
++{
++  "kind": "gemm_up",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 4392.775611877441,
++    "device_p50_us": 4383.399963378906,
++    "device_p95_us": 4477.708125114441,
++    "device_p99_us": 4535.086722373962,
++    "device_max_us": 4593.160152435303,
++    "device_std_us": 51.676047253532765,
++    "host_mean_us": 4580.833679065108,
++    "n": 100,
++    "dispatch_overhead_us": 188.0580671876669
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/n_active_6/routed_full.json b/tools/moe_microbench/results/n_active_6/routed_full.json
+new file mode 100644
+index 0000000..8d29605
+--- /dev/null
++++ b/tools/moe_microbench/results/n_active_6/routed_full.json
+@@ -0,0 +1,49 @@
++{
++  "kind": "routed_full",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 8981.255445480347,
++    "device_p50_us": 8952.029705047607,
++    "device_p95_us": 9163.696002960205,
++    "device_p99_us": 9284.221382141117,
++    "device_max_us": 10086.2398147583,
++    "device_std_us": 145.38684035145744,
++    "host_mean_us": 9146.872228011489,
++    "n": 100,
++    "dispatch_overhead_us": 165.61678253114223
++  },
++  "derived": {
++    "routed_full_compute_only_us": 8844.105167388916,
++    "routed_full_post_dispatch_us": 8981.255445480347,
++    "dispatch_overhead_us": 165.61678253114223
++  },
++  "segments": {
++    "compute_only": {
++      "device_mean_us": 8844.105167388916,
++      "device_p50_us": 8832.589626312256,
++      "device_p95_us": 8983.074188232422,
++      "device_p99_us": 9025.178165435791,
++      "device_max_us": 9046.819686889648,
++      "device_std_us": 75.51076464235263,
++      "host_mean_us": 9022.116996347904,
++      "n": 100,
++      "dispatch_overhead_us": 178.0118289589882
++    },
++    "post_dispatch": {
++      "device_mean_us": 8981.255445480347,
++      "device_p50_us": 8952.029705047607,
++      "device_p95_us": 9163.696002960205,
++      "device_p99_us": 9284.221382141117,
++      "device_max_us": 10086.2398147583,
++      "device_std_us": 145.38684035145744,
++      "host_mean_us": 9146.872228011489,
++      "n": 100,
++      "dispatch_overhead_us": 165.61678253114223
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/routed_full.json b/tools/moe_microbench/results/routed_full.json
+new file mode 100644
+index 0000000..9b34664
+--- /dev/null
++++ b/tools/moe_microbench/results/routed_full.json
+@@ -0,0 +1,49 @@
++{
++  "kind": "routed_full",
++  "cfg": {
++    "N": 6,
++    "H": 4096,
++    "I": 2048,
++    "E_act": 6
++  },
++  "timing": {
++    "device_mean_us": 9142.269401550293,
++    "device_p50_us": 9142.670154571533,
++    "device_p95_us": 9244.869041442871,
++    "device_p99_us": 9266.387310028076,
++    "device_max_us": 9267.080307006836,
++    "device_std_us": 58.92113390905739,
++    "host_mean_us": 9311.312912032008,
++    "n": 100,
++    "dispatch_overhead_us": 169.0435104817152
++  },
++  "derived": {
++    "routed_full_compute_only_us": 9104.782190322876,
++    "routed_full_post_dispatch_us": 9142.269401550293,
++    "dispatch_overhead_us": 169.0435104817152
++  },
++  "segments": {
++    "compute_only": {
++      "device_mean_us": 9104.782190322876,
++      "device_p50_us": 9108.870029449463,
++      "device_p95_us": 9226.773357391357,
++      "device_p99_us": 9267.250776290894,
++      "device_max_us": 9363.340377807617,
++      "device_std_us": 76.62434953042305,
++      "host_mean_us": 9283.117167651653,
++      "n": 100,
++      "dispatch_overhead_us": 178.3349773287773
++    },
++    "post_dispatch": {
++      "device_mean_us": 9142.269401550293,
++      "device_p50_us": 9142.670154571533,
++      "device_p95_us": 9244.869041442871,
++      "device_p99_us": 9266.387310028076,
++      "device_max_us": 9267.080307006836,
++      "device_std_us": 58.92113390905739,
++      "host_mean_us": 9311.312912032008,
++      "n": 100,
++      "dispatch_overhead_us": 169.0435104817152
++    }
++  }
++}
+\ No newline at end of file

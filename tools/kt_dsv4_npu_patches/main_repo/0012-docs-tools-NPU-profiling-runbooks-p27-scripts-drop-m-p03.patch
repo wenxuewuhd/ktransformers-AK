@@ -1,0 +1,1590 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 12/13] docs(tools): NPU profiling runbooks, p27 scripts, drop (part 3/4)
+
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00037-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00037-of-00157.safetensors
+deleted file mode 120000
+index 514336a..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00037-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/9cc084b5f65b6562a0a39e3572cbb0566fbdae240e4cc6038bb6940de3b99dd1
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00038-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00038-of-00157.safetensors
+deleted file mode 120000
+index a9b10ca..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00038-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/ce4d7659e31bd54e62e60b0c3efb66ed1e4593d562fde567778a64331964b0ab
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00039-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00039-of-00157.safetensors
+deleted file mode 120000
+index 9d39617..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00039-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/90340add0d5aa640d5e48ce0a007bf84002963cc4ac759edda699bddadb5104b
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00040-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00040-of-00157.safetensors
+deleted file mode 120000
+index 534f952..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00040-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/a504b7e6725ce635bc04530128d4d632aefa2d2c2cad4ba3f1062e62d2b16732
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00041-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00041-of-00157.safetensors
+deleted file mode 120000
+index 3fd8aaa..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00041-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/aabe2aad03d252fe68b71a65869957f8f834257dbe9a47499fe73fb952e70e80
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00042-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00042-of-00157.safetensors
+deleted file mode 120000
+index 7f4f46f..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00042-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/d77cefea96c057fcd1e62255fa3ef105478a36539aec367bacde13138a8e4446
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00043-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00043-of-00157.safetensors
+deleted file mode 120000
+index 0a687a0..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00043-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/f7684dcd6b64134cf6e8128af3dcd562746fbfee21728310bb14b2378d61a7e8
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00044-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00044-of-00157.safetensors
+deleted file mode 120000
+index 41bc0c6..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00044-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/c8908c31e0a92da32d99d69d71dc7ceff5f239208329a1f073b1386cd2da7bc5
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00045-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00045-of-00157.safetensors
+deleted file mode 120000
+index 567a113..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00045-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/8abf7817a209ced08cb3f2751faa0d1e28faf3e41ce17257f66ac73ae7dcce80
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00046-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00046-of-00157.safetensors
+deleted file mode 120000
+index 68698ff..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00046-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/1071ba768d7d0daf4a691bcace05f0ee829aed92b1a5603d2a6ca44d9055ace1
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00047-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00047-of-00157.safetensors
+deleted file mode 120000
+index 1a139f3..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00047-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/7f2be601645fe5a611aa4969a0adfc3ec815df6bbc5b6d5c6a84b3b0f563b3aa
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00048-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00048-of-00157.safetensors
+deleted file mode 120000
+index e94030e..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00048-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/4830f3d294003d26c2fae282c895cc738a64aec55d6b9179948431b3b319c530
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00049-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00049-of-00157.safetensors
+deleted file mode 120000
+index 391015b..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00049-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/3eb468ad92080b27ea3e1a399dc4c619a00b97fa3a0b8d59a41237d1867e5237
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00050-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00050-of-00157.safetensors
+deleted file mode 120000
+index d128869..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00050-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/99320b0567618b72aeb118fa5139d6dee1bed715f9c96df8008b5fb37ec61fb7
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00051-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00051-of-00157.safetensors
+deleted file mode 120000
+index 0dc7af8..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00051-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/6654b89d5792237b7d59bc296955beaba59220491b3509629569e5209186c4d9
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00052-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00052-of-00157.safetensors
+deleted file mode 120000
+index 8e9f19a..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00052-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/cd2be91c9ddc4cc24f585de62fb39b8be51b8e2520fd75b6d165eb934a431ad2
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00053-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00053-of-00157.safetensors
+deleted file mode 120000
+index e827669..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00053-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/428823016e9cea4b9bb02f7c23beb8ff680a2d31579254cdf615f4555278f349
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00054-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00054-of-00157.safetensors
+deleted file mode 120000
+index eaebb5e..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00054-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/f2bc504e479d59b0cc61d194ab67bd7fa81db8adf13c93d640aa85fd78ff4e37
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00055-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00055-of-00157.safetensors
+deleted file mode 120000
+index ea0f865..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00055-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/37af6699829999358444d4342d5a1ae0ef3817889aaecc4d1e2d0903c6b482bd
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00056-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00056-of-00157.safetensors
+deleted file mode 120000
+index 0352a84..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00056-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/489e610a0abe60e13a082a81aef6f9764b9ac2aad3c001637903620e28c1f91f
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00057-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00057-of-00157.safetensors
+deleted file mode 120000
+index b6fe070..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00057-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/675b4c282034d54c01aceeb189becf2a6d9d00f0146b2d03db621211c641da0f
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00058-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00058-of-00157.safetensors
+deleted file mode 120000
+index ea5a32f..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00058-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/aa83459b6b353d47bedabce317f1fa4842cdf4bad1b43cb52705ebdd6d5b8da5
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00059-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00059-of-00157.safetensors
+deleted file mode 120000
+index 4ce04ee..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00059-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/136d932e97558f92b8f1cc1eef4f64238ba5effffa77e1c0dd762d54608bda16
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00060-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00060-of-00157.safetensors
+deleted file mode 120000
+index 71d2374..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00060-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/cca703e7347bcf03eb57f1ee4e23c680d15ac47498789b95efa92570453d190f
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00061-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00061-of-00157.safetensors
+deleted file mode 120000
+index cf7fe57..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00061-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/b9c1ec091bf45df7520d3761568dcc168edf536f153fa000e8af01e595a487e9
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00062-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00062-of-00157.safetensors
+deleted file mode 120000
+index 56b6855..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00062-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/4445b9afea95320858eea6b9b7fa6afa16925c861e8b854910f5825d321b1093
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00063-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00063-of-00157.safetensors
+deleted file mode 120000
+index 41e41f2..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00063-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/3a94138568004bb64c1d177a200d5a3f5773c795c5b9119901067ce3a094d03a
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00064-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00064-of-00157.safetensors
+deleted file mode 120000
+index 2b65dac..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00064-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/95d6f790a6b480f6d9078acbf0e6b9376c8d667473b60c9d2e33764590c3ecaf
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00065-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00065-of-00157.safetensors
+deleted file mode 120000
+index c17332e..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00065-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/295edacdaef3d32a2caa1f6c9cbc240fb9e35f66cb157f2ac79e6f7b6ab6ebc5
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00066-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00066-of-00157.safetensors
+deleted file mode 120000
+index 48f3322..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00066-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/e9083913add3940715999b86a00b64be7e5d1fa52018e0108d671517b8450087
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00067-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00067-of-00157.safetensors
+deleted file mode 120000
+index e622bb2..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00067-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/f51c2a1eb3a24c32262861270e02c6c1482b8ba35ebef0bcff4225ade79ce34d
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00068-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00068-of-00157.safetensors
+deleted file mode 120000
+index 3264ae6..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00068-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/cf7d0ded9eb5d96660dd977a6cbd74dd11bf9df5d38c48c3404b17b6a8de4ea8
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00069-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00069-of-00157.safetensors
+deleted file mode 120000
+index 31d8873..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00069-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/714a9433535c90706c792fd8929db910e41323dd9ca59d5c79d5556da71eff89
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00070-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00070-of-00157.safetensors
+deleted file mode 120000
+index c395c63..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00070-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/1a00fe10b3323e1afaa259064788f6176759b2a1d55da7047a1a093a13cd17a7
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00071-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00071-of-00157.safetensors
+deleted file mode 120000
+index 196866c..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00071-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/d2aa9527362b9289aec60b03ebaf57e2390c53b79d331cb32453eb82fd7bfc17
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00072-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00072-of-00157.safetensors
+deleted file mode 120000
+index e4d178b..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00072-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/871177355b828e4e37318f465877645796dec38241faefa490d73f06ba5f5712
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00073-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00073-of-00157.safetensors
+deleted file mode 120000
+index ff44f67..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00073-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/9761b0b90d3d51924f1fcd67e21ff11d7ea771c6967f8e7b847785f5c11d882a
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00074-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00074-of-00157.safetensors
+deleted file mode 120000
+index 6ac7728..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00074-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/0c3245e009bcf9e005d74af94a9659381d775793838c9fd3f5dc6e12d3bb9583
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00075-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00075-of-00157.safetensors
+deleted file mode 120000
+index e215625..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00075-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/a2c17f9a86116b00142b62f462c467355f30099895da5d226371b823d3cdb7b8
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00076-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00076-of-00157.safetensors
+deleted file mode 120000
+index c864158..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00076-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/9b7941b9b4bcbcb90b1e31898cae161478fc83239c9e77f4ccf0ea454e2ad705
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00077-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00077-of-00157.safetensors
+deleted file mode 120000
+index 3bb5f24..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00077-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/9c12cf78d737a33b116e1a7d09cd25a6d27916f97d15165dc57502133b84e5ef
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00078-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00078-of-00157.safetensors
+deleted file mode 120000
+index 6096143..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00078-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/bbec2d160ebac881ccee68ee6b77e82e5b297b3e7283d4ee3a6ce92b871aa91d
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00079-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00079-of-00157.safetensors
+deleted file mode 120000
+index 762ce70..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00079-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/d7e8bafacd2cd024554e1e9f532757897bc54936921f54596b51153d6ba0cea7
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00080-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00080-of-00157.safetensors
+deleted file mode 120000
+index fb48bc4..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00080-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/524bbbccb497f677fe74e6b204505e5f288d98443bf494efa1547d92f435ebca
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00081-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00081-of-00157.safetensors
+deleted file mode 120000
+index adfa1e7..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00081-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/2db63aa8c90e80cdc7640380fec0766cc5355f7169dfa25fbc2af5e16ea4138d
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00082-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00082-of-00157.safetensors
+deleted file mode 120000
+index 5f64fc7..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00082-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/787f05ff82116f4ab0ab4d869b4c8f65784e97c6de5d99eef6b8cb1ab017fef4
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00083-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00083-of-00157.safetensors
+deleted file mode 120000
+index 1eff3f3..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00083-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/151fa28a5989efb058abfece7b682ce783488b734e9e671afade57bee1559bc5
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00084-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00084-of-00157.safetensors
+deleted file mode 120000
+index ce688f0..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00084-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/116f844fab872c0bae3a65e8393828031b4c8b59f4a618f50d6502e5748d0343
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00085-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00085-of-00157.safetensors
+deleted file mode 120000
+index c4045c9..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00085-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/6f0b2ec7693d0c81abb217366bf95b57df9ee99cc97989fb14a117b42f15dfb4
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00086-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00086-of-00157.safetensors
+deleted file mode 120000
+index 4487bdf..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00086-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/c71de0380caa1eafa691b7e52df2c2061d07c20e9b20ff473819f64797ec33a9
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00087-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00087-of-00157.safetensors
+deleted file mode 120000
+index 607e4bd..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00087-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/b88c6b159f4c0388058b788abcc5352eae2941b0df697c19c585bf70917e65f4
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00088-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00088-of-00157.safetensors
+deleted file mode 120000
+index 1300e23..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00088-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/a957ddd144d5d468700e5513071048dd739b5b3bda7a07cf2004ae773d727592
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00089-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00089-of-00157.safetensors
+deleted file mode 120000
+index 1e34e5e..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00089-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/77a9be41a27373d249005a3ae5da9f1a7267dffbdfa5ba172f30fb954a9679e9
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00090-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00090-of-00157.safetensors
+deleted file mode 120000
+index 01a122b..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00090-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/d386c053b7fe63f452c31cd51550bcbac0743c30d145d3bbc356cc886cf28f89
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00091-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00091-of-00157.safetensors
+deleted file mode 120000
+index 3720093..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00091-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/7637f269582f86085320c238eb43ea7fd6a80b4cb5e544179029bc50f06939de
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00092-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00092-of-00157.safetensors
+deleted file mode 120000
+index 37e77cc..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00092-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/0aa90742cf5d3043cdbdcecb37dd47317680a35ea16d153cb64cbeb751142e2a
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00093-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00093-of-00157.safetensors
+deleted file mode 120000
+index f33c2b5..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00093-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/7036408e3c814e9a14f22d8fe93fadff9b8814e90afe4a88b2c91f7ae3b3560f
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00094-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00094-of-00157.safetensors
+deleted file mode 120000
+index 0ec3605..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00094-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/e4bdc62552d7059665db11ed07f7129da44a7676a6e673f0654497d4ee444427
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00095-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00095-of-00157.safetensors
+deleted file mode 120000
+index 2a2eddd..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00095-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/f333a2a184403b2f19a629526690224b8d2c317d1abc5eac4a61e9dd77cf0ae9
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00096-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00096-of-00157.safetensors
+deleted file mode 120000
+index 9b70017..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00096-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/8421161bb589fea74695291d1c39c900e0c9a19370af79f908e304365b0bdd64
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00097-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00097-of-00157.safetensors
+deleted file mode 120000
+index bac61f6..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00097-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/26e1b1aca9007a2c194c0bbca1f70e044558259135be8a0e79a619f44c737f8b
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00098-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00098-of-00157.safetensors
+deleted file mode 120000
+index 79b0e8d..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00098-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/06088b8dd218ac2a3e875b00e7d039fb5dde166132406cb449de74dfb8797718
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00099-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00099-of-00157.safetensors
+deleted file mode 120000
+index 35d54e6..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00099-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/105a18efa9d576f87278403559624c8ca5e9f8dffc5a09b5b260ab438285328a
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00100-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00100-of-00157.safetensors
+deleted file mode 120000
+index 199d3c6..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00100-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/d0c8c7476ee2d98206abf449de6837c1cb51726dcf3482cc1f2735e575e9c488
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00101-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00101-of-00157.safetensors
+deleted file mode 120000
+index 1f92cfd..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00101-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/0d7abc7239a12234d701f42ddeee27dcfd5d86db0192e19f89085aff1cbdc7f5
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00102-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00102-of-00157.safetensors
+deleted file mode 120000
+index d8b8c9c..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00102-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/1841175a3800cd7c58112e0208466795e6c5700b8dca0c945413d33475d181e4
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00103-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00103-of-00157.safetensors
+deleted file mode 120000
+index 51a8c17..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00103-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/c3b1dab81467a7aa19d8320136dac5e46f03012ed0a6fed7ba0fca0ae05eb610
+\ No newline at end of file
+diff --git a/model/w8a8/quant_model_weight_w8a8_dynamic-00104-of-00157.safetensors b/model/w8a8/quant_model_weight_w8a8_dynamic-00104-of-00157.safetensors
+deleted file mode 120000
+index 6bf23c0..0000000
+--- a/model/w8a8/quant_model_weight_w8a8_dynamic-00104-of-00157.safetensors
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../root/.cache/openmind/hub/models--State_Cloud--DeepSeek-R1-W8A8/blobs/781c198950bafb35ba64e0c07c2752a934649a5daf86425b6b748f144920e58f
+\ No newline at end of file
+diff --git a/third_party/llamafile/iqk_mul_mat_arm82.cpp b/third_party/llamafile/iqk_mul_mat_arm82.cpp
+old mode 100644
+new mode 100755
+index 6ab57f2..b6b17e4
+--- a/third_party/llamafile/iqk_mul_mat_arm82.cpp
++++ b/third_party/llamafile/iqk_mul_mat_arm82.cpp
+@@ -9,7 +9,7 @@
+ // time. Without this rename, .inc emits the un-suffixed iqk_mul_mat / _moe
+ // and `kt_kernel_ext.so` reports `undefined symbol: iqk_mul_mat_moe_arm82`
+ // at import time.
+-#define iqk_mul_mat iqk_mul_mat_arm82
+-#define iqk_mul_mat_moe iqk_mul_mat_moe_arm82
++//#define iqk_mul_mat iqk_mul_mat_arm82
++//#define iqk_mul_mat_moe iqk_mul_mat_moe_arm82
+ #include "iqk_mul_mat_arm.inc"
+ #endif  // __aarch64__
+diff --git a/third_party/llamafile/tinyblas_cpu_sgemm.inc b/third_party/llamafile/tinyblas_cpu_sgemm.inc
+old mode 100644
+new mode 100755
+index e83636b..1a58787
+--- a/third_party/llamafile/tinyblas_cpu_sgemm.inc
++++ b/third_party/llamafile/tinyblas_cpu_sgemm.inc
+@@ -344,9 +344,13 @@ bool llamafile_sgemm(long m, long n, long k, const void* A, long lda, const void
+     if ((Btype == GGML_TYPE_Q8_0 || Btype == GGML_TYPE_Q8_1) && Ctype == GGML_TYPE_F32) {
+         // assert(QK8_0 == QK8_1 == QK4_0 == QK4_1 == QK5_0 == QK5_1 == 32);
+         assert((QK8_0 == 32) && (QK8_1 == 32) && (QK4_0 == 32) && (QK4_1 == 32) && (QK5_0 == 32) && (QK5_1 == 32));
++        // Kunpeng 920 / Cortex-A76: dotprod yes, i8mm no. iqk_mul_mat_arm82 Q8_0×Q8_0
++        // can return NaN on this class of CPUs; prefer tinyBLAS_Q0_ARM (NEON SDOT).
++#if defined(__ARM_FEATURE_MATMUL_INT8)
+         if (iqk_mul_mat(m, n, k * QK8_0, Atype, A, B, (float*)C, ldc, ith, nth)) {
+             return true;
+         }
++#endif
+     }
+ #endif
+ #endif
+diff --git a/third_party/sglang b/third_party/sglang
+index db577d2..38bda36 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit db577d2e82439876e7b7a93fc11ea7dd2a5a747f
++Subproject commit 38bda36e8e4420e27ab3087829e8a836ff446200
+diff --git a/tools/p27_curl_f2_prompts.sh b/tools/p27_curl_f2_prompts.sh
+new file mode 100755
+index 0000000..f693302
+--- /dev/null
++++ b/tools/p27_curl_f2_prompts.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++# F2 整网冒烟：Handoff 附录 Z.8 四个 prompt（需服务已起，PORT 与 launch 一致）。
++# 用法：HOST=127.0.0.1 PORT=8000 bash tools/p27_curl_f2_prompts.sh
++
++set -euo pipefail
++HOST="${HOST:-127.0.0.1}"
++PORT="${PORT:-8000}"
++PYBIN="${PYTHON_BIN:-${PYBIN:-/usr/local/python3.11.14/bin/python3.11}}"
++
++"$PYBIN" - <<'PY'
++import json
++import urllib.request
++
++host = __import__("os").environ.get("HOST", "127.0.0.1")
++port = __import__("os").environ.get("PORT", "8000")
++base = f"http://{host}:{port}/generate"
++
++prompts = [
++    (1, 64, "Below is a Python function to compute Fibonacci numbers:"),
++    (
++        2,
++        128,
++        "Explain the difference between supervised and unsupervised learning in three short paragraphs.\n\n",
++    ),
++    (3, 80, "请用一句话解释什么是 transformer 模型："),
++    (4, 128, "什么是 transformer 模型："),
++]
++
++for pid, max_tok, text in prompts:
++    print(f"========== prompt {pid} (max_new_tokens={max_tok}) ==========")
++    body = {"text": text, "sampling_params": {"max_new_tokens": max_tok, "temperature": 0}}
++    req = urllib.request.Request(
++        base,
++        data=json.dumps(body).encode(),
++        headers={"Content-Type": "application/json"},
++        method="POST",
++    )
++    with urllib.request.urlopen(req, timeout=600) as r:
++        print(r.read()[:2500].decode(errors="replace"))
++    print()
++
++print("[f2] done — 人工看 text：无 NaN/全感叹号/乱码即通过（base 模型不考核指令遵循）")
++PY
+diff --git a/tools/p27_curl_long_prompt_sweep.sh b/tools/p27_curl_long_prompt_sweep.sh
+new file mode 100755
+index 0000000..4ba1881
+--- /dev/null
++++ b/tools/p27_curl_long_prompt_sweep.sh
+@@ -0,0 +1,58 @@
++#!/usr/bin/env bash
++# 通过 input_ids 灌任意长度 prompt，不依赖 tokenizer，不占客户端 NPU。
++#
++# 用法：
++#   PORT=8001 PROMPT_LEN=32768 MAX_NEW=64 bash tools/p27_curl_long_prompt_sweep.sh
++#   PORT=8001 SWEEP=1 bash tools/p27_curl_long_prompt_sweep.sh   # 1k→32k sweep
++#
++# 32k JSON body ~200KB，用 python 写临时文件 + curl --data-binary @file 避免 ARG_MAX。
++set -euo pipefail
++HOST="${HOST:-127.0.0.1}"
++PORT="${PORT:-8000}"
++MAX_NEW="${MAX_NEW:-1}"
++FILLER_ID="${FILLER_ID:-100}"
++
++_one() {
++  local _len=$1
++  echo "===== prompt_len=${_len} max_new=${MAX_NEW} ====="
++  local _body_file _out _start _code
++  _body_file=$(mktemp)
++  python3 -c "
++import json, sys
++n = int(sys.argv[1]); fid = int(sys.argv[2]); mx = int(sys.argv[3])
++body = {'input_ids': [fid]*n, 'sampling_params': {'max_new_tokens': mx, 'temperature': 0}}
++open(sys.argv[4], 'w').write(json.dumps(body))
++" "${_len}" "${FILLER_ID}" "${MAX_NEW}" "${_body_file}"
++  _out=$(mktemp)
++  _start=$SECONDS
++  _code=$(curl -sS -o "${_out}" -w '%{http_code}' \
++    --max-time 7200 \
++    -X POST "http://${HOST}:${PORT}/generate" \
++    -H 'Content-Type: application/json' \
++    --data-binary @"${_body_file}") || {
++    echo "[sweep][${_len}] curl failed"
++    rm -f "${_out}" "${_body_file}"
++    return 1
++  }
++  echo "[sweep][${_len}] HTTP=${_code} elapsed=$((SECONDS - _start))s"
++  rm -f "${_body_file}"
++  if [[ "${_code}" != "200" ]]; then
++    head -c 2000 "${_out}"
++    rm -f "${_out}"
++    return 2
++  fi
++  head -c 400 "${_out}"
++  echo
++  rm -f "${_out}"
++}
++
++if [[ "${SWEEP:-0}" == "1" ]]; then
++  for L in 1024 2048 4096 8192 16384 32768; do
++    _one "${L}" || {
++      echo "[sweep] STOPPED at len=${L}"
++      exit 1
++    }
++  done
++else
++  _one "${PROMPT_LEN:-32768}"
++fi
+diff --git a/tools/p27_e2e_preflight.sh b/tools/p27_e2e_preflight.sh
+new file mode 100755
+index 0000000..3edf4c2
+--- /dev/null
++++ b/tools/p27_e2e_preflight.sh
+@@ -0,0 +1,69 @@
++#!/usr/bin/env bash
++# P2.7 / 任务 3：整网 e2e 启动前预检（GGUF 层文件 + kt_kernel_ext 路径）。
++#
++# 用法：
++#   bash tools/p27_e2e_preflight.sh
++#   GGUF_DIR=/path/cache GGUF_SUFFIX=_q8_0 bash tools/p27_e2e_preflight.sh
++#
++# 退出码：0=通过，1=有缺失/路径不对。
++
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
++# shellcheck source=tools/p27_ensure_kt_kernel.sh
++source "${SCRIPT_DIR}/p27_ensure_kt_kernel.sh"
++p27_ensure_kt_kernel "$REPO"
++GGUF_DIR="${GGUF_DIR:-/workspace/models/cache}"
++GGUF_PREFIX="${GGUF_PREFIX:-dsv4_layer}"
++# 批量 convert 默认 q8_0 后缀为空 → dsv4_layer3.gguf；若你用手动命名 dsv4_layer3_q8_0.gguf 则设 GGUF_SUFFIX=_q8_0
++GGUF_SUFFIX="${GGUF_SUFFIX:-}"
++LAYER_START="${LAYER_START:-0}"
++LAYER_END="${LAYER_END:-42}"
++MIN_GIB="${MIN_GIB:-6}"  # Q8_0 单层约 6.85 GiB；BF16 请设 MIN_GIB=12
++
++PYBIN="${PYTHON_BIN:-${PYBIN:-/usr/local/python3.11.14/bin/python3.11}}"
++
++echo "[preflight] REPO=$REPO"
++echo "[preflight] GGUF: ${GGUF_DIR}/${GGUF_PREFIX}{L}${GGUF_SUFFIX}.gguf  layers ${LAYER_START}-${LAYER_END}"
++
++missing=0
++for L in $(seq "$LAYER_START" "$LAYER_END"); do
++  f="${GGUF_DIR}/${GGUF_PREFIX}${L}${GGUF_SUFFIX}.gguf"
++  if [[ ! -f "$f" ]]; then
++    echo "[preflight] MISSING $f"
++    missing=$((missing + 1))
++    continue
++  fi
++  sz=$(stat -c%s "$f")
++  min_bytes=$((MIN_GIB * 1024 * 1024 * 1024))
++  if (( sz < min_bytes )); then
++    echo "[preflight] TOO_SMALL $f ($(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B") < ${MIN_GIB}GiB)"
++    missing=$((missing + 1))
++  fi
++done
++if (( missing > 0 )); then
++  echo "[preflight] FAIL: ${missing} layer file(s) missing or too small."
++  echo "[preflight] 批量转换: $PYBIN $REPO/tools/batch_convert_w8a8_layers_mp.py --input ... --output-dir $GGUF_DIR --layer-start $LAYER_START --layer-end $LAYER_END --quant q8_0 --skip-existing"
++  exit 1
++fi
++echo "[preflight] OK: all $((LAYER_END - LAYER_START + 1)) GGUF files present (>= ${MIN_GIB} GiB each)."
++
++echo "[preflight] kt_kernel_ext:"
++"$PYBIN" -c "from kt_kernel import kt_kernel_ext; print('  ', kt_kernel_ext.__file__)"
++so_path=$("$PYBIN" -c "from kt_kernel import kt_kernel_ext; print(kt_kernel_ext.__file__)")
++if [[ "$so_path" == *"${REPO}/kt-kernel/python/"* || "$so_path" == *"${REPO}/kt-kernel/kt_kernel/"* ]]; then
++  echo "[preflight] OK: kt_kernel_ext 在仓库 kt-kernel 包内"
++else
++  echo "[preflight] WARN: .so 不在 ${REPO}/kt-kernel/{python,kt_kernel}/ 下（见手册 §2.4）"
++fi
++build_so="/tmp/kt_kernel_build/kt_kernel_ext.cpython-"*"-linux-gnu.so"
++if compgen -G "$build_so" >/dev/null 2>&1; then
++  bso=$(ls -t $build_so 2>/dev/null | head -1)
++  if [[ -f "$bso" && "$so_path" -ef "$bso" ]]; then
++    echo "[preflight] OK: 已加载 /tmp/kt_kernel_build 同 inode（或已 cp 到 python/）"
++  elif [[ -f "$bso" ]]; then
++    echo "[preflight] HINT: build 目录有更新 .so，请执行:"
++    echo "  cp -f $bso ${REPO}/kt-kernel/python/"
++  fi
++fi
++echo "[preflight] PASS"
+diff --git a/tools/p27_ensure_kt_kernel.sh b/tools/p27_ensure_kt_kernel.sh
+new file mode 100755
+index 0000000..02d891e
+--- /dev/null
++++ b/tools/p27_ensure_kt_kernel.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++# Ensure `import kt_kernel` works without pip editable install (container restart).
++# setup.py maps package name kt_kernel -> python/; symlink + PYTHONPATH parent dir suffices.
++# Still requires: kt-kernel/python/kt_kernel_ext*.so on disk + libhwloc.so.15 at runtime.
++
++p27_ensure_kt_kernel() {
++  local repo="${1:?repo root required}"
++  if [[ ! -e "${repo}/kt-kernel/kt_kernel" ]]; then
++    ln -sfn python "${repo}/kt-kernel/kt_kernel"
++  fi
++  export PYTHONPATH="${repo}/third_party/sglang/python:${repo}/kt-kernel${PYTHONPATH:+:$PYTHONPATH}"
++}
+diff --git a/tools/p27_kt_hf_config_patch.py b/tools/p27_kt_hf_config_patch.py
+new file mode 100755
+index 0000000..64d65a8
+--- /dev/null
++++ b/tools/p27_kt_hf_config_patch.py
+@@ -0,0 +1,13 @@
++"""Runtime patch: upstream kt_ep_wrapper expects ServerArgs.get_hf_config()."""
++
++try:
++    from sglang.srt.server_args import ServerArgs
++
++    if not hasattr(ServerArgs, "get_hf_config"):
++
++        def _get_hf_config(self):
++            return self.get_model_config().hf_config
++
++        ServerArgs.get_hf_config = _get_hf_config  # type: ignore[attr-defined]
++except Exception:
++    pass
+diff --git a/tools/p27_launch_ds4flash_npu_longcontext.sh b/tools/p27_launch_ds4flash_npu_longcontext.sh
+new file mode 100755
+index 0000000..34ec9a5
+--- /dev/null
++++ b/tools/p27_launch_ds4flash_npu_longcontext.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++# 32k 长 prompt prefill + decode profiling 专用 launch。
++#
++# 关键：CHUNKED_PREFILL_SIZE 须 >= 目标 prompt 且为 page_size=128 倍数（默认 32768）。
++# 32k 单 chunk prefill 依赖 ascend_backend.py 的 q.squeeze(0) 守护（T=1 chunk 不压维）。
++#
++# 终端 1 — seq32k decode #32 profiling：
++#   SGLANG_NPU_PROFILE_ENABLE=1 \
++#   SGLANG_NPU_PROFILE_DECODE_TOKEN=32 \
++#   SGLANG_NPU_PROFILE_DIR=./tools/npu_results_dbg/seq32k_decode32 \
++#   CHUNKED_PREFILL_SIZE=32768 \
++#   PORT=8001 ASCEND_RT_VISIBLE_DEVICES=2 \
++#   ./tools/p27_launch_ds4flash_npu_longcontext.sh
++#
++# 终端 2：
++#   PORT=8001 PROMPT_LEN=32768 MAX_NEW=64 bash tools/p27_curl_long_prompt_sweep.sh
++#
++# 注意：MAX_NEW 必须 >= SGLANG_NPU_PROFILE_DECODE_TOKEN，否则 profile 不触发。
++
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
++export USE_PA_PREFILL="${USE_PA_PREFILL:-1}"
++export USE_PA_DECODE="${USE_PA_DECODE:-1}"
++
++echo "[p27-longctx] CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE} (prompt 须 <= 此值且为 128 倍数)"
++echo "[p27-longctx] USE_PA_PREFILL=${USE_PA_PREFILL} USE_PA_DECODE=${USE_PA_DECODE}"
++
++exec "${SCRIPT_DIR}/p27_launch_ds4flash_npu_num_expert_0.sh" "$@"
+diff --git a/tools/p27_launch_ds4flash_npu_num_expert_0.sh b/tools/p27_launch_ds4flash_npu_num_expert_0.sh
+index e7f1fbd..603b7f7 100755
+--- a/tools/p27_launch_ds4flash_npu_num_expert_0.sh
++++ b/tools/p27_launch_ds4flash_npu_num_expert_0.sh
+@@ -27,7 +27,9 @@
+ set -euo pipefail
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+-export PYTHONPATH="${REPO}/third_party/sglang/python:${REPO}/kt-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
++# shellcheck source=tools/p27_ensure_kt_kernel.sh
++source "${SCRIPT_DIR}/p27_ensure_kt_kernel.sh"
++p27_ensure_kt_kernel "$REPO"
+ 
+ # ---------- 选定 Python 解释器 ----------
+ # 现象：本镜像默认 PATH 里 ``python3`` 指 ``/usr/bin/python3``（系统 python，没装
+@@ -71,11 +73,10 @@ fi
+ 
+ MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeek-V4-Flash-W8A8}"
+ # 勿用 KT_GGUF_TEMPLATE="${KT:-...dsv4_layer{layer_idx}.gguf}"：bash 会把 {layer_idx} 的第一个 ``}`` 当成 ``${...:-}`` 的结束符，路径会变成 ``...{layer_idx.gguf}``。
+-# 默认走 BF16：aarch64（K920 / Cortex-A76 无 i8mm）上 tinyBLAS_Q0_ARM Q8_0 内核仍 NaN
+-# （见 Handoff 附录 Z.5），BF16 路径已经被 B+ 5 层抽样验证 cosine ≥ 0.999996。
+-# 老的 Q8_0 模板：'/workspace/models/cache/dsv4_layer{layer_idx}.gguf'（layout 已修，但 ARM 内核还没修，谨慎使用）
++# 默认 Q8_0（批量 convert 输出 dsv4_layer{L}.gguf）。须先 cp 新 kt_kernel_ext.so 到 kt-kernel/python/（手册 §2.4）。
++# BF16 回退：export KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
+ if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
+-  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
++  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
+ fi
+ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
+ QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
+@@ -101,6 +102,18 @@ export USE_FUSED_TRANSPOSE_BATCHMATMUL="${USE_FUSED_TRANSPOSE_BATCHMATMUL:-1}"
+ export USE_ROPE_PARTIAL_IN_PLACE_ASCENDC="${USE_ROPE_PARTIAL_IN_PLACE_ASCENDC:-1}"
+ export ASCEND_USE_FIA="${ASCEND_USE_FIA:-1}"
+ 
++export SGLANG_NPU_PROFILE_ENABLE="${SGLANG_NPU_PROFILE_ENABLE:-0}"
++export SGLANG_NPU_PROFILE_DECODE_TOKEN="${SGLANG_NPU_PROFILE_DECODE_TOKEN:-2}"
++export SGLANG_NPU_PROFILE_DIR="${SGLANG_NPU_PROFILE_DIR:-./npu_results_dbg}"
++export SGLANG_NPU_PROFILE_LEVEL="${SGLANG_NPU_PROFILE_LEVEL:-0}"
++export SGLANG_NPU_PROFILE_ANALYSE="${SGLANG_NPU_PROFILE_ANALYSE:-0}"
++export SGLANG_NPU_PROFILE_DISABLE_GRAPH="${SGLANG_NPU_PROFILE_DISABLE_GRAPH:-1}"
++export SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER="${SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER:-1}"
++if [[ "${SGLANG_NPU_PROFILE_ENABLE}" == "1" && "${EXTRA_FLAGS:-}" != *"--disable-cuda-graph"* ]]; then
++  EXTRA_FLAGS="${EXTRA_FLAGS:+$EXTRA_FLAGS }--disable-cuda-graph"
++  echo "[p27] SGLANG_NPU_PROFILE_ENABLE=1: auto append EXTRA_FLAGS=--disable-cuda-graph"
++fi
++
+ # 可选：若机器上存在 CANN set_env，则加载（失败则忽略）。
+ if [[ -f "${ASCEND_TOOLKIT_HOME}/set_env.sh" ]]; then
+   # shellcheck source=/dev/null
+@@ -123,7 +136,9 @@ fi
+ echo "[p27] REPO=$REPO"
+ echo "[p27] PYTHONPATH head: ${PYTHONPATH%%:*}"
+ echo "[p27] chunked-prefill-size=${CHUNKED_PREFILL_SIZE}（正数须为 page_size 倍数；见脚本头注释）"
++echo "[p27] kt-weight-path template=${KT_GGUF_TEMPLATE}"
+ echo "[p27] quantization=${QUANTIZATION} IS_DEEPSEEK_V4=${IS_DEEPSEEK_V4:-}"
++echo "[p27] SGLANG_NPU_PROFILE_ENABLE=${SGLANG_NPU_PROFILE_ENABLE} DECODE_TOKEN=${SGLANG_NPU_PROFILE_DECODE_TOKEN}"
+ "${PYTHON_BIN}" -c "import sglang; print('[p27] sglang file:', sglang.__file__)"
+ 
+ # EXTRA_FLAGS 用于临时附加任意 sglang.launch_server 参数（不需要改脚本本体），例如：
+@@ -164,3 +179,4 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
+ # cuda-graph 已启用：kt-kernel ACL callback worker + kt_ep_wrapper NPU graph
+ # host callback（见 kt-kernel/cpu_backend/ascend_callback_worker.*）。
+ # 调试同步路径：KT_FORCE_SYNC_SUBMIT=1；回退无 graph：EXTRA_FLAGS="--disable-cuda-graph"
++# 生产勿开 KT_DEBUG_HYBRID_MOE / KT_DEBUG_MOE_OUT。graph 性能用 msprof，勿长期开 SGLANG_NPU_PROFILE_ENABLE。
+diff --git a/tools/p27_msprof_graph_baseline.sh b/tools/p27_msprof_graph_baseline.sh
+new file mode 100755
+index 0000000..f751cee
+--- /dev/null
++++ b/tools/p27_msprof_graph_baseline.sh
+@@ -0,0 +1,355 @@
++#!/usr/bin/env bash
++# R1 msprof 基线采集：graph on、inline profiler off、hybrid N=32 prefix、单并发 F2。
++#
++# 用法（仓库根或任意目录）：
++#   bash tools/p27_msprof_graph_baseline.sh
++#   NPU_DEVICE_ID=2 PORT=8001 bash tools/p27_msprof_graph_baseline.sh
++#
++# 环境覆盖：
++#   NPU_DEVICE_ID          物理 NPU 卡号（默认 2）
++#   PORT                   HTTP 端口（默认 8001，避免与 8000 冲突）
++#   MSPROF_OUTPUT_ROOT     产物根目录（默认 tools/msprof_dbg）
++#   MSPROF_DURATION_SEC    dynamic attach 采集时长秒（默认 240）
++#   MSPROF_MODE            application | dynamic（默认 dynamic）
++#   SKIP_SERVER=1          仅跑 F2 + 解析（server 已在外部运行）
++#   SKIP_PARSE=1           只采集不解析
++#
++# 约束：勿设 SGLANG_NPU_PROFILE_ENABLE=1、勿设 KT_ACTIVATION_FREQ_PATH、勿开 KT_DEBUG_*。
++
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
++cd "$REPO"
++
++NPU_DEVICE_ID="${NPU_DEVICE_ID:-2}"
++PORT="${PORT:-8001}"
++HOST="${HOST:-127.0.0.1}"
++MSPROF_OUTPUT_ROOT="${MSPROF_OUTPUT_ROOT:-${REPO}/tools/msprof_dbg}"
++MSPROF_DURATION_SEC="${MSPROF_DURATION_SEC:-300}"
++MSPROF_MODE="${MSPROF_MODE:-application}"
++SERVER_WAIT_SEC="${SERVER_WAIT_SEC:-4200}"
++MSPROF_ATTACH_ONLY="${MSPROF_ATTACH_ONLY:-0}"
++SERVER_PID="${SERVER_PID:-}"
++PYBIN="${PYTHON_BIN:-/usr/local/python3.11.14/bin/python3.11}"
++MSPROF_BIN="${MSPROF_BIN:-$(command -v msprof)}"
++RUN_TAG="r1_$(date +%Y%m%d_%H%M%S)"
++OUT_DIR="${MSPROF_OUTPUT_ROOT}/${RUN_TAG}"
++SERVER_LOG="${OUT_DIR}/server.log"
++F2_LOG="${OUT_DIR}/f2_throughput.log"
++META_JSON="${OUT_DIR}/run_meta.json"
++
++mkdir -p "$OUT_DIR"
++
++if [[ -f "${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}/set_env.sh" ]]; then
++  # shellcheck source=/dev/null
++  source "${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}/set_env.sh" || true
++fi
++
++# ---------- 强制 R1 形态 ----------
++export P27_SITE_PATCH=1
++export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICE_ID}"
++export PORT
++export SGLANG_NPU_PROFILE_ENABLE=0
++unset KT_ACTIVATION_FREQ_PATH
++unset KT_COLLECT_MOE_ACTIVATION_FREQ
++unset KT_DEBUG_HYBRID_MOE
++unset KT_DEBUG_MOE_OUT
++
++echo "[msprof-r1] REPO=$REPO"
++echo "[msprof-r1] NPU card=${NPU_DEVICE_ID} PORT=${PORT} mode=${MSPROF_MODE}"
++echo "[msprof-r1] output=${OUT_DIR}"
++echo "[msprof-r1] commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
++
++CANN_VER=""
++for vf in /usr/local/Ascend/cann-8.5.0/version.cfg /usr/local/Ascend/ascend-toolkit/latest/version.cfg; do
++  if [[ -f "$vf" ]]; then CANN_VER="$(grep -E '^version=' "$vf" | head -1 | cut -d= -f2- || true)"; break; fi
++done
++echo "[msprof-r1] CANN=${CANN_VER:-unknown} msprof=${MSPROF_BIN}"
++
++wait_for_server() {
++  local logfile="$1" timeout_sec="${2:-900}"
++  local i
++  for ((i = 0; i < timeout_sec; i += 5)); do
++    if grep -q "The server is fired up" "$logfile" 2>/dev/null; then
++      echo "[msprof-r1] server ready (${i}s) — log marker"
++      return 0
++    fi
++    if curl -sf -m 2 "http://${HOST}:${PORT}/v1/models" >/dev/null 2>&1; then
++      echo "[msprof-r1] server ready (${i}s) — HTTP /v1/models"
++      return 0
++    fi
++    if (( i > 0 && i % 120 == 0 )); then
++      local layer
++      layer=$(grep -oE "TP MOE layer [0-9]+" "$logfile" 2>/dev/null | tail -1 || true)
++      echo "[msprof-r1] still loading... ${i}s elapsed ${layer:-"(no layer log yet)"}"
++    fi
++    if grep -qiE "Bus error|SIGBUS|ERR 107027" "$logfile" 2>/dev/null; then
++      echo "[msprof-r1][ERROR] server failed early:" >&2
++      tail -80 "$logfile" >&2 || true
++      return 1
++    fi
++    if grep -q "Traceback (most recent call last)" "$logfile" 2>/dev/null; then
++      if ! grep -q "The server is fired up" "$logfile" 2>/dev/null; then
++        echo "[msprof-r1][ERROR] server traceback before ready:" >&2
++        tail -80 "$logfile" >&2 || true
++        return 1
++      fi
++    fi
++    sleep 5
++  done
++  echo "[msprof-r1][ERROR] timeout waiting for server (${timeout_sec}s)" >&2
++  tail -40 "$logfile" >&2 || true
++  return 1
++}
++
++find_launch_server_pid() {
++  # 取 launch_server 主进程（排除 bash 包装）
++  pgrep -f "sglang.launch_server.*--port ${PORT}" | head -1
++}
++
++run_f2_with_timing() {
++  export HOST PORT PYTHON_BIN="$PYBIN"
++  "$PYBIN" - <<'PY' | tee "$F2_LOG"
++import json
++import os
++import time
++import urllib.request
++
++host = os.environ.get("HOST", "127.0.0.1")
++port = os.environ.get("PORT", "8001")
++base = f"http://{host}:{port}/generate"
++
++prompts = [
++    (1, 64, "Below is a Python function to compute Fibonacci numbers:"),
++    (
++        2,
++        128,
++        "Explain the difference between supervised and unsupervised learning in three short paragraphs.\n\n",
++    ),
++    (3, 80, "请用一句话解释什么是 transformer 模型："),
++    (4, 128, "什么是 transformer 模型："),
++]
++
++results = []
++for pid, max_tok, text in prompts:
++    print(f"========== prompt {pid} (max_new_tokens={max_tok}) ==========")
++    body = {"text": text, "sampling_params": {"max_new_tokens": max_tok, "temperature": 0}}
++    req = urllib.request.Request(
++        base,
++        data=json.dumps(body).encode(),
++        headers={"Content-Type": "application/json"},
++        method="POST",
++    )
++    t0 = time.perf_counter()
++    with urllib.request.urlopen(req, timeout=900) as r:
++        raw = r.read()
++    elapsed = time.perf_counter() - t0
++    meta = json.loads(raw.decode())
++    meta_info = meta.get("meta_info") or {}
++    completion_tokens = meta_info.get("completion_tokens")
++    if completion_tokens is None:
++        # /generate 有时只有 text；用 max_tok 粗估 decode 段
++        completion_tokens = max_tok
++    tok_s = completion_tokens / elapsed if elapsed > 0 else 0.0
++    rec = {
++        "prompt_id": pid,
++        "max_new_tokens": max_tok,
++        "elapsed_s": round(elapsed, 3),
++        "completion_tokens": completion_tokens,
++        "tok_per_s": round(tok_s, 3),
++    }
++    results.append(rec)
++    print(f"[timing] prompt={pid} elapsed={elapsed:.2f}s tokens={completion_tokens} throughput={tok_s:.3f} tok/s")
++    print((meta.get("text") or "")[:800])
++    print()
++
++# 稳态参考：prompt 2 / 4（128 decode）
++steady = [r for r in results if r["prompt_id"] in (2, 4)]
++if steady:
++    avg = sum(r["tok_per_s"] for r in steady) / len(steady)
++    print(f"[steady] avg tok/s (prompt 2+4) = {avg:.3f}")
++print("[f2] done")
++PY
++}
++
++stop_server() {
++  local pid="${1:-}"
++  pkill -f "sglang.launch_server.*--port ${PORT}" 2>/dev/null || true
++  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
++    echo "[msprof-r1] stopping server pid=$pid"
++    kill "$pid" 2>/dev/null || true
++    for _ in $(seq 1 30); do
++      kill -0 "$pid" 2>/dev/null || break
++      sleep 2
++    done
++    kill -9 "$pid" 2>/dev/null || true
++  fi
++  sleep 2
++}
++
++export_prof_results() {
++  # 进程外 msprof 产物需 export 才出 ASCEND_PROFILER_OUTPUT（若尚未存在）
++  if compgen -G "${OUT_DIR}/**/ASCEND_PROFILER_OUTPUT/kernel_details.csv" >/dev/null 2>&1; then
++    echo "[msprof-r1] ASCEND_PROFILER_OUTPUT already present"
++    return 0
++  fi
++  if [[ ! -d "$OUT_DIR" ]]; then return 1; fi
++  echo "[msprof-r1] running msprof --export=on ..."
++  "$MSPROF_BIN" --export=on --output="$OUT_DIR" --type=text --summary-format=csv 2>&1 | tee "${OUT_DIR}/export.log" || true
++}
++
++write_meta() {
++  local server_pid="${1:-}" msprof_ec="${2:-0}"
++  "$PYBIN" - <<PY
++import json, os, subprocess
++from datetime import datetime, timezone
++
++repo = ${REPO@Q}
++out = ${OUT_DIR@Q}
++server_pid_val = """${server_pid}""" or None
++msprof_ec_val = int("""${msprof_ec}""")
++meta = {
++    "run_tag": ${RUN_TAG@Q},
++    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++    "commit": subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip() if os.path.isdir(os.path.join(repo, ".git")) else "unknown",
++    "npu_device_id": ${NPU_DEVICE_ID@Q},
++    "port": ${PORT@Q},
++    "msprof_mode": ${MSPROF_MODE@Q},
++    "msprof_output": out,
++    "server_pid": server_pid_val,
++    "msprof_exit_code": msprof_ec_val,
++    "cann_version": ${CANN_VER@Q},
++    "msprof_bin": ${MSPROF_BIN@Q},
++    "env": {
++        "SGLANG_NPU_PROFILE_ENABLE": "0",
++        "KT_ACTIVATION_FREQ_PATH": "",
++        "graph": "on (default launch)",
++        "kt_num_gpu_experts": 32,
++        "placement": "prefix",
++    },
++}
++with open(${META_JSON@Q}, "w") as f:
++    json.dump(meta, f, indent=2)
++print("[msprof-r1] meta ->", ${META_JSON@Q})
++PY
++}
++
++SERVER_PID=""
++MSPROF_EC=0
++
++if [[ "$MSPROF_MODE" == "application" && "${MSPROF_ATTACH_ONLY}" != "1" && "${SKIP_SERVER:-0}" != "1" ]]; then
++  stop_server
++  echo "[msprof-r1] msprof --application (server+F2 under msprof, ~50min load)"
++  WL="$REPO/tools/p27_msprof_r1_workload.sh"
++  export MSPROF_WORKLOAD_LOG="${OUT_DIR}/server.log"
++  chmod +x "$WL"
++  set +e
++  "$MSPROF_BIN" \
++    --application="$WL" \
++    --output="$OUT_DIR" \
++    --aic-mode=task-based \
++    --aicpu=on \
++    --task-time=on \
++    --runtime-api=on \
++    --hccl=off \
++    2>&1 | tee "${OUT_DIR}/msprof_collect.log"
++  MSPROF_EC=$?
++  set -e
++  if [[ -f "${OUT_DIR}/server.log" ]]; then
++    grep -E "\[timing\]|\[steady\]|prompt [0-9]" "${OUT_DIR}/server.log" >"${F2_LOG}" 2>/dev/null || cp -f "${OUT_DIR}/server.log" "$F2_LOG"
++  fi
++  export_prof_results
++  write_meta "" "$MSPROF_EC"
++  if [[ "${SKIP_PARSE:-0}" != "1" ]]; then
++    echo "[msprof-r1] parsing ..."
++    "$PYBIN" "$REPO/tools/p27_parse_msprof_baseline.py" \
++      --run-dir "$OUT_DIR" --label R1 --f2-log "$F2_LOG" --meta "$META_JSON" \
++      --write-json "${OUT_DIR}/parsed_summary.json" || true
++  fi
++  echo "[msprof-r1] DONE output=${OUT_DIR}"
++  exit "$MSPROF_EC"
++elif [[ "${SKIP_SERVER:-0}" != "1" && "${MSPROF_ATTACH_ONLY}" != "1" ]]; then
++  stop_server
++  : >"$SERVER_LOG"
++
++  echo "[msprof-r1] starting server (graph on, profiler off) ..."
++  bash "$REPO/tools/p27_launch_ds4flash_npu.sh" >"$SERVER_LOG" 2>&1 &
++  SERVER_PID=$!
++  wait_for_server "$SERVER_LOG" "$SERVER_WAIT_SEC"
++
++  LAUNCH_PID="$(find_launch_server_pid || true)"
++elif [[ "${MSPROF_ATTACH_ONLY}" == "1" ]]; then
++  LAUNCH_PID="${SERVER_PID:-$(find_launch_server_pid || true)}"
++  if [[ -z "$LAUNCH_PID" ]]; then
++    echo "[msprof-r1][ERROR] MSPROF_ATTACH_ONLY=1 but no launch_server pid (set SERVER_PID=)" >&2
++    exit 1
++  fi
++  echo "[msprof-r1] attach-only mode, pid=${LAUNCH_PID}"
++else
++  LAUNCH_PID=""
++fi
++
++if [[ -n "${LAUNCH_PID:-}" ]]; then
++  if [[ -z "$LAUNCH_PID" ]]; then
++    echo "[msprof-r1][ERROR] cannot find sglang.launch_server pid" >&2
++    tail -50 "$SERVER_LOG" >&2
++    exit 1
++  fi
++  echo "[msprof-r1] launch_server pid=${LAUNCH_PID} (wrapper pid=${SERVER_PID})"
++  grep -E "Decode npu graph|Prefill npu graph|kt placement" "$SERVER_LOG" | tail -5 || true
++
++  if [[ "$MSPROF_MODE" == "dynamic" ]]; then
++    echo "[msprof-r1] msprof dynamic attach pid=${LAUNCH_PID} (no duration; stop after F2)"
++    set +e
++    "$MSPROF_BIN" \
++      --output="$OUT_DIR" \
++      --dynamic=on \
++      --pid="$LAUNCH_PID" \
++      --aic-mode=task-based \
++      --aicpu=on \
++      --task-time=on \
++      --runtime-api=on \
++      --hccl=off \
++      >"${OUT_DIR}/msprof_collect.log" 2>&1 &
++    MSPROF_WRAPPER_PID=$!
++    set -e
++    sleep 8
++    echo "[msprof-r1] running F2 prompts under msprof window ..."
++    run_f2_with_timing
++    echo "[msprof-r1] stopping msprof pid=${MSPROF_WRAPPER_PID} ..."
++    kill -INT "$MSPROF_WRAPPER_PID" 2>/dev/null || true
++    for _ in $(seq 1 60); do
++      kill -0 "$MSPROF_WRAPPER_PID" 2>/dev/null || break
++      sleep 2
++    done
++    kill -9 "$MSPROF_WRAPPER_PID" 2>/dev/null || true
++    wait "$MSPROF_WRAPPER_PID" 2>/dev/null || true
++    MSPROF_EC=$?
++  else
++    echo "[msprof-r1][ERROR] unsupported MSPROF_MODE=$MSPROF_MODE in attach path" >&2
++    exit 1
++  fi
++
++  export_prof_results
++  if [[ "${MSPROF_ATTACH_ONLY}" != "1" ]]; then
++    stop_server "$SERVER_PID"
++  fi
++else
++  echo "[msprof-r1] SKIP_SERVER=1 — assume server already ran; only parse if data exists"
++  run_f2_with_timing || true
++fi
++
++write_meta "${LAUNCH_PID:-$SERVER_PID}" "$MSPROF_EC"
++
++if [[ "${SKIP_PARSE:-0}" != "1" ]]; then
++  echo "[msprof-r1] parsing ..."
++  "$PYBIN" "$REPO/tools/p27_parse_msprof_baseline.py" \
++    --run-dir "$OUT_DIR" \
++    --label R1 \
++    --f2-log "$F2_LOG" \
++    --meta "$META_JSON" \
++    --write-json "${OUT_DIR}/parsed_summary.json"
++fi
++
++echo "[msprof-r1] DONE output=${OUT_DIR}"
++echo "[msprof-r1] logs: server=${SERVER_LOG} f2=${F2_LOG}"
+diff --git a/tools/p27_msprof_graph_baseline_exec.sh b/tools/p27_msprof_graph_baseline_exec.sh
+new file mode 100755
+index 0000000..8f6de1e
+--- /dev/null
++++ b/tools/p27_msprof_graph_baseline_exec.sh
+@@ -0,0 +1,99 @@
++#!/usr/bin/env bash
++# R1 msprof exec+sidecar 采集（推荐）：msprof exec 拉起服务，sidecar 跑 F2。
++# Runbook: doc/zh/Profiling_R1_msprof_Baseline.md
++# 须在仓库根启动；MSPROF_DELAY 默认 900（跳过加载/编译，勿用 4200）。
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
++cd "$REPO"
++
++NPU_DEVICE_ID="${NPU_DEVICE_ID:-2}"
++PORT="${PORT:-8001}"
++MSPROF_DELAY="${MSPROF_DELAY:-900}"
++MSPROF_BIN="${MSPROF_BIN:-$(command -v msprof)}"
++PYBIN="${PYTHON_BIN:-/usr/local/python3.11.14/bin/python3.11}"
++RUN_TAG="r1_$(date +%Y%m%d_%H%M%S)"
++OUT_DIR="${REPO}/tools/msprof_dbg/${RUN_TAG}"
++EXEC_LOG="${OUT_DIR}/server.log"
++F2_LOG="${OUT_DIR}/f2_throughput.log"
++
++mkdir -p "$OUT_DIR"
++export P27_SITE_PATCH=1
++export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICE_ID}"
++export NPU_DEVICE_ID
++export PORT
++export SGLANG_NPU_PROFILE_ENABLE=0
++export MSPROF_WORKLOAD_LOG="$EXEC_LOG"
++unset KT_ACTIVATION_FREQ_PATH
++
++if [[ -f /usr/local/Ascend/ascend-toolkit/latest/set_env.sh ]]; then
++  source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh || true
++fi
++
++pkill -f "sglang.launch_server.*--port ${PORT}" 2>/dev/null || true
++sleep 3
++
++chmod +x "$REPO/tools/p27_msprof_launch_exec.sh" "$REPO/tools/p27_msprof_sidecar_f2.sh"
++
++echo "[msprof-exec] OUT=$OUT_DIR card=$NPU_DEVICE_ID delay=${MSPROF_DELAY}s"
++"$MSPROF_BIN" \
++  --application="$REPO/tools/p27_msprof_launch_exec.sh" \
++  --output="$OUT_DIR" \
++  --delay="${MSPROF_DELAY}" \
++  --aic-mode=task-based \
++  --task-time=on \
++  --runtime-api=on \
++  --aicpu=on \
++  --ascendcl=on \
++  --hccl=off \
++  >"${OUT_DIR}/msprof_collect.log" 2>&1 &
++MPID=$!
++MSPROF_START=$(date +%s)
++export MSPROF_START MSPROF_DELAY
++
++bash "$REPO/tools/p27_msprof_sidecar_f2.sh" "$EXEC_LOG" "$F2_LOG" || {
++  kill "$MPID" 2>/dev/null || true
++  exit 1
++}
++
++# F2 完成后给 msprof 刷盘，再优雅停服（避免 exit 137 导致 device_2/data 空）
++sleep 60
++LAUNCH_PID="$(pgrep -f "sglang.launch_server.*--port ${PORT}" | head -1 || true)"
++if [[ -n "$LAUNCH_PID" ]]; then
++  echo "[msprof-exec] SIGTERM launch_server pid=$LAUNCH_PID"
++  kill -TERM "$LAUNCH_PID" 2>/dev/null || true
++  for _ in $(seq 1 90); do
++    kill -0 "$LAUNCH_PID" 2>/dev/null || break
++    sleep 2
++  done
++  if kill -0 "$LAUNCH_PID" 2>/dev/null; then
++    echo "[msprof-exec] WARN: launch_server still alive after 180s, sending SIGKILL"
++    kill -KILL "$LAUNCH_PID" 2>/dev/null || true
++  fi
++else
++  echo "[msprof-exec] WARN: launch_server pid not found (pgrep miss?)"
++fi
++echo "[msprof-exec] post-stop flush sleep 60s ..."
++sleep 60
++wait "$MPID" 2>/dev/null || true
++
++has_kernel_csv() {
++  find "$OUT_DIR" -name 'kernel_details.csv' -print -quit | grep -q .
++}
++
++# msprof --application 通常已自动 export；无 kernel_details 时对每个 PROF_* 补 export
++if ! has_kernel_csv; then
++  : >"${OUT_DIR}/export.log"
++  for prof in "$OUT_DIR"/PROF_*; do
++    [[ -d "$prof" ]] || continue
++    echo "[msprof-exec] export PROF $(basename "$prof")" | tee -a "${OUT_DIR}/export.log"
++    "$MSPROF_BIN" --export=on --output="$prof" --type=text --summary-format=csv \
++      2>&1 | tee -a "${OUT_DIR}/export.log" || true
++  done
++fi
++
++"$PYBIN" "$REPO/tools/p27_parse_msprof_baseline.py" \
++  --run-dir "$OUT_DIR" --label R1 --f2-log "$F2_LOG" \
++  --write-json "${OUT_DIR}/parsed_summary.json" || true
++
++echo "[msprof-exec] DONE $OUT_DIR"
+diff --git a/tools/p27_msprof_launch_exec.sh b/tools/p27_msprof_launch_exec.sh
+new file mode 100755
+index 0000000..b35d37c
+--- /dev/null
++++ b/tools/p27_msprof_launch_exec.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++# msprof --application 入口：exec launch_server（进程树在 msprof 下，勿 background）。
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
++export P27_SITE_PATCH=1
++export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICE_ID:-2}"
++export PORT="${PORT:-8001}"
++export NPU_DEVICE_ID="${NPU_DEVICE_ID:-2}"
++export SGLANG_NPU_PROFILE_ENABLE=0
++unset KT_ACTIVATION_FREQ_PATH
++LOG="${MSPROF_WORKLOAD_LOG:-${REPO}/tools/msprof_dbg/msprof_exec.log}"
++if [[ "$LOG" != /* ]]; then
++  LOG="$REPO/$LOG"
++fi
++mkdir -p "$(dirname "$LOG")"
++# 勿用 | tee：pipe 会使 msprof 跟踪 bash+tee 子进程，停服易 exit 137
++bash "$REPO/tools/p27_launch_ds4flash_npu.sh" >>"$LOG" 2>&1
+diff --git a/tools/p27_msprof_r1_workload.sh b/tools/p27_msprof_r1_workload.sh
+new file mode 100755
+index 0000000..2594b54
+--- /dev/null
++++ b/tools/p27_msprof_r1_workload.sh
+@@ -0,0 +1,78 @@
++#!/usr/bin/env bash
++# 由 msprof --application 直接拉起，采集 graph on R1 decode + F2。
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
++export P27_SITE_PATCH=1
++export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICE_ID:-2}"
++export PORT="${PORT:-8001}"
++export HOST="${HOST:-127.0.0.1}"
++export SGLANG_NPU_PROFILE_ENABLE=0
++unset KT_ACTIVATION_FREQ_PATH
++
++LOG="${MSPROF_WORKLOAD_LOG:-${REPO}/tools/msprof_dbg/msprof_workload.log}"
++mkdir -p "$(dirname "$LOG")"
++: >"$LOG"
++
++bash "$REPO/tools/p27_launch_ds4flash_npu.sh" >>"$LOG" 2>&1 &
++SRV=$!
++
++cleanup() {
++  kill "$SRV" 2>/dev/null || true
++  pkill -f "sglang.launch_server.*--port ${PORT}" 2>/dev/null || true
++}
++trap cleanup EXIT
++
++for i in $(seq 1 840); do
++  if grep -q "The server is fired up" "$LOG" 2>/dev/null; then break; fi
++  if grep -qiE "NPU out of memory|Traceback|Bus error|SIGBUS|ERR 107027" "$LOG" 2>/dev/null; then
++    if ! grep -q "The server is fired up" "$LOG" 2>/dev/null; then
++      tail -60 "$LOG" >&2
++      exit 1
++    fi
++  fi
++  if (( i % 24 == 0 )); then
++    layer=$(grep -oE "TP MOE layer [0-9]+" "$LOG" 2>/dev/null | tail -1 || true)
++    echo "[workload] loading... $((i * 5))s ${layer:-}" >>"$LOG"
++  fi
++  sleep 5
++done
++grep -q "The server is fired up" "$LOG" || { echo "server timeout" >&2; exit 1; }
++
++sleep 5
++PYBIN="${PYTHON_BIN:-/usr/local/python3.11.14/bin/python3.11}"
++export HOST PORT PYTHON_BIN="$PYBIN"
++"$PYBIN" - <<'PY' | tee -a "$LOG"
++import json, os, time, urllib.request
++
++host = os.environ.get("HOST", "127.0.0.1")
++port = os.environ.get("PORT", "8001")
++base = f"http://{host}:{port}/generate"
++prompts = [
++    (1, 64, "Below is a Python function to compute Fibonacci numbers:"),
++    (2, 128, "Explain the difference between supervised and unsupervised learning in three short paragraphs.\n\n"),
++    (3, 80, "请用一句话解释什么是 transformer 模型："),
++    (4, 128, "什么是 transformer 模型："),
++]
++results = []
++for pid, mt, text in prompts:
++    print(f"========== prompt {pid} (max_new_tokens={mt}) ==========")
++    body = {"text": text, "sampling_params": {"max_new_tokens": mt, "temperature": 0}}
++    req = urllib.request.Request(
++        base, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST"
++    )
++    t0 = time.perf_counter()
++    with urllib.request.urlopen(req, timeout=900) as r:
++        raw = r.read()
++    el = time.perf_counter() - t0
++    meta = json.loads(raw.decode())
++    ct = (meta.get("meta_info") or {}).get("completion_tokens") or mt
++    tp = ct / el if el > 0 else 0
++    results.append((pid, tp))
++    print(f"[timing] prompt={pid} elapsed={el:.2f}s tokens={ct} throughput={tp:.3f} tok/s")
++steady = [t for p, t in results if p in (2, 4)]
++if steady:
++    print(f"[steady] avg tok/s (prompt 2+4) = {sum(steady)/len(steady):.3f}")
++print("[f2] done")
++PY
++sleep 3
+diff --git a/tools/p27_msprof_sidecar_f2.sh b/tools/p27_msprof_sidecar_f2.sh
+new file mode 100755
+index 0000000..6a70f22
+--- /dev/null
++++ b/tools/p27_msprof_sidecar_f2.sh
+@@ -0,0 +1,95 @@
++#!/usr/bin/env bash
++# Sidecar：等 msprof+exec 服务 ready 后跑 F2（与 p27_msprof_launch_exec.sh 配合）。
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
++HOST="${HOST:-127.0.0.1}"
++PORT="${PORT:-8001}"
++PYBIN="${PYTHON_BIN:-/usr/local/python3.11.14/bin/python3.11}"
++
++_abs_path() {
++  local p="$1"
++  if [[ "$p" = /* ]]; then
++    echo "$p"
++    return
++  fi
++  local cand dir base
++  for cand in "$PWD/$p" "$REPO/$p" "$SCRIPT_DIR/$p"; do
++    if [[ -e "$cand" ]]; then
++      dir="$(cd "$(dirname "$cand")" && pwd)"
++      base="$(basename "$cand")"
++      echo "${dir}/${base}"
++      return
++    fi
++  done
++  echo "$REPO/$p"
++}
++
++LOG="$(_abs_path "${1:-tools/msprof_dbg/msprof_exec.log}")"
++OUT_F2="$(_abs_path "${2:-tools/msprof_dbg/f2_sidecar.log}")"
++mkdir -p "$(dirname "$OUT_F2")"
++
++echo "[sidecar] waiting server log=$LOG (resolved)"
++for i in $(seq 1 840); do
++  if grep -q "The server is fired up" "$LOG" 2>/dev/null; then
++    echo "[sidecar] ready at ${i}x5s"
++    break
++  fi
++  if grep -qiE "Segmentation fault|NPU out of memory|Traceback" "$LOG" 2>/dev/null; then
++    if ! grep -q "The server is fired up" "$LOG" 2>/dev/null; then
++      echo "[sidecar] server failed" >&2
++      tail -40 "$LOG" >&2
++      exit 1
++    fi
++  fi
++  sleep 5
++done
++grep -q "The server is fired up" "$LOG" || { echo "[sidecar] timeout" >&2; exit 1; }
++
++# msprof --delay 从 msprof 启动起算；ready 后须等采数窗口打开再跑 F2
++MSPROF_DELAY="${MSPROF_DELAY:-900}"
++MSPROF_START="${MSPROF_START:-0}"
++if [[ "$MSPROF_START" -gt 0 ]]; then
++  now=$(date +%s)
++  wait_left=$(( MSPROF_START + MSPROF_DELAY - now ))
++  if (( wait_left > 0 )); then
++    echo "[sidecar] msprof delay: wait ${wait_left}s before F2 (profiling opens at +${MSPROF_DELAY}s)"
++    sleep "$wait_left"
++  else
++    echo "[sidecar] msprof delay already passed (${wait_left}s), run F2 now"
++  fi
++fi
++
++sleep 5
++export HOST PORT
++"$PYBIN" - <<'PY' | tee "$OUT_F2"
++import json, os, time, urllib.request
++host = os.environ.get("HOST", "127.0.0.1")
++port = os.environ.get("PORT", "8001")
++base = f"http://{host}:{port}/generate"
++prompts = [
++    (1, 64, "Below is a Python function to compute Fibonacci numbers:"),
++    (2, 128, "Explain the difference between supervised and unsupervised learning in three short paragraphs.\n\n"),
++    (3, 80, "请用一句话解释什么是 transformer 模型："),
++    (4, 128, "什么是 transformer 模型："),
++]
++results = []
++for pid, mt, text in prompts:
++    print(f"========== prompt {pid} (max_new_tokens={mt}) ==========")
++    body = {"text": text, "sampling_params": {"max_new_tokens": mt, "temperature": 0}}
++    req = urllib.request.Request(base, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
++    t0 = time.perf_counter()
++    with urllib.request.urlopen(req, timeout=900) as r:
++        raw = r.read()
++    el = time.perf_counter() - t0
++    meta = json.loads(raw.decode())
++    ct = (meta.get("meta_info") or {}).get("completion_tokens") or mt
++    tp = ct / el if el > 0 else 0
++    results.append((pid, tp))
++    print(f"[timing] prompt={pid} elapsed={el:.2f}s tokens={ct} throughput={tp:.3f} tok/s")
++steady = [t for p, t in results if p in (2, 4)]
++if steady:
++    print(f"[steady] avg tok/s (prompt 2+4) = {sum(steady)/len(steady):.3f}")
++print("[f2] done")
++PY
++echo "[sidecar] F2 complete -> $OUT_F2"

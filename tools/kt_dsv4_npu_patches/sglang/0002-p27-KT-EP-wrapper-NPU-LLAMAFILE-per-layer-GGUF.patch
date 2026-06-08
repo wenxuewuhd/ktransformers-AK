@@ -1,0 +1,87 @@
+From c99920aeedec5ba39b43978557524b3be01ca10c Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 18 May 2026 12:06:02 +0000
+Subject: [PATCH 2/5] =?UTF-8?q?p27:=20KT=20EP=20wrapper=20=E5=8D=95?=
+ =?UTF-8?q?=E5=8D=A1=20NPU=20=E5=AD=90=E9=9B=86=20(LLAMAFILE=20+=20per-lay?=
+ =?UTF-8?q?er=20GGUF)=20-=20resolve=5Fkt=5Fweight=5Fpath=5Ffor=5Flayer:=20?=
+ =?UTF-8?q?=E6=94=AF=E6=8C=81=20{layer=5Fidx}=20=E5=8D=A0=E4=BD=8D?=
+ =?UTF-8?q?=E7=AC=A6=20-=20KTMoEWrapper=20submit/sync/merge=20=E4=B8=8E=20?=
+ =?UTF-8?q?NPU=20MoE=20=E5=B9=B6=E8=A1=8C=20-=20gpu=5Fexperts=5Fmask:=20?=
+ =?UTF-8?q?=E5=89=8D=20N=20=E4=B8=AA=20expert=20=E8=B5=B0=20NPU=EF=BC=8C?=
+ =?UTF-8?q?=E5=85=B6=E4=BD=99=20CPU=20GGUF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 51 +++++++++++--------
+ 1 file changed, 30 insertions(+), 21 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 4dcb01dac..6a200bf4a 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -417,31 +417,40 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         if self.tp_rank == 0:
+             self.submit(layer, dispatch_output)
+ 
+-        # Step 2: Prepare GPU computation by masking out CPU expert rows.
+-        # CPU rows (id >= num_gpu_experts) are remapped to (expert 0, weight 0)
+-        # — see ``mask_cpu_expert_routing`` docstring for why we do not use
+-        # ``-1`` here (would crash NPU ``npu_moe_init_routing/compute_expert_tokens``).
+-        topk_ids = topk_output.topk_ids
+-        topk_weights = topk_output.topk_weights
+-        masked_topk_ids, masked_topk_weights = mask_cpu_expert_routing(
+-            topk_ids, topk_weights, self.num_gpu_experts
+-        )
++        # Step 2 & 3: GPU expert computation — only if we actually have GPU experts.
++        #
++        # In all-CPU mode (``--kt-num-gpu-experts 0``) the underlying quant
++        # method created ``layer.w13_weight`` / ``layer.w2_weight`` with shape
++        # ``[0, ...]`` (no GPU expert weights loaded → no HBM cost). Calling
++        # ``self.gpu_method.apply`` would then invoke ``npu_grouped_matmul``
++        # with an empty weight tensor and CANN raises
++        # ``RuntimeError: Invalid inputs: neither x nor weight could be empty``.
++        # This guard is symmetric to the early-return ``torch.zeros_like(x)``
++        # in ``submit/sync`` when ``tp_rank != 0`` / ``wrapper is None``.
++        if self.num_gpu_experts > 0:
++            # CPU rows (id >= num_gpu_experts) are remapped to (expert 0, weight 0)
++            # — see ``mask_cpu_expert_routing`` docstring for why we do not use
++            # ``-1`` here (would crash NPU ``npu_moe_init_routing/compute_expert_tokens``).
++            topk_ids = topk_output.topk_ids
++            topk_weights = topk_output.topk_weights
++            masked_topk_ids, masked_topk_weights = mask_cpu_expert_routing(
++                topk_ids, topk_weights, self.num_gpu_experts
++            )
+ 
+-        # Create modified dispatch output for GPU computation
+-        masked_topk_output = topk_output._replace(
+-            topk_ids=masked_topk_ids,
+-            topk_weights=masked_topk_weights,
+-        )
+-        masked_dispatch_output = dispatch_output._replace(
+-            topk_output=masked_topk_output
+-        )
++            masked_topk_output = topk_output._replace(
++                topk_ids=masked_topk_ids,
++                topk_weights=masked_topk_weights,
++            )
++            masked_dispatch_output = dispatch_output._replace(
++                topk_output=masked_topk_output
++            )
+ 
+-        # Step 3: Execute GPU expert computation (any quantization method)
+-        # This runs in parallel with CPU computation
+-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
++            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
++            output = gpu_combine_input.hidden_states
++        else:
++            output = torch.zeros_like(x)
+ 
+         # Step 4: Synchronize CPU results and merge with GPU results
+-        output = gpu_combine_input.hidden_states
+         if self.tp_rank == 0:
+             cpu_output = self.sync(x)
+             output = output + cpu_output
+-- 
+2.34.1

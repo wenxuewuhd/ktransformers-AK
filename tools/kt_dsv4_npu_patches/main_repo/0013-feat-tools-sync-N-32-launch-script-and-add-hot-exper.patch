@@ -1,0 +1,184 @@
+From 334067098530065acf2cd6ba05bc5b1cf14ef02f Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Sat, 30 May 2026 07:25:30 +0000
+Subject: [PATCH 13/13] feat(tools): sync N=32 launch script and add hot expert
+ mask builder Align p27_launch_ds4flash_npu.sh with ensure_kt_kernel, Q8
+ default, and NPU profile env. Bump sglang for prefix/frequency hybrid MoE
+ placement.
+
+
+diff --git a/third_party/sglang b/third_party/sglang
+index 38bda36..68a0bce 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit 38bda36e8e4420e27ab3087829e8a836ff446200
++Subproject commit 68a0bce65fec9e66be6babbe342ae0c8f2224407
+diff --git a/tools/p27_build_hot_expert_mask.py b/tools/p27_build_hot_expert_mask.py
+new file mode 100755
+index 0000000..e295b8e
+--- /dev/null
++++ b/tools/p27_build_hot_expert_mask.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""Build activation_freq .pt for --kt-expert-placement-strategy frequency.
++
++Input: JSON lines with topk expert ids per layer (from msprof / request logs),
++       or a zero tensor for prefix-equivalent smoke tests.
++
++Output: torch.save({"activation_freq": Tensor[num_layers, num_experts]})
++
++Example:
++  python3 tools/p27_build_hot_expert_mask.py \\
++    --num-layers 43 --num-experts 256 \\
++    --out /tmp/activation_freq.pt \\
++    --prefix 32
++
++  python3 tools/p27_build_hot_expert_mask.py \\
++    --num-layers 43 --num-experts 256 \\
++    --out /tmp/activation_freq.pt \\
++    --counts-json tools/npu_results_dbg/topk_counts.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++from typing import Dict, List
++
++import torch
++
++
++def _parse_counts_json(path: Path, num_layers: int, num_experts: int) -> torch.Tensor:
++    raw = json.loads(path.read_text())
++    freq = torch.zeros(num_layers, num_experts, dtype=torch.float32)
++    if isinstance(raw, dict) and "layers" in raw:
++        layers = raw["layers"]
++    elif isinstance(raw, list):
++        layers = raw
++    else:
++        raise ValueError(f"Unsupported counts JSON layout in {path}")
++
++    for layer_idx, layer_counts in enumerate(layers):
++        if layer_idx >= num_layers:
++            break
++        if isinstance(layer_counts, dict):
++            for expert_id, count in layer_counts.items():
++                eid = int(expert_id)
++                if 0 <= eid < num_experts:
++                    freq[layer_idx, eid] = float(count)
++        elif isinstance(layer_counts, list):
++            for expert_id, count in enumerate(layer_counts):
++                if expert_id < num_experts:
++                    freq[layer_idx, expert_id] = float(count)
++    return freq
++
++
++def main() -> None:
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument("--num-layers", type=int, default=43)
++    p.add_argument("--num-experts", type=int, default=256)
++    p.add_argument("--out", type=Path, required=True)
++    p.add_argument(
++        "--prefix",
++        type=int,
++        default=None,
++        help="Synthetic freq: boost experts 0..prefix-1 on every MoE layer (smoke test).",
++    )
++    p.add_argument(
++        "--counts-json",
++        type=Path,
++        default=None,
++        help="JSON with per-layer expert hit counts.",
++    )
++    args = p.parse_args()
++
++    if args.counts_json is not None:
++        freq = _parse_counts_json(args.counts_json, args.num_layers, args.num_experts)
++    elif args.prefix is not None:
++        freq = torch.zeros(args.num_layers, args.num_experts, dtype=torch.float32)
++        k = min(max(args.prefix, 0), args.num_experts)
++        if k > 0:
++            freq[:, :k] = 1.0
++    else:
++        raise SystemExit("Provide --counts-json or --prefix")
++
++    args.out.parent.mkdir(parents=True, exist_ok=True)
++    torch.save({"activation_freq": freq}, args.out)
++    print(f"Wrote {args.out} shape={tuple(freq.shape)} sum={float(freq.sum()):.1f}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/p27_launch_ds4flash_npu.sh b/tools/p27_launch_ds4flash_npu.sh
+index 32b3174..69a9be2 100755
+--- a/tools/p27_launch_ds4flash_npu.sh
++++ b/tools/p27_launch_ds4flash_npu.sh
+@@ -27,6 +27,9 @@
+ set -euo pipefail
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
++# shellcheck source=tools/p27_ensure_kt_kernel.sh
++source "${SCRIPT_DIR}/p27_ensure_kt_kernel.sh"
++p27_ensure_kt_kernel "$REPO"
+ export PYTHONPATH="${REPO}/third_party/sglang/python:${REPO}/kt-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
+ 
+ # ---------- 选定 Python 解释器 ----------
+@@ -71,11 +74,10 @@ fi
+ 
+ MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeek-V4-Flash-W8A8}"
+ # 勿用 KT_GGUF_TEMPLATE="${KT:-...dsv4_layer{layer_idx}.gguf}"：bash 会把 {layer_idx} 的第一个 ``}`` 当成 ``${...:-}`` 的结束符，路径会变成 ``...{layer_idx.gguf}``。
+-# 默认走 BF16：aarch64（K920 / Cortex-A76 无 i8mm）上 tinyBLAS_Q0_ARM Q8_0 内核仍 NaN
+-# （见 Handoff 附录 Z.5），BF16 路径已经被 B+ 5 层抽样验证 cosine ≥ 0.999996。
+-# 老的 Q8_0 模板：'/workspace/models/cache/dsv4_layer{layer_idx}.gguf'（layout 已修，但 ARM 内核还没修，谨慎使用）
++# 默认 Q8_0（批量 convert 输出 dsv4_layer{L}.gguf）。须先 cp 新 kt_kernel_ext.so 到 kt-kernel/python/（手册 §2.4）。
++# BF16 回退：export KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
+ if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
+-  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
++  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
+ fi
+ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
+ QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
+@@ -101,6 +103,18 @@ export USE_FUSED_TRANSPOSE_BATCHMATMUL="${USE_FUSED_TRANSPOSE_BATCHMATMUL:-1}"
+ export USE_ROPE_PARTIAL_IN_PLACE_ASCENDC="${USE_ROPE_PARTIAL_IN_PLACE_ASCENDC:-1}"
+ export ASCEND_USE_FIA="${ASCEND_USE_FIA:-1}"
+ 
++export SGLANG_NPU_PROFILE_ENABLE="${SGLANG_NPU_PROFILE_ENABLE:-0}"
++export SGLANG_NPU_PROFILE_DECODE_TOKEN="${SGLANG_NPU_PROFILE_DECODE_TOKEN:-2}"
++export SGLANG_NPU_PROFILE_DIR="${SGLANG_NPU_PROFILE_DIR:-./npu_results_dbg}"
++export SGLANG_NPU_PROFILE_LEVEL="${SGLANG_NPU_PROFILE_LEVEL:-0}"
++export SGLANG_NPU_PROFILE_ANALYSE="${SGLANG_NPU_PROFILE_ANALYSE:-0}"
++export SGLANG_NPU_PROFILE_DISABLE_GRAPH="${SGLANG_NPU_PROFILE_DISABLE_GRAPH:-1}"
++export SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER="${SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER:-1}"
++if [[ "${SGLANG_NPU_PROFILE_ENABLE}" == "1" && "${EXTRA_FLAGS:-}" != *"--disable-cuda-graph"* ]]; then
++  EXTRA_FLAGS="${EXTRA_FLAGS:+$EXTRA_FLAGS }--disable-cuda-graph"
++  echo "[p27] SGLANG_NPU_PROFILE_ENABLE=1: auto append EXTRA_FLAGS=--disable-cuda-graph"
++fi
++
+ # 可选：若机器上存在 CANN set_env，则加载（失败则忽略）。
+ if [[ -f "${ASCEND_TOOLKIT_HOME}/set_env.sh" ]]; then
+   # shellcheck source=/dev/null
+@@ -123,7 +137,9 @@ fi
+ echo "[p27] REPO=$REPO"
+ echo "[p27] PYTHONPATH head: ${PYTHONPATH%%:*}"
+ echo "[p27] chunked-prefill-size=${CHUNKED_PREFILL_SIZE}（正数须为 page_size 倍数；见脚本头注释）"
++echo "[p27] kt-weight-path template=${KT_GGUF_TEMPLATE}"
+ echo "[p27] quantization=${QUANTIZATION} IS_DEEPSEEK_V4=${IS_DEEPSEEK_V4:-}"
++echo "[p27] SGLANG_NPU_PROFILE_ENABLE=${SGLANG_NPU_PROFILE_ENABLE} DECODE_TOKEN=${SGLANG_NPU_PROFILE_DECODE_TOKEN}"
+ "${PYTHON_BIN}" -c "import sglang; print('[p27] sglang file:', sglang.__file__)"
+ 
+ # EXTRA_FLAGS 用于临时附加任意 sglang.launch_server 参数（不需要改脚本本体），例如：
+@@ -162,4 +178,8 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
+   --port "$PORT" \
+   ${EXTRA_FLAGS}
+ # cuda-graph 已启用：kt-kernel ACL callback worker + kt_ep_wrapper NPU graph
+-# host callback。调试：KT_FORCE_SYNC_SUBMIT=1；回退：EXTRA_FLAGS="--disable-cuda-graph"
++# host callback（见 kt-kernel/cpu_backend/ascend_callback_worker.*）。
++# frequency placement 示例：
++#   EXTRA_FLAGS="--kt-expert-placement-strategy frequency --kt-activation-freq-path /path/to/activation_freq.pt"
++# 调试同步路径：KT_FORCE_SYNC_SUBMIT=1；回退无 graph：EXTRA_FLAGS="--disable-cuda-graph"
++# 生产勿开 KT_DEBUG_HYBRID_MOE / KT_DEBUG_MOE_OUT。graph 性能用 msprof，勿长期开 SGLANG_NPU_PROFILE_ENABLE。
+-- 
+2.34.1
+

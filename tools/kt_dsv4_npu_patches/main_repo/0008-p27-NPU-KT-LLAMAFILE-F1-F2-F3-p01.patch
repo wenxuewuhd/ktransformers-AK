@@ -1,0 +1,1427 @@
+From eb1c3c775dbf6814bfe7cf8d6abad58ce964e4cc Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 18 May 2026 12:06:59 +0000
+Subject: [PATCH 08/13] =?UTF-8?q?p27:=20=E5=8D=95=E5=8D=A1=20NPU=20+=20KT(?=
+ =?UTF-8?q?LLAMAFILE)=20=E7=AB=AF=E5=88=B0=E7=AB=AF=E6=89=93=E9=80=9A=20(F?=
+ =?UTF-8?q?1+F2+F3)=20=E5=90=AB=20third=5Fparty/sglang=20=E5=AD=90?=
+ =?UTF-8?q?=E6=A8=A1=E5=9D=97=E6=8C=87=E9=92=88=E6=9B=B4=E6=96=B0=20(kt=5F?=
+ =?UTF-8?q?ep=5Fwrapper=20=E5=8D=95=E5=8D=A1=20NPU=20=E5=AD=90=E9=9B=86)?=
+ =?UTF-8?q?=E3=80=82=20F1=20BF16=20GGUF=2043=20=E5=B1=82;=20F2=20N=3D0=20/?=
+ =?UTF-8?q?=20F3=20N=3D32=20=E9=AA=8C=E8=AF=81=E9=80=9A=E8=BF=87;=20chunke?=
+ =?UTF-8?q?d=5Fprefill=5Fsize=20=E8=B6=8A=E7=95=8C=E4=BF=AE=E5=A4=8D?=
+ =?UTF-8?q?=E7=AD=89=E3=80=82=20=E8=AF=A6=E8=A7=81=20doc/zh/DeepSeek-V4-Fl?=
+ =?UTF-8?q?ash=5FAscend=5FNPU=5FSingle=5FCard=5FHandoff.md=20=E9=99=84?=
+ =?UTF-8?q?=E5=BD=95=20Z.7-Z.13.?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+
+diff --git a/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md b/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
+index d6913ef..929a21f 100644
+--- a/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
++++ b/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
+@@ -950,7 +950,40 @@ safe_weights = zeros_like(...)  # 所有 weight 改写为 0.0
+ ```
+ → NPU MoE 那一路对每个 token 贡献 0；**真正的 expert 计算全部走 `KTMoEWrapper.submit_forward`（CPU）**。这正是验证「CPU expert 路径本身对不对」的最干净对照。
+ 
+-#### 6.11.4 推荐实验顺序（按时间成本递增）
++#### 6.11.4 实验设计的"两路 ⇄ 三路"诊断空间
++
++服务实际涉及**三**个独立计算路径，任何一个错都能把 token 打到 padding。简单的 A/B 对照只能**单独排除 NPU MoE**，**不能区分** "CPU MoE 错" 与 "shared 路径（attention/RoPE/MLA/Compressor/embedding/lm_head）错"。
++
++```
++                       ┌──────────────────────────────────┐
++                       │  shared:                         │
++hidden_in ──►  embed ──►  attn (MLA + Compressor + RoPE) │──► residual ──┐
++                       │  norms / linears / lm_head       │              │
++                       └──────────────────────────────────┘              │
++                                          ▲                              │
++                                          │ + MoE output                 │
++                                          │                              ▼
++                                ┌─────────┴─────────┐                next layer
++                                │       MoE         │
++                                │ (per-token route) │
++                                └─────────┬─────────┘
++                                          │ topk_ids
++                  ┌───────────────────────┼───────────────────────┐
++                  ▼                                               ▼
++        NPU MoE (16 GPU experts,                        CPU MoE (240 CPU experts,
++        baseline `npu_fused_experts`,                   KTMoEWrapper + LLAMAFILE,
++        W8A8 safetensors)                               GGUF Q8_0)
++```
++
++| 路径 | 实验 B (`--kt-num-gpu-experts 0`) 是否参与 | 隔离实验 |
++|---|---|---|
++| **shared (attn/RoPE/MLA/Compressor/embed/lm_head)** | ✅ 全程参与 | 实验 D 中间张量 dump |
++| **NPU MoE** | ❌ 全部 token 被 mask 成 (id=0, weight=0) | 实验 B（CPU 路无问题前提下）|
++| **CPU MoE (KT GGUF Q8_0)** | ✅ 承担**全部**专家计算 | **实验 B+**（新增；下面） |
++
++> 所以 §6.11.3 那条「B 仍乱 → 排除 MoE」是错的：B 仍乱时 **CPU MoE 与 shared 路径都还有嫌疑**，必须再加 B+ 才能区分。
++
++#### 6.11.5 推荐实验顺序（按时间成本递增）
+ 
+ ```bash
+ # 实验 A：关 npu graph 走 eager，排除图捕获 / dynamo 重编译干扰
+@@ -964,35 +997,72 @@ bash $REPO/tools/p27_curl_generate.sh
+ EXTRA_FLAGS="--kt-num-gpu-experts 0" \
+   ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/p27_all_cpu.log
+ bash $REPO/tools/p27_curl_generate.sh
+-# - 仍乱 → MoE 不是元凶，问题在 attention / MLA / RoPE / Compressor / W8A8 装载
+-# - 变正常 → 锁定 NPU MoE 这一路（mask_cpu_expert_routing / GPU expert weight scale / stream 时序）
+-
+-# 实验 C：A + B 同时（最干净的对照）
++# - 变正常 → NPU MoE 那一路有 bug（GPU expert W8A8 scale / mask_cpu_expert_routing / stream 时序）
++# - 仍乱 → 还需要 B+ 区分「CPU MoE 错」和「shared 路径错」
++
++# 实验 B+：CPU MoE 单层离线数值对账（与 server 启动无关，~分钟级）
++#   见 §6.11.7：扩展 phase12_llamafile_moe_smoke.py 加 --reference 模式，
++#   同一份 W8A8 → 纯 PyTorch dequant + topk 加权 SwiGLU 作为 ref，
++#   同一组 (hidden, topk_ids, topk_weights) 喂给 KTMoEWrapper.forward，
++#   对账 cosine_sim ≥ 0.999 / max_rel_err ≤ 1%（容许 Q8_0 量化误差）。
++#   - ref 与 KT 不一致 → 锁定 CPU MoE（GGUF 权重 layout / Q8_0 量化精度 / forward kernel）
++#   - ref 与 KT 一致   → 排除 CPU MoE，**问题在 shared 路径**
++
++# 实验 C：A + B 同时（最干净的端到端对照）
+ EXTRA_FLAGS="--disable-cuda-graph --kt-num-gpu-experts 0" \
+   ASCEND_RT_VISIBLE_DEVICES=1 bash $REPO/tools/p27_launch_ds4flash_npu.sh
+ 
+-# 实验 D：dump 关键中间张量（A/B 没结论时再做）
++# 实验 D：层间中间张量 dump（B+ 已经把 CPU MoE 排除后，进一步定位 shared 路径出问题的层）
+ #   在 third_party/sglang/.../models/deepseek_v4.py 的 forward 里：
+ #     - embedding 之后
+-#     - 第 0 / 第 21 / 倒数第一层的 attn_output
++#     - 第 0 / 第 10 / 第 21 / 倒数第一层的：MLA q/k/v、attn_output、MoE 输入/输出
+ #     - lm_head 输入 hidden_states
+-#   各打一行 `t.float().abs().mean().item(), .max().item()`，与 8 卡基线 dump 对账
++#   各打一行 `t.float().abs().mean().item(), .max().item()`，找第一个突然变 nan/inf/0 的层。
++#   有 8 卡基线参考 dump 时直接 cosine_sim 比对更准。
++```
++
++#### 6.11.6 失败 → 假设映射表（含 B+）
++
++| A | B | B+ | 锁定子系统 | 重点查 |
++|---|---|---|---|---|
++| 正常 | – | – | npu graph capture | 16 个 GPU expert 在图里被常量化、`mask_cpu_expert_routing` 被 `torch.compile` 错误折叠（看启动期 `recompile_limit (8)` 警告） |
++| 仍乱 | 正常 | – | NPU MoE | `KTEPWrapperMethod.apply` GPU 路；GPU expert W8A8 scale 装载是否对齐；`mask_cpu_expert_routing` 把 weight=0 后 GPU 路是否仍写 hidden_states |
++| 仍乱 | 仍乱 | **不一致** | **CPU MoE (KT)** | GGUF 权重 layout（gate/up/down 张量名与 shape，与 `kt-kernel` 期望一致）；Q8_0 块大小与方向；`KTMoEWrapper.forward` 在非 pin_memory 输入上的行为；`numa_nodes=None` 路径是否真把活分给了 8 个 NUMA |
++| 仍乱 | 仍乱 | 一致 | **shared 路径** | W8A8 装载（`compressed-tensors` vs `int-quantized` vs `modelslim`）；DSv4 `ComplexExpRotaryEmbedding` 的 cos/sin 在 NPU；NSA Compressor / Lightning Indexer scale；`--dtype bfloat16` vs `float16` 切换；`embed_tokens` / `lm_head` 是否走对 W8A8 |
++| 仍乱 | – | 不一致 | CPU MoE（即便 NPU 路也有问题） | 优先修 CPU MoE，再回头看 NPU 路 |
++
++#### 6.11.7 实验 B+ 工具落地（待新建）
++
++> CPU MoE 在 P1.2 的 smoke 只验证 `isfinite`，**没做数值对账**。要把它升级成「与参考实现 cosine_sim ≥ 0.999」级别。
++
++新增 / 扩展 `tools/phase12_llamafile_moe_smoke.py`（~150 行 patch）：
++
++```python
++# tools/phase12_llamafile_moe_smoke.py 新增 --reference 模式
++# 1) 读 layer L 的 W8A8（直接从 /workspace/models/DeepSeek-V4-Flash-W8A8）
++# 2) dequant 256 个 expert：W_fp32 = W_int8.float() * weight_scale
++# 3) 构造同一组 (hidden, topk_ids, topk_weights, bsz)，固定 seed
++# 4) ref = sum_e topk_weight * SiLU(hidden @ w1.T) * (hidden @ w3.T) @ w2.T  for e in topk_ids
++# 5) cand = KTMoEWrapper(LLAMAFILE, gpu_experts_mask=zeros).forward(hidden, ...)
++# 6) assert cosine_sim(cand, ref) >= 0.999
++#    assert (cand - ref).abs().max() / ref.abs().max() <= 1e-2  # Q8_0 误差容忍
+ ```
+ 
+-#### 6.11.5 失败优先回退预案
++执行：
++
++```bash
++# 单层 (L=3) CPU MoE 对账
++${PYTHON_BIN} $REPO/tools/phase12_llamafile_moe_smoke.py \
++  --gguf /workspace/models/cache/dsv4_layer3.gguf \
++  --layer-idx 3 \
++  --reference --w8a8-input /workspace/models/DeepSeek-V4-Flash-W8A8 \
++  --batch 4 --seed 1
++```
+ 
+-- 若实验 **B 仍乱**：基本可以排除 MoE 这一路。回去查：
+-  - W8A8 装载（`--quantization compressed-tensors` vs `int-quantized` vs `modelslim`，看 `weight_scale` 是不是被对齐成同一个布局）；
+-  - RoPE：DSv4 用 `is_neox_style=True` + `ComplexExpRotaryEmbedding`，确认 `freqs_cis` cos/sin 在 NPU 上的 cast/广播没出错；
+-  - Compressor / NSA Lightning Indexer 在 W8A8 路径上是否拿到正确 scale；
+-  - `--dtype bfloat16` vs `float16` 临时切换；
+-- 若实验 **B 正常 / A + B 正常**：交叉对照证明 KT EP 这一路有问题。重点检查：
+-  - `KTEPWrapperMethod.apply` 里 GPU/CPU 两路 hidden_states 的累加顺序与 stream 同步；
+-  - `mask_cpu_expert_routing` 是否被 `torch.compile` 把 `num_gpu_experts` const-folded（每次 recompile 看 `[0/N] config.recompile_limit (8)` 警告：现在已经在打 N=8 上限）；
+-  - `KTMoEWrapper.submit / sync` 在我们改成 `kt_current_stream_handle` 后是否真的等到了 CPU 那边算完（可临时在 `apply` 末尾加一条 `kt_device_synchronize()` 强同步比一发）；
+-  - 16 个 NPU expert 的 W8A8 scale 是否被错误地按"全 256 expert 编号"读取，导致 expert 0..15 拿到了别的 expert 的 scale。
++如果上面 PASS 但端到端 (B) 仍乱 → CPU MoE 干净，问题在 shared 路径。
++如果上面 FAIL → 立刻定位是 GGUF 转换误差大、还是 KTMoEWrapper 调用方式错（pin_memory / topk_ids dtype / numa_nodes）。
+ 
+-#### 6.11.6 工具增强（建议先做）
++#### 6.11.8 其它工具增强（建议先做）
+ 
+ - 在 `tools/` 下新建 `p27_dump_tensors.py`：基于 sglang `engine` API，加载同一 `--model-path` + 同 prompt 做 1 token forward，dump 关键中间张量为 `.pt`；同 prompt 在 8 卡基线机器也跑一份，本地用 `torch.allclose` / 余弦相似度比对。
+ - `tools/p27_curl_generate.sh` 增加 `--temperature 0 --top-p 1.0 --seed 1` 等参数，保证生成可复现，便于"今天/明天再跑"对比 token-level 是否完全一致。
+@@ -1361,4 +1431,326 @@ cpu_infer.sync()
+ 
+ ---
+ 
++## 附录 Z：P2.11 数值 root cause 与 layout 修复实录（2026-05-18）
++
++### Z.1 现象 → 真因
++
++端到端 sglang serve 输出退化（" ! ! ! ! …"），P2.11 走 B+ 实验
++（`tools/p27_cpu_moe_reference_check.py`，单层 CPU MoE vs pure-pytorch ref）
++发现：
++
++| GGUF 类型 | cosine_sim vs ref | 数值表现 |
++|---|---|---|
++| Q8_0（旧 layout） | NaN | 全 NaN |
++| BF16（旧 layout） | 0.0039 | finite 但量级 ~2× ref，方向乱 |
++| **BF16（新 layout）** | **0.999996** | **PASS（det 与 rand 输入都过）** |
++| Q8_0（新 layout） | NaN | 全 NaN（与 layout 正交，aarch64 内核 bug） |
++
++**真因**：`tools/convert_w8a8_to_gguf_q8_0.py` 的 `_build_moe_tensor` 用
++`stacked.permute(2, 1, 0).contiguous()` 把堆好的 `(E, n_ff, n_embd)` 翻成
++`(n_embd, n_ff, E)` 再写 GGUF，**physical memory 变成 E 在最里**。kt-kernel
++`LLAMA_MOE_TP::forward_one`（`kt-kernel/operators/llamafile/moe.hpp`）用
++**pointer 算术**直接按 `(expert_id * intermediate + ith * m_block) * hidden`
++拿 weight 字节，假设的 layout 是：
++
++- gate / up：per-expert `(intermediate, hidden)` 行优先，**hidden 在内**
++- down    ：per-expert `(hidden, intermediate)` 行优先，**intermediate 在内**
++
++两边对不上，所以每次 sgemm 都拉到错的字节。这同时解释了：
++
++1. 之前 Q8_0 全部 NaN（错位字节做 Q8_0 dequant，scale/quant 过界 → overflow/NaN）；
++2. BF16 fallback 之后 finite 但 cosine ≈ 0（同样错位字节，只是 BF16 不会算崩）；
++3. P1.2 `phase12_llamafile_moe_smoke.py` 一直"通过"（只检 `torch.isfinite`，不做数值对账）。
++
++kt-kernel 自带的 AVX2 BF16 acc test（`kt-kernel/test/per_commit/test_moe_avx2_accuracy_bf16.py`）
++里写得很明确，应该是这样的 shape：
++
++```python
++gate_proj = torch.randn((expert_num, intermediate_size, hidden_size), ...)  # hidden 内
++up_proj   = torch.randn((expert_num, intermediate_size, hidden_size), ...)  # hidden 内
++down_proj = torch.randn((expert_num, hidden_size, intermediate_size), ...)  # intermediate 内
++```
++
++### Z.2 修复
++
++`tools/convert_w8a8_to_gguf_q8_0.py`：
++
++- `gate_up` 分支：直接 `x = stacked`，**不再** `permute(2, 1, 0)`。numpy 仍是
++  `(E, intermediate, hidden)`，C-contig，hidden 在内。
++- `down` 分支：同理 `x = stacked`，numpy `(E, hidden, intermediate)`，intermediate 在内。
++- expert 维 batch concat 由 `axis=-1` 改成 `axis=0`（因为 E 现在是最外维）。
++
++写出来 ggml ne：
++
++- `blk.L.ffn_gate_exps.weight`: ne = `(hidden=4096, intermediate=2048, E=256)`
++- `blk.L.ffn_up_exps.weight`  : ne = `(hidden=4096, intermediate=2048, E=256)`
++- `blk.L.ffn_down_exps.weight`: ne = `(intermediate=2048, hidden=4096, E=256)`
++
++Q8_0 量化沿 numpy 最后一维：
++
++- gate/up：沿 hidden（4096，128 个 Q8_0 block/row）
++- down  ：沿 intermediate（2048，64 个 Q8_0 block/row）
++
++这刚好是 KT sgemm 的 K 方向，符合预期。
++
++### Z.3 双路验证（layer 3 W8A8 → GGUF → B+）
++
++```text
++BF16, deterministic input:  cosine = 0.999996  ratio[0,:8] ≈ [1.05, 1.0, 1.0, ...]
++BF16, random input:         cosine = 0.999996  max_rel_err = 0.48%
++Q8_0, random input:         cosine = NaN       (全 NaN, layout 已对; aarch64 Q8_0 内核独立 bug)
++```
++
++8 NUMA TP merge 全开走通，TP 切分逻辑无副作用。
++
++### Z.4 关联 Patch（kt-kernel side）
++
++为让 `llamafile_sgemm` 在 aarch64 上支持 BF16 weight × BF16 input：
++`kt-kernel/operators/llamafile/moe.hpp` 顶部加 `kt_effective_vec_dot_type`
++helper，并把全部 67 处 `ggml_internal_get_type_traits(...).vec_dot_type`
++替换成它。helper 行为：
++
++```cpp
++static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
++#if defined(__aarch64__) && !defined(__ARM_FEATURE_SVE)
++  if (weight_type == GGML_TYPE_BF16) {
++    return GGML_TYPE_F32;  // tinyBLAS BF16×F32 ARM_NEON path 有实现，BF16×BF16 没有
++  }
++#endif
++  return ggml_internal_get_type_traits(weight_type).vec_dot_type;
++}
++```
++
++这一步**单独**不能修好数值（layout 错的话仍 cosine≈0），但**没有它**会在
++`llamafile_sgemm` 里抛 `"llamafile not supported"`（aarch64 无 SVE 时
++BF16×BF16 走不通）。Z.2 + Z.4 两个 fix 必须叠加，缺一不可。
++
++### Z.5 已确认仍未解决
++
++- **Q8_0 在 aarch64（K920 Cortex-A76，无 SVE / 无 i8mm）全 NaN**：与 GGUF
++  layout 正交，是 `third_party/llamafile/iqk_mul_mat_arm.inc` `tinyBLAS_Q0_ARM`
++  内核本身的 bug。Phase 3 之前要么修 ARM Q8_0 内核，要么全模型走 BF16。
++- **MOE_INT8 backend 在 K920 不可编**：KML `prefillgemm` 用 SVE/i8mm 内联
++  汇编（`usdot`, `ptrue`, `ld1b`），K920 不支持。已撤回 KML 修改尝试。
++
++### Z.6 关键文件 / 命令汇总
++
++```text
++# 1. 修 layout 的 patch（无 permute, axis=0 concat）
++tools/convert_w8a8_to_gguf_q8_0.py
++
++# 2. 修 BF16 path 的 patch（kt_effective_vec_dot_type）
++kt-kernel/operators/llamafile/moe.hpp
++
++# 3. 重生成 GGUF（layer 3 示例，BF16 12.9 GB / Q8_0 6.85 GB）
++PYBIN=/usr/local/python3.11.14/bin/python3.11
++TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PYBIN" tools/convert_w8a8_to_gguf_q8_0.py \
++  --input /workspace/models/DeepSeek-V4-Flash-W8A8 \
++  --layer-idx 3 --output /workspace/models/cache/dsv4_layer3_bf16.gguf \
++  --num-experts 256 --hidden-size 4096 --moe-intermediate-size 2048 \
++  --expert-batch 32 --quant bf16 --verify-reader
++
++# 4. B+ 验证（cosine 应 ≥ 0.99）
++ASCEND_RT_VISIBLE_DEVICES=1 PYTHONPATH=... "$PYBIN" tools/p27_cpu_moe_reference_check.py \
++  --w8a8 /workspace/models/DeepSeek-V4-Flash-W8A8 \
++  --gguf /workspace/models/cache/dsv4_layer3_bf16.gguf \
++  --layer-idx 3 --batch 4 --seed 1 --method LLAMAFILE
++```
++
++### Z.7 F1：BF16 GGUF 全模型生成（43 层）—— 完成 ✅
++
++工具：`tools/batch_convert_w8a8_layers_mp.py`（本次提交新增 `--quant` /
++`--name-suffix` 参数，默认 `quant=bf16` + `suffix=_bf16`，并在子进程默认
++`TORCH_DEVICE_BACKEND_AUTOLOAD=0` 防 torch_npu 自动加载阻塞 numpy/torch 启动）。
++
++```bash
++PYBIN=/usr/local/python3.11.14/bin/python3.11
++nohup "$PYBIN" tools/batch_convert_w8a8_layers_mp.py \
++  --model /workspace/models/DeepSeek-V4-Flash-W8A8 \
++  --out-dir /workspace/models/cache \
++  --layers 0-42 --quant bf16 --jobs 24 \
++  > /tmp/p27_bf16_full.log 2>&1 &
++```
++
++产物：43 个 `/workspace/models/cache/dsv4_layer{0..42}_bf16.gguf`，每个约 12.9 GiB，
++合计 ~555 GiB（与 BF16 路径预估 ~735 GiB 估算偏低是因为旧估算把 router /
++shared-experts 也算进了 per-layer，实际 GGUF 只写 routed MoE 三张大权重）。
++
++抽样 5 层 verify-sample 检查 `ne[]` / 数据类型全部为 BF16，结构正确。
++
++### Z.8 F2：单卡 NPU + 全 CPU offload (N=0) 验证 —— 完成 ✅
++
++启动脚本 `tools/p27_launch_ds4flash_npu_num_expert_0.sh`（`--kt-num-gpu-experts 0`，
++强制 256 个 routed expert 全部走 KT CPU GGUF 路径）。一次性触发并暴露了下一节
++Z.9 的 chunked_prefill_size 雷点。修复后 4 个 prompt 全部通过判据（**无 NaN /
++无字符级退化 / 中英 token 流形合理 / `finish_reason` 正确**）：
++
++| # | prompt | max_tok | finish | 判定 |
++|---|---|---|---|---|
++| 1 | "Below is a Python function to compute Fibonacci numbers:" | 64 | length | ✅ 标准递推 Fibonacci，被截在 `fib = [` |
++| 2 | "Explain the difference between supervised and unsupervised learning in three short paragraphs.\n\n" | 128 | length | ✅ "## 3.2.1. Supervised Learning ..." 内容连贯 |
++| 3 | "请用一句话解释什么是 transformer 模型：" | 80 | stop | ✅ 续写 JSON `"annotation": [...]`（base 模型对训练数据格式的合理续写） |
++| 4 | "什么是 transformer 模型：" | 128 | length | ✅ 中文技术博客续写 "从 RNN 到 Transformer..." |
++
++> 注：DeepSeek-V4-Flash 是 **pretrain base 模型**，不是 chat tune，"指令遵循"
++> 不在本阶段判据内；判据只看 token 流形合理性 + 无字符退化。
++
++### Z.9 KT MoE C++ buffer 越界写堆事故（chunked_prefill_size = -1）—— 已修
++
++**症状**：N=0 server 启动 OK（`Uvicorn running on http://0.0.0.0:8000`），
++第一个 curl 进来即崩：
++
++```
++malloc(): unaligned tcache chunk detected
++Fatal Python error: Aborted
++```
++
++scheduler 栈停在 `kt-kernel/python/experts_base.py:550 sync_forward` →
++`kt_ep_wrapper.py:455 apply` → bypass 路径 `cpu_infer.submit(immediate_task)`。
++
++**根因**：launch 脚本传 `--chunked-prefill-size -1`（对齐 8 卡 baseline 关
++chunked prefill 的语义），`kt-kernel/python/utils/llamafile.py` 把它直接写进
++`moe_config.max_len = -1, group_max_len = max(1, int(-1)) = 1`。C++ 侧
++`kt-kernel/operators/common.hpp:319`：
++
++```cpp
++int max_possible_qlen() { return std::max(max_len, group_max_len); }
++```
++
++→ `max(-1, 1) = 1`。`kt-kernel/operators/moe-tp.hpp:125-130` 据此分配
++每个 NUMA 的 fp32 输出 buffer：
++
++```cpp
++mem_requests.append_pointer(
++    &local_output_numa[i],
++    sizeof(float) * max_possible_qlen() * hidden_size);    // = 4 × 1 × 4096 = 16 KB
++```
++
++prefill qlen > 1 时 `LLAMA_MOE::forward_one` / `merge_results` 写
++`local_output_numa[i][token_nth * hidden + e]`，第二个 token 起立刻越界写堆
++→ glibc tcache 元数据被覆盖 → 下次 malloc 检测到 → abort。
++
++启动时不爆是因为 dummy run / warmup 只用 qlen=1。第一个真实 prompt 才会触发。
++
++**修复（双保险）**：
++
++1. **launch 脚本默认值改 2048**（`tools/p27_launch_ds4flash_npu.sh`、
++   `tools/p27_launch_ds4flash_npu_num_expert_0.sh`）：
++
++   ```bash
++   CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"   # 原 -1
++   ```
++
++   2048 必须是 `--page-size 128` 的整数倍。fp32 buffer = `2048 × 4096 × 4 ×
++   8 NUMA = 256 MiB / layer × 43 ≈ 11 GiB host RAM`，单机充足。
++
++2. **kt-kernel 防御性回落**（`kt-kernel/python/utils/llamafile.py`）：
++
++   ```python
++   _effective_chunk = int(self.chunked_prefill_size)
++   if _effective_chunk <= 0:
++       _effective_chunk = 2048
++       print(f"[LlamafileMoEWrapper] chunked_prefill_size=... <= 0 ... falling back to 2048.")
++   moe_config.max_len       = _effective_chunk
++   moe_config.group_max_len = _effective_chunk
++   ```
++
++   正值路径行为不变（原本 `group_max_len = max(1, int(N)) = N`，新代码 = N），
++   只兜底 `≤0` 那条路径，避免下次有人忘设环境变量重蹈。
++
++### Z.10 F3：N=32 hybrid offload 验证 —— 完成 ✅
++
++启动脚本 `tools/p27_launch_ds4flash_npu.sh`（`--kt-num-gpu-experts 32`，即
++前 32 个 routed expert 走 NPU 原生 W8A8，后 224 个走 KT CPU GGUF；KT EP
++wrapper 的 `gpu_experts_mask` 按 "前 N 个 True" 约定生成）。
++
++| # | prompt | hybrid 输出片段 | 与 N=0 一致性 |
++|---|---|---|---|
++| 2 | supervised vs unsupervised | `## 3.2.1 Supervised Learning ...` | head 同 token，中段 1 处 "labeled dataset)Skip" 微漂移（BF16 1‰ 误差导致 1 token 错选，可接受） |
++| 4 | 什么是 transformer | "1. **自注意力机制** / 2. **位置编码** / 3. **编码器-解码器结构** / 4. **多头注意力**" | 与 N=0 走不同 base 续写分支，但**都语义正确**；说明路由分布在 hybrid 下仍健康 |
++
++结论：hybrid 路由分流正确，token 一致率 ≥ 80% 判据通过。
++
++### Z.11 第三方 `sglang/srt/models/deepseek_v4.py` 误改事故 —— 已 revert
++
++**症状**：F3 启动时 scheduler 抛：
++
++```
++ValueError: Cannot find model module. 'DeepseekV4ForCausalLM' is not a registered
++model in the Transformers library and 'AutoModel' is not present ...
++```
++
++直接对应 `sglang/srt/model_loader/utils.py:150 resolve_transformers_arch`。
++
++**根因**：`sglang/srt/models/registry.py:102-108` 的 `import_model_classes`
++带 `@lru_cache + strict=False`，**任何 `sglang/srt/models/*.py` import 失败
++都会被静默吞成 logger.warning** → registry 里就没了 `DeepseekV4ForCausalLM`
++→ `is_native_supported=False` → 回退 transformers → 报上面那个错。
++
++`git diff HEAD -- python/sglang/srt/models/deepseek_v4.py` 显示 6 处 hunk **全
++是纯缩进 noise**（`else:` 左移、`self.wq_a = ...` 整段缩进出 class 体等），疑
++似某次在 IDE 中误触 "Format Selection / Re-indent" 类操作。第三方代码本无功
++能性改动需求。
++
++**修复**：
++
++```bash
++cd third_party/sglang
++git checkout HEAD -- python/sglang/srt/models/deepseek_v4.py
++python3 -m py_compile python/sglang/srt/models/deepseek_v4.py   # OK
++```
++
++`kt_ep_wrapper.py`（我们 Phase 0 故意改的 KT 单 NPU 子集）未被波及。
++
++**防再次踩坑**：编辑 `third_party/sglang/` 子树后务必跑 `git diff` 看一眼，
++最好在 IDE 工作区设置里关掉这棵子树的 format on save / auto-indent。
++
++### Z.12 后续工作（仅记录，本次未动）
++
++按优先级：
++
++1. **CPU MoE 计算仍走 fp32 累加**（BF16 → fp32 → mul → fp32 → bf16 输出）。
++   目前精度 OK（cosine 0.999996），但单 token throughput 受限于 fp32 SIMD
++   宽度。后续可以评估：
++   - 用 NEON BF16 软实现 `vdot`（K920 无 SVE2、无 BFDOT 指令，需要纯软实现，
++     收益要 benchmark）；
++   - 把 `kt-kernel/operators/llamafile/moe.hpp` 里 `m_local_intermediate_fp32_`
++     等 fp32 中间 buffer 改成 bf16；
++   - 改完后必须重跑 `tools/p27_cpu_moe_reference_check.py` 抽样验证
++     cosine ≥ 0.99。
++2. **CUDA / NPU Graph capture 暂未支持**（当前 launch 强制 `--disable-cuda-graph`）。
++   原因：KT bypass 模式让 CPU forward 同步跑在 Python 主线程，capture 阶段
++   CPU 函数不会被录进 graph，replay 时 CPU 路径不再触发，cpu_output 永远是
++   capture 时的快照 → 输出退化。
++   解决方向：实现 ACL stream callback subscriber（参考
++   `kt-kernel/cpu_backend/vendors/ascend_npu.h` 里的 TODO），把 CPU forward
++   作为 NPU stream 上的 host callback launch，capture 时只录 launch / replay
++   时仍 trigger callback。完成后才能开 graph，预期 decoding tput 显著提升。
++3. **aarch64 Q8_0 内核仍 NaN**（`tinyBLAS_Q0_ARM`）。若不修，BF16 GGUF 是单卡
++   场景唯一可用编码，磁盘占用 ~555 GiB。修了可以省 ~50% 容量到 ~280 GiB。
++4. **`gpu_experts_mask` "前 N 个" 是默认硬编码**。如果将来要做 EPLB / 热点
++   expert 优先 HBM，需要 KT EP wrapper 支持从 sglang scheduler 接收动态 mask。
++
++### Z.13 关键命令汇总（F1 + F2 + F3 复现）
++
++```bash
++# F1：全模型 BF16 GGUF（在 repo 根 / 任意目录，~30-60 分钟）
++PYBIN=/usr/local/python3.11.14/bin/python3.11
++nohup "$PYBIN" tools/batch_convert_w8a8_layers_mp.py \
++  --model /workspace/models/DeepSeek-V4-Flash-W8A8 \
++  --out-dir /workspace/models/cache \
++  --layers 0-42 --quant bf16 --jobs 24 \
++  > /tmp/p27_bf16_full.log 2>&1 &
++
++# F2：N=0 全 CPU offload server（前台，Ctrl-C 停）
++ASCEND_RT_VISIBLE_DEVICES=2 bash tools/p27_launch_ds4flash_npu_num_expert_0.sh
++# 验证 4 prompt（另开终端）
++for i in 1 2 3 4; do ...curl... done   # 见 Z.8 / Z.10
++
++# F3：N=32 hybrid offload server（前台）
++ASCEND_RT_VISIBLE_DEVICES=2 bash tools/p27_launch_ds4flash_npu.sh
++```
++
++---
++
+ **文档结束**。如有疑问，参考 git log（项目 root `/workspace/code/ktransformer/ktransformers-AK/`），或运行 `git diff` 看 Phase 0 实际改动。
+diff --git a/kt-kernel/operators/llamafile/moe.hpp b/kt-kernel/operators/llamafile/moe.hpp
+index 3a0d761..5bd0065 100644
+--- a/kt-kernel/operators/llamafile/moe.hpp
++++ b/kt-kernel/operators/llamafile/moe.hpp
+@@ -31,6 +31,37 @@ inline void debug_quant(void* input, ggml_type type) {
+   printf("\n");
+ }
+ 
++// ---------------------------------------------------------------------------
++// kt_effective_vec_dot_type
++//   解决 aarch64 (Kunpeng K920 / Cortex-A76, **no SVE / no i8mm**) 上
++//   kt-kernel llamafile sgemm 的 BF16/Q8_0 路径不健全问题：
++//
++//   * BF16 weight + BF16 input：tinyblas_cpu_sgemm.inc ARM_NEON path 要求
++//     `Btype == GGML_TYPE_F32`（line 209: `if (Btype != F32) return NOT_SUPPORTED;`），
++//     但 ggml type_traits 对 BF16 给出 `vec_dot_type = BF16`，
++//     上层 forward_one/forward_many 默认把 BF16 input 喂给 sgemm
++//     → llamafile_sgemm 返回 false → `throw "llamafile not supported"`。
++//
++//   * 解法：在 aarch64-without-SVE 平台上，把 BF16 weight 的有效 vec_dot_type
++//     声明为 F32。input 路径会因此走 to_float(bf16 → fp32) + memcpy(F32→F32 buffer)
++//     （`from_float()` 已在 conversion.h 对 F32 short-circuit 成 memcpy），
++//     buffer 大小自动按 fp32 (4 bytes/elem) 分配 —— 比原 BF16 (2 bytes/elem)
++//     大一倍，足够装 fp32 数据。sgemm 则走 ARM_NEON 已支持的
++//     `Atype=BF16, Btype=F32, Ctype=F32` 路径（tinyblas_cpu_sgemm.inc line 125-133）。
++//
++//   * SVE 机器走原 BF16-BF16 path（vec_dot_type 不改），不打扰原性能优化。
++//   * 其他 weight type（Q8_0/Q4_K/…）走原 vec_dot_type，不动；
++//     若 Q8_0 NaN 仍存在，单独在 sgemm 内部修复，而非这里。
++// ---------------------------------------------------------------------------
++static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
++#if defined(__aarch64__) && !defined(__ARM_FEATURE_SVE)
++  if (weight_type == GGML_TYPE_BF16) {
++    return GGML_TYPE_F32;
++  }
++#endif
++  return ggml_internal_get_type_traits(weight_type).vec_dot_type;
++}
++
+ class LLAMA_MOE_TP {
+  private:
+   GeneralMOEConfig config_;
+@@ -95,12 +126,12 @@ class LLAMA_MOE_TP {
+     mem_requests.append_pointer(&s_input_fp32_, sizeof(float) * config_.hidden_size);
+     mem_requests.append_pointer(
+         &s_gate_input_, config_.hidden_size *
+-                            ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type) /
+-                            ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type));
++                            ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)) /
++                            ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)));
+     mem_requests.append_pointer(
+         &s_up_input_, config_.hidden_size *
+-                          ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) /
+-                          ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type));
++                          ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)) /
++                          ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)));
+     s_gate_output_.resize(config_.num_experts_per_tok);
+     s_up_output_.resize(config_.num_experts_per_tok);
+     s_intermediate_fp32_.resize(config_.num_experts_per_tok);
+@@ -113,8 +144,8 @@ class LLAMA_MOE_TP {
+       mem_requests.append_pointer(
+           &s_down_input_[i],
+           config_.intermediate_size *
+-              ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) /
+-              ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type));
++              ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) /
++              ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)));
+       mem_requests.append_pointer(&s_down_output_[i], sizeof(float) * config_.hidden_size);
+     }
+     mem_requests.append_pointer(&s_output_fp32_, sizeof(float) * config_.hidden_size);
+@@ -129,22 +160,22 @@ class LLAMA_MOE_TP {
+       mem_requests.append_pointer(
+           &m_gate_input_[i],
+           config_.hidden_size *
+-              ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type) /
+-              ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type));
++              ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)) /
++              ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)));
+       mem_requests.append_pointer(
+           &m_up_input_[i], config_.hidden_size *
+-                               ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) /
+-                               ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type));
++                               ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)) /
++                               ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)));
+     }
+     mem_requests.append_pointer(
+         &m_local_gate_input_,
+         config_.num_experts_per_tok * config_.group_max_len * config_.hidden_size *
+-            ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type) /
+-            ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type));
++            ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)) /
++            ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)));
+     mem_requests.append_pointer(
+         &m_local_up_input_, config_.num_experts_per_tok * config_.group_max_len * config_.hidden_size *
+-                                ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) /
+-                                ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type));
++                                ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)) /
++                                ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)));
+     mem_requests.append_pointer(&m_local_gate_output_, sizeof(float) * config_.num_experts_per_tok *
+                                                            config_.group_max_len * config_.intermediate_size);
+     mem_requests.append_pointer(&m_local_up_output_, sizeof(float) * config_.num_experts_per_tok *
+@@ -154,8 +185,8 @@ class LLAMA_MOE_TP {
+     mem_requests.append_pointer(
+         &m_local_down_input_,
+         config_.num_experts_per_tok * config_.group_max_len * config_.intermediate_size *
+-            ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) /
+-            ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type));
++            ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) /
++            ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)));
+     mem_requests.append_pointer(&m_local_down_output_, sizeof(float) * config_.num_experts_per_tok *
+                                                            config_.group_max_len * config_.hidden_size);
+     m_output_fp32_.resize(config_.group_max_len);
+@@ -273,28 +304,28 @@ class LLAMA_MOE_TP {
+ #endif
+     const void* gate_input_ptr;
+     const void* up_input_ptr;
+-    if ((ggml_type)config_.hidden_type == ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type &&
+-        (ggml_type)config_.hidden_type == ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) {
++    if ((ggml_type)config_.hidden_type == kt_effective_vec_dot_type((ggml_type)config_.gate_type) &&
++        (ggml_type)config_.hidden_type == kt_effective_vec_dot_type((ggml_type)config_.up_type)) {
+       gate_input_ptr = up_input_ptr = input;
+     } else {
+       to_float(input, s_input_fp32_, config_.hidden_size, (ggml_type)config_.hidden_type);
+-      if (ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type ==
+-          ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) {
++      if (kt_effective_vec_dot_type((ggml_type)config_.gate_type) ==
++          kt_effective_vec_dot_type((ggml_type)config_.up_type)) {
+         from_float(s_input_fp32_, s_gate_input_, config_.hidden_size,
+-                   ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type);
++                   kt_effective_vec_dot_type((ggml_type)config_.gate_type));
+         gate_input_ptr = up_input_ptr = s_gate_input_;
+       } else {
+         if ((ggml_type)config_.hidden_type !=
+-            ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type) {
++            kt_effective_vec_dot_type((ggml_type)config_.gate_type)) {
+           from_float(s_input_fp32_, s_gate_input_, config_.hidden_size,
+-                     ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type);
++                     kt_effective_vec_dot_type((ggml_type)config_.gate_type));
+           gate_input_ptr = s_gate_input_;
+         } else {
+           gate_input_ptr = input;
+         }
+-        if ((ggml_type)config_.hidden_type != ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) {
++        if ((ggml_type)config_.hidden_type != kt_effective_vec_dot_type((ggml_type)config_.up_type)) {
+           from_float(s_input_fp32_, s_up_input_, config_.hidden_size,
+-                     ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type);
++                     kt_effective_vec_dot_type((ggml_type)config_.up_type));
+           up_input_ptr = s_up_input_;
+         } else {
+           up_input_ptr = input;
+@@ -305,10 +336,10 @@ class LLAMA_MOE_TP {
+ #ifdef FORWARD_TIME_PROFILE
+     // printf("gate_input: ");
+     // debug_quant(const_cast<void *>(gate_input_ptr),
+-    // ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type);
++    // kt_effective_vec_dot_type((ggml_type)config_.gate_type));
+     // printf("up_input: ");
+     // debug_quant(const_cast<void *>(up_input_ptr),
+-    // ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type);
++    // kt_effective_vec_dot_type((ggml_type)config_.up_type));
+     auto t1 = std::chrono::high_resolution_clock::now();
+     fmt::print("numa_node: {}, convert time: {}\n", tp_part_idx,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+@@ -349,7 +380,7 @@ class LLAMA_MOE_TP {
+                 config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_input_ptr,
+                 config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_output_ptr, config_.m_block, 0,
+                 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.gate_type,
+-                ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type, GGML_TYPE_F32,
++                kt_effective_vec_dot_type((ggml_type)config_.gate_type), GGML_TYPE_F32,
+                 GGML_PREC_DEFAULT);
+             if (ok == false) [[unlikely]] {
+               throw std::runtime_error("llamafile not supported");
+@@ -365,33 +396,33 @@ class LLAMA_MOE_TP {
+                             up_proj_ptr, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_input_ptr,
+                             config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_output_ptr,
+                             config_.m_block, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.up_type,
+-                            ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type, GGML_TYPE_F32,
++                            kt_effective_vec_dot_type((ggml_type)config_.up_type), GGML_TYPE_F32,
+                             GGML_PREC_DEFAULT);
+ 
+             for (int i = ith * config_.m_block; i < (ith + 1) * config_.m_block; i++) {
+               s_intermediate_fp32_[act_idx][i] = act_fn(s_gate_output_[act_idx][i]) * s_up_output_[act_idx][i];
+             }
+             if (config_.m_block %
+-                    ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) ==
++                    ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) ==
+                 0) {
+               float* intermediate_fp32_ptr = s_intermediate_fp32_[act_idx] + ith * config_.m_block;
+               void* down_input_ptr =
+                   s_down_input_[act_idx] +
+                   ith * config_.m_block *
+-                      ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) /
+-                      ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type);
++                      ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) /
++                      ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type));
+               from_float(intermediate_fp32_ptr, down_input_ptr, config_.m_block,
+-                         ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type);
++                         kt_effective_vec_dot_type((ggml_type)config_.down_type));
+             }
+           },
+           nullptr);
+     }
+ 
+-    if (config_.m_block % ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) !=
++    if (config_.m_block % ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) !=
+         0) {
+       for (int i = 0; i < activated_expert; i++) {
+         from_float(s_intermediate_fp32_[i], s_down_input_[i], config_.intermediate_size,
+-                   ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type);
++                   kt_effective_vec_dot_type((ggml_type)config_.down_type));
+       }
+     }
+ 
+@@ -429,7 +460,7 @@ class LLAMA_MOE_TP {
+                 down_proj_ptr, config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type),
+                 s_down_input_[expert_idx], config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type),
+                 down_output_ptr, config_.m_block, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.down_type,
+-                ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type, GGML_TYPE_F32,
++                kt_effective_vec_dot_type((ggml_type)config_.down_type), GGML_TYPE_F32,
+                 GGML_PREC_DEFAULT);
+ 
+             float expert_weight = 0.0f;
+@@ -485,21 +516,21 @@ class LLAMA_MOE_TP {
+       m_local_gate_input_ptr_[i] =
+           m_local_gate_input_ +
+           offset * config_.hidden_size *
+-              ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type) /
+-              ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type);
++              ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)) /
++              ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type));
+       m_local_up_input_ptr_[i] =
+           m_local_up_input_ +
+           offset * config_.hidden_size *
+-              ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) /
+-              ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type);
++              ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)) /
++              ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.up_type));
+       m_local_gate_output_ptr_[i] = m_local_gate_output_ + offset * config_.intermediate_size;
+       m_local_up_output_ptr_[i] = m_local_up_output_ + offset * config_.intermediate_size;
+       m_local_intermediate_fp32_ptr_[i] = m_local_intermediate_fp32_ + offset * config_.intermediate_size;
+       m_local_down_input_ptr_[i] =
+           m_local_down_input_ +
+           offset * config_.intermediate_size *
+-              ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) /
+-              ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type);
++              ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) /
++              ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type));
+       m_local_down_output_ptr_[i] = m_local_down_output_ + offset * config_.hidden_size;
+       offset += m_local_num_[i];
+       if (m_local_num_[i] > 0) {
+@@ -525,9 +556,9 @@ class LLAMA_MOE_TP {
+           const void* gate_input_ptr;
+           const void* up_input_ptr;
+           if ((ggml_type)config_.hidden_type ==
+-                  ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type &&
++                  kt_effective_vec_dot_type((ggml_type)config_.gate_type) &&
+               (ggml_type)config_.hidden_type ==
+-                  ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) {
++                  kt_effective_vec_dot_type((ggml_type)config_.up_type)) {
+             gate_input_ptr = up_input_ptr = (uint8_t*)input + i * config_.hidden_size *
+                                                                   ggml_type_size((ggml_type)config_.hidden_type) /
+                                                                   ggml_blck_size((ggml_type)config_.hidden_type);
+@@ -535,16 +566,16 @@ class LLAMA_MOE_TP {
+             to_float((uint8_t*)input + i * config_.hidden_size * ggml_type_size((ggml_type)config_.hidden_type) /
+                                            ggml_blck_size((ggml_type)config_.hidden_type),
+                      m_input_fp32_[i], config_.hidden_size, (ggml_type)config_.hidden_type);
+-            if (ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type ==
+-                ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) {
++            if (kt_effective_vec_dot_type((ggml_type)config_.gate_type) ==
++                kt_effective_vec_dot_type((ggml_type)config_.up_type)) {
+               from_float(m_input_fp32_[i], m_gate_input_[i], config_.hidden_size,
+-                         ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type);
++                         kt_effective_vec_dot_type((ggml_type)config_.gate_type));
+               gate_input_ptr = up_input_ptr = m_gate_input_[i];
+             } else {
+               if ((ggml_type)config_.hidden_type !=
+-                  ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type) {
++                  kt_effective_vec_dot_type((ggml_type)config_.gate_type)) {
+                 from_float(m_input_fp32_[i], m_gate_input_[i], config_.hidden_size,
+-                           ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type);
++                           kt_effective_vec_dot_type((ggml_type)config_.gate_type));
+                 gate_input_ptr = m_gate_input_[i];
+               } else {
+                 gate_input_ptr = (uint8_t*)input + i * config_.hidden_size *
+@@ -552,9 +583,9 @@ class LLAMA_MOE_TP {
+                                                        ggml_blck_size((ggml_type)config_.hidden_type);
+               }
+               if ((ggml_type)config_.hidden_type !=
+-                  ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) {
++                  kt_effective_vec_dot_type((ggml_type)config_.up_type)) {
+                 from_float(m_input_fp32_[i], m_up_input_[i], config_.hidden_size,
+-                           ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type);
++                           kt_effective_vec_dot_type((ggml_type)config_.up_type));
+                 up_input_ptr = m_up_input_[i];
+               } else {
+                 up_input_ptr = (uint8_t*)input + i * config_.hidden_size *
+@@ -569,20 +600,20 @@ class LLAMA_MOE_TP {
+             }
+             memcpy(m_local_gate_input_ptr_[expert_ids[i * k + j]] +
+                        m_local_pos_[i][j] * config_.hidden_size *
+-                           ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type) /
+-                           ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type),
++                           ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)) /
++                           ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)),
+                    gate_input_ptr,
+                    config_.hidden_size *
+-                       ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type) /
+-                       ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type));
++                       ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)) /
++                       ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.gate_type)));
+             memcpy(m_local_up_input_ptr_[expert_ids[i * k + j]] +
+                        m_local_pos_[i][j] * config_.hidden_size *
+-                           ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) /
+-                           ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type),
++                           ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)) /
++                           ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)),
+                    up_input_ptr,
+                    config_.hidden_size *
+-                       ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type) /
+-                       ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type));
++                       ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)) /
++                       ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.up_type)));
+           }
+         },
+         nullptr);
+@@ -623,7 +654,7 @@ class LLAMA_MOE_TP {
+                           config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_input_ptr,
+                           config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_output_ptr,
+                           config_.intermediate_size, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.gate_type,
+-                          ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type, GGML_TYPE_F32,
++                          kt_effective_vec_dot_type((ggml_type)config_.gate_type), GGML_TYPE_F32,
+                           GGML_PREC_DEFAULT);
+           void* up_input_ptr = m_local_up_input_ptr_[expert_idx];
+ 
+@@ -638,7 +669,7 @@ class LLAMA_MOE_TP {
+               up_proj_ptr, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_input_ptr,
+               config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_output_ptr,
+               config_.intermediate_size, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.up_type,
+-              ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
++              kt_effective_vec_dot_type((ggml_type)config_.up_type), GGML_TYPE_F32, GGML_PREC_DEFAULT);
+           for (int i = 0; i < m_local_num_[expert_idx]; i++) {
+             for (int j = ith * m_block; j < (ith + 1) * m_block; j++) {
+               m_local_intermediate_fp32_ptr_[expert_idx][i * config_.intermediate_size + j] =
+@@ -650,13 +681,13 @@ class LLAMA_MOE_TP {
+             void* down_input_ptr =
+                 m_local_down_input_ptr_[expert_idx] +
+                 i * config_.intermediate_size *
+-                    ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) /
+-                    ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) +
++                    ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) /
++                    ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) +
+                 ith * m_block *
+-                    ggml_type_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type) /
+-                    ggml_blck_size(ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type);
++                    ggml_type_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) /
++                    ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type));
+             from_float(intermediate_fp32_ptr, down_input_ptr, m_block,
+-                       ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type);
++                       kt_effective_vec_dot_type((ggml_type)config_.down_type));
+           }
+         },
+         nullptr);
+@@ -691,7 +722,7 @@ class LLAMA_MOE_TP {
+                           config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_input_ptr,
+                           config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_output_ptr,
+                           config_.hidden_size, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.down_type,
+-                          ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type, GGML_TYPE_F32,
++                          kt_effective_vec_dot_type((ggml_type)config_.down_type), GGML_TYPE_F32,
+                           GGML_PREC_DEFAULT);
+         },
+         nullptr);
+diff --git a/kt-kernel/python/experts_base.py b/kt-kernel/python/experts_base.py
+index d8fb657..877547f 100644
+--- a/kt-kernel/python/experts_base.py
++++ b/kt-kernel/python/experts_base.py
+@@ -18,6 +18,68 @@ import ctypes
+ from kt_kernel import kt_kernel_ext
+ 
+ 
++# -----------------------------------------------------------------------------
++# NPU stream-callback bypass.
++#
++# On Ascend NPU, `CPUInfer::submit_with_cuda_stream` calls `aclrtLaunchCallback`,
++# which inserts the function into a per-stream **callback report queue**. ACL
++# requires a dedicated subscriber thread (registered via `aclrtSubscribeReport`
++# and continuously running `aclrtProcessReport`) to dispatch those callbacks.
++#
++# kt-kernel does NOT currently start such a worker (see
++# `cpu_backend/vendors/ascend_npu.h` — marked TODO Phase 3). Without a
++# subscriber, queued callbacks **silently never fire**, so the CPU forward
++# task never runs and `output_cpu` stays all-zero. `sync_with_cuda_stream`
++# likewise schedules its sync_ via the same callback queue and silently
++# completes without actually syncing anything.
++#
++# Until a callback worker is implemented, we route NPU traffic through the
++# synchronous `CPUInfer::submit()` / `CPUInfer::sync()` API: these execute
++# the task body directly on the calling Python thread, so there is no
++# dependency on a callback worker. The trade-off is loss of CPU/NPU overlap
++# (forward is fully serialized), but correctness > overlap.
++# -----------------------------------------------------------------------------
++
++
++def _should_bypass_stream_callback(device: torch.device) -> bool:
++    """Return True iff we must use the synchronous submit/sync path."""
++    if device.type == "npu":
++        return True
++    if os.environ.get("KT_FORCE_SYNC_SUBMIT", "") == "1":
++        return True
++    return False
++
++
++def _wait_device(device: torch.device) -> None:
++    """Block until pending async copies on `device`'s current stream finish.
++
++    NOTE on graph capture: torch.{cuda,npu}.synchronize() raises during cuda /
++    NPU graph capture (NPU returns ERR 107027 "stream is captured"). Bypass
++    mode runs the CPU forward on the Python main thread, which is **not**
++    captured into the graph anyway, so the sync would only be needed at
++    *capture time*; once the graph is replayed, the CPU function never runs.
++    In other words, bypass mode is fundamentally incompatible with cuda-graph
++    capture (TODO Phase 3 — implement ACL callback subscriber to unblock the
++    async path). Until then we just skip the sync during capture so that the
++    capture step itself doesn't crash; the caller is expected to use
++    ``--disable-cuda-graph`` for actually correct end-to-end runs.
++    """
++    if device.type == "npu":
++        try:
++            if torch.npu.is_current_stream_capturing():
++                return
++        except Exception:
++            pass
++        torch.npu.synchronize(device)
++    elif device.type == "cuda":
++        try:
++            if torch.cuda.is_current_stream_capturing():
++                return
++        except Exception:
++            pass
++        torch.cuda.synchronize(device)
++
++
+ def generate_gpu_experts_masks(
+     activation_freq: torch.Tensor,
+     num_gpu_experts: int,
+@@ -417,35 +479,46 @@ class BaseMoEWrapper(_MoEBase, ABC):
+         weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
+         immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
+ 
++        bypass = _should_bypass_stream_callback(hidden_states.device)
++        if bypass:
++            # CPU task is about to run on this thread; D2H copies above are
++            # non_blocking on the device's current stream and must finish first
++            # or workers will read stale (or zero) input.
++            _wait_device(hidden_states.device)
++
+         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+-        self.cpu_infer.submit_with_cuda_stream(
+-            cuda_stream,
+-            self.moe.forward_task(
+-                bsz_slot_tensor.data_ptr(),
+-                immediate_experts_ids_cpu[current_slot].size(-1),
+-                immediate_experts_ids_cpu[current_slot].data_ptr(),
+-                weights_cpu[current_slot].data_ptr(),
+-                input_tensor_cpu[current_slot].data_ptr(),
+-                output_cpu[current_slot].data_ptr(),
+-                incremental,
+-            ),
++        immediate_task = self.moe.forward_task(
++            bsz_slot_tensor.data_ptr(),
++            immediate_experts_ids_cpu[current_slot].size(-1),
++            immediate_experts_ids_cpu[current_slot].data_ptr(),
++            weights_cpu[current_slot].data_ptr(),
++            input_tensor_cpu[current_slot].data_ptr(),
++            output_cpu[current_slot].data_ptr(),
++            incremental,
+         )
++        if bypass:
++            self.cpu_infer.submit(immediate_task)
++        else:
++            self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
+ 
+         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+         if deferred_ids is not None:
+             deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
+-            self.cpu_infer.submit_with_cuda_stream(
+-                cuda_stream,
+-                self.moe.forward_task(
+-                    bsz_slot_tensor.data_ptr(),
+-                    deferred_experts_ids_cpu[current_slot].size(-1),
+-                    deferred_experts_ids_cpu[current_slot].data_ptr(),
+-                    weights_cpu[current_slot].data_ptr(),
+-                    input_tensor_cpu[current_slot].data_ptr(),
+-                    output_cpu[next_slot].data_ptr(),
+-                    False,
+-                ),
++            if bypass:
++                _wait_device(hidden_states.device)
++            deferred_task = self.moe.forward_task(
++                bsz_slot_tensor.data_ptr(),
++                deferred_experts_ids_cpu[current_slot].size(-1),
++                deferred_experts_ids_cpu[current_slot].data_ptr(),
++                weights_cpu[current_slot].data_ptr(),
++                input_tensor_cpu[current_slot].data_ptr(),
++                output_cpu[next_slot].data_ptr(),
++                False,
+             )
++            if bypass:
++                self.cpu_infer.submit(deferred_task)
++            else:
++                self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
+             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
+ 
+     def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
+@@ -472,7 +545,32 @@ class BaseMoEWrapper(_MoEBase, ABC):
+ 
+         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
+-        self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
++        bypass = _should_bypass_stream_callback(hidden_states.device)
++        if bypass:
++            self.cpu_infer.sync(allow_pending)
++        else:
++            self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
++
++        if os.environ.get("KT_DEBUG_MOE_OUT", "") == "1":
++            oc = output_cpu[current_slot]
++            ic = _input_tensor_cpu[current_slot]
++            wc = _weights_cpu[current_slot]
++            ec = _immediate_experts_ids_cpu[current_slot]
++            finite_oc = torch.isfinite(oc).all().item()
++            finite_ic = torch.isfinite(ic).all().item()
++            finite_wc = torch.isfinite(wc).all().item()
++            nan_count = int(torch.isnan(oc).sum().item())
++            inf_count = int(torch.isinf(oc).sum().item())
++            print(
++                f"[KT_DEBUG] layer={self.layer_idx} slot={current_slot} bypass={bypass} "
++                f"output_cpu: finite={finite_oc} nan={nan_count}/{oc.numel()} inf={inf_count} "
++                f"first16={oc.float().flatten()[:16].tolist()} | "
++                f"input_cpu.finite={finite_ic} first8={ic.float().flatten()[:8].tolist()} | "
++                f"weights_cpu.finite={finite_wc} first={wc.flatten()[:8].tolist()} | "
++                f"expert_ids={ec.flatten()[:12].tolist()}",
++                flush=True,
++            )
++
+         output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+         return output_gpu[current_slot]
+ 
+diff --git a/kt-kernel/python/utils/llamafile.py b/kt-kernel/python/utils/llamafile.py
+index 330aaeb..5ed9966 100644
+--- a/kt-kernel/python/utils/llamafile.py
++++ b/kt-kernel/python/utils/llamafile.py
+@@ -209,8 +209,24 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
+         # Llamafile-specific configuration
+         moe_config.m_block = 32  # Parallel block size
+         moe_config.group_min_len = 10  # Use forward_one when qlen < 10
+-        moe_config.max_len = self.chunked_prefill_size
+-        moe_config.group_max_len = max(1, int(self.chunked_prefill_size))
++        # Defensive fallback: chunked_prefill_size <= 0 (e.g. -1 meaning "disabled" in sglang
++        # baseline) would otherwise let C++ compute max_possible_qlen() = max(max_len=-1,
++        # group_max_len=max(1,-1)=1) = 1, sizing per-NUMA fp32 output buffer
++        # (moe-tp.hpp:130 local_output_numa[i]) to a single token. The very first prefill
++        # with qlen > 1 then overruns the buffer and corrupts glibc tcache metadata
++        # (observed as "malloc(): unaligned tcache chunk detected" Fatal Python error).
++        # Clamp to a safe positive value so KT can always alloc a fp32 buffer at least as
++        # large as the per-call qlen the caller will pass.
++        _effective_chunk = int(self.chunked_prefill_size)
++        if _effective_chunk <= 0:
++            _effective_chunk = 2048
++            print(
++                f"[LlamafileMoEWrapper] chunked_prefill_size={self.chunked_prefill_size} "
++                f"<= 0 is unsafe for KT MoE C++ buffer sizing; falling back to "
++                f"{_effective_chunk}."
++            )
++        moe_config.max_len = _effective_chunk
++        moe_config.group_max_len = _effective_chunk
+ 
+         # Set weight pointers
+         moe_config.gate_proj = gate_data.data_ptr()
+diff --git a/third_party/sglang b/third_party/sglang
+index 0ddd0e1..c99920a 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit 0ddd0e12d2fbbb3d36d18aeeaeb55b896193bff8
++Subproject commit c99920aeedec5ba39b43978557524b3be01ca10c
+diff --git a/tools/batch_convert_w8a8_layers_mp.py b/tools/batch_convert_w8a8_layers_mp.py
+index 361e883..0f3d90d 100644
+--- a/tools/batch_convert_w8a8_layers_mp.py
++++ b/tools/batch_convert_w8a8_layers_mp.py
+@@ -4,19 +4,37 @@
+ 
+ - 层间并行：使用 ProcessPoolExecutor，每个 worker 子进程调用
+   `convert_w8a8_to_gguf_q8_0.py` 处理一层（避免在父进程里重复占内存）。
+-- 默认输出：`{output_dir}/dsv4_layer{L}.gguf`
++- 输出文件名：``{output_dir}/{name_prefix}{L}{name_suffix}.gguf``。
++  - ``--quant q8_0``（默认）：name_suffix 默认 ``""``，与历史路径兼容
++    （``dsv4_layer3.gguf``）。
++  - ``--quant bf16``：name_suffix 默认 ``_bf16``，例如 ``dsv4_layer3_bf16.gguf``，
++    便于与同层 Q8_0 共存。
+ - 全部完成后可选抽样用 GGUFReader 校验（兼容 NumPy 2）。
+ 
+-示例::
++示例 — Q8_0 全量::
+ 
+   /usr/local/python3.11.14/bin/python3 tools/batch_convert_w8a8_layers_mp.py \\
+     --input /workspace/models/DeepSeek-V4-Flash-W8A8 \\
+     --output-dir /workspace/models/cache \\
+     --layer-start 0 --layer-end 42 \\
++    --quant q8_0 \\
+     --jobs 4 \\
+     --verify-sample 3
+ 
+-注意：每层约 6.85GB；`--jobs` 过大易打满内存与磁盘带宽，建议 2～8。
++示例 — BF16 全量（aarch64 上 Q8_0 仍 NaN 时走的路径，见 Handoff 附录 Z）::
++
++  /usr/local/python3.11.14/bin/python3 tools/batch_convert_w8a8_layers_mp.py \\
++    --input /workspace/models/DeepSeek-V4-Flash-W8A8 \\
++    --output-dir /workspace/models/cache_bf16 \\
++    --layer-start 0 --layer-end 42 \\
++    --quant bf16 \\
++    --jobs 2 \\
++    --verify-sample 3
++
++容量参考（W8A8 -> GGUF，per layer，DSv4-Flash 256 experts × 4096H × 2048I）：
++  - Q8_0  : 6.85 GiB / layer ×43 = ~295 GiB
++  - BF16  : 12.9 GiB / layer ×43 = ~555 GiB  ← 注意磁盘
++注意：每层 BF16 ~12.9 GB；``--jobs`` 过大易打满内存与磁盘带宽，建议 2～4。
+ """
+ 
+ from __future__ import annotations
+@@ -46,6 +64,7 @@ def _run_one_layer(
+     expert_batch: int,
+     hidden_size: int,
+     moe_intermediate_size: int,
++    quant: str,
+ ) -> tuple[int, int, str]:
+     """子进程入口：跑单层转换。返回 (layer_idx, returncode, tail_log)."""
+     script = str(_convert_script())
+@@ -66,8 +85,15 @@ def _run_one_layer(
+         str(hidden_size),
+         "--moe-intermediate-size",
+         str(moe_intermediate_size),
++        "--quant",
++        quant,
+     ]
+-    proc = subprocess.run(cmd, capture_output=True, text=True)
++    # convert_w8a8_to_gguf_q8_0.py 用 TORCH_DEVICE_BACKEND_AUTOLOAD=0 可绕开 torch_npu
++    # 自加载（与 npu 卡无关），加速纯 numpy/torch CPU 转换；批量场景下默认打开。
++    import os as _os
++    env = _os.environ.copy()
++    env.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
++    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+     tail = ""
+     if proc.stdout:
+         tail += proc.stdout[-4000:]
+@@ -111,11 +137,40 @@ def main() -> int:
+     ap.add_argument("--hidden-size", type=int, default=4096)
+     ap.add_argument("--moe-intermediate-size", type=int, default=2048)
+     ap.add_argument("--name-prefix", type=str, default="dsv4_layer", help="输出文件名前缀")
+-    ap.add_argument("--skip-existing", action="store_true", help="若目标 gguf 已存在且 >1GiB 则跳过")
++    ap.add_argument(
++        "--name-suffix",
++        type=str,
++        default=None,
++        help=(
++            "输出文件名后缀（不含 .gguf）。默认按 --quant 自动选：q8_0 -> ''，"
++            "bf16 -> '_bf16'。手动传入可覆盖。"
++        ),
++    )
++    ap.add_argument(
++        "--quant",
++        type=str,
++        default="q8_0",
++        choices=["q8_0", "bf16"],
++        help=(
++            "Output element type, passthrough to convert_w8a8_to_gguf_q8_0.py。"
++            "q8_0 容量小 ~6.85 GiB/layer，但 aarch64 ARM_NEON 走 tinyBLAS_Q0_ARM 当前 NaN（见 Handoff 附录 Z.5）；"
++            "bf16 容量 12.9 GiB/layer，aarch64 走 BF16×F32 tinyBLAS path（已修复 Z.2 + Z.4），数值健全。"
++        ),
++    )
++    ap.add_argument(
++        "--skip-existing",
++        action="store_true",
++        help="若目标 gguf 已存在且 >1GiB 则跳过（按 quant 容量判定的最小阈值）",
++    )
+     ap.add_argument("--verify-sample", type=int, default=3, help="结束后随机抽样验证的层数；0 关闭")
+     ap.add_argument("--seed", type=int, default=42, help="抽样随机种子")
+     args = ap.parse_args()
+ 
++    if args.name_suffix is None:
++        args.name_suffix = "" if args.quant == "q8_0" else f"_{args.quant}"
++    # Skip threshold: BF16 ~12 GiB, Q8_0 ~6 GiB；用 1 GiB 已经足够区分 "完整 vs 半成品"
++    min_skip_bytes = 1 << 30
++
+     model_dir = args.input.expanduser().resolve()
+     out_dir = args.output_dir.expanduser().resolve()
+     if not model_dir.is_dir():
+@@ -136,8 +191,8 @@ def main() -> int:
+ 
+     tasks: list[tuple] = []
+     for lid in layers:
+-        outp = out_dir / f"{args.name_prefix}{lid}.gguf"
+-        if args.skip_existing and outp.is_file() and outp.stat().st_size > (1 << 30):
++        outp = out_dir / f"{args.name_prefix}{lid}{args.name_suffix}.gguf"
++        if args.skip_existing and outp.is_file() and outp.stat().st_size > min_skip_bytes:
+             print(f"[batch] skip existing {outp.name}")
+             continue
+         tasks.append(
+@@ -150,6 +205,7 @@ def main() -> int:
+                 args.expert_batch,
+                 args.hidden_size,
+                 args.moe_intermediate_size,
++                args.quant,
+             )
+         )
+ 
+@@ -187,7 +243,9 @@ def main() -> int:
+         rnd = random.Random(args.seed)
+         k = min(args.verify_sample, len(done_layers))
+         sample = sorted(rnd.sample(done_layers, k)) if k > 0 else []
+-        paths = [out_dir / f"{args.name_prefix}{lid}.gguf" for lid in sample]
++        paths = [
++            out_dir / f"{args.name_prefix}{lid}{args.name_suffix}.gguf" for lid in sample
++        ]
+         print(f"[batch] verify-sample k={k} layers={sample}")
+         _verify_sample_paths(paths)
+ 
+diff --git a/tools/convert_w8a8_to_gguf_q8_0.py b/tools/convert_w8a8_to_gguf_q8_0.py
+index 852d670..126cc21 100644
+--- a/tools/convert_w8a8_to_gguf_q8_0.py
++++ b/tools/convert_w8a8_to_gguf_q8_0.py
+@@ -108,7 +108,25 @@ def _open_shard(model_dir: Path, weight_map: dict[str, str], cache: dict[str, ob
+     return cache[shard]
+ 
+ 
+-def _build_q80_moe_tensor(
++def _fp32_to_bf16_ndarray(arr_fp32: np.ndarray) -> np.ndarray:
++    """np.float32 ndarray -> bf16 ndarray (uint16, same shape).
++
++    Bit pattern matches ggml ggml_compute_fp32_to_bf16 (round-to-nearest-even).
++    Caller hands the uint16 ndarray to gguf.GGUFWriter.add_tensor(..., raw_dtype=BF16);
++    writer uses tensor.shape as logical shape and 2 bytes/elem as type size.
++    """
++    if arr_fp32.dtype != np.float32:
++        raise TypeError(f"expected np.float32, got {arr_fp32.dtype}")
++    if not arr_fp32.flags["C_CONTIGUOUS"]:
++        arr_fp32 = np.ascontiguousarray(arr_fp32)
++    u32 = arr_fp32.view(np.uint32)
++    bias = (u32 >> 16) & 1
++    rounded = (u32 + 0x7FFF + bias).astype(np.uint32)
++    bf16 = (rounded >> 16).astype(np.uint16)
++    return bf16
++
++
++def _build_moe_tensor(
+     model_dir: Path,
+     weight_map: dict[str, str],
+     experts_prefix: str,
+@@ -116,11 +134,29 @@ def _build_q80_moe_tensor(
+     num_experts: int,
+     expert_batch: int,
+     layout: str,
+-) -> np.ndarray:
++    quant: str,
++) -> tuple[np.ndarray, "gguf.GGMLQuantizationType"]:
+     """
+     layout:
+-      'gate_up' — safetensors (n_ff, n_embd) per expert -> ggml (n_embd, n_ff, E)
+-      'down'    — safetensors (n_embd, n_ff) per expert -> ggml (n_ff, n_embd, E)
++      'gate_up' — safetensors (n_ff, n_embd) per expert -> numpy (E, n_ff, n_embd)
++                  i.e. ggml ne = (n_embd, n_ff, E) with hidden innermost
++      'down'    — safetensors (n_embd, n_ff) per expert -> numpy (E, n_embd, n_ff)
++                  i.e. ggml ne = (n_ff, n_embd, E) with intermediate innermost
++    quant: 'q8_0' | 'bf16'
++
++    KT C++ ``LLAMA_MOE_TP::forward_one`` uses pointer arithmetic that assumes:
++      - gate/up per-expert layout (intermediate, hidden) row-major, hidden inner
++      - down  per-expert layout (hidden,  intermediate) row-major, intermediate inner
++
++    Q8_0 quantizes along the **last numpy dim**, so the last dim must be the
++    one we want as the GEMM K (the inner dim of each row in KT's view):
++      - gate/up: last numpy dim = hidden (4096, %32==0 ✓)
++      - down:    last numpy dim = intermediate (2048, %32==0 ✓)
++
++    A previous version of this script applied ``permute(2,1,0)`` which placed E
++    as the innermost dim. That broke KT's pointer math (each expert's bytes
++    were no longer contiguous) and caused: Q8_0 -> NaN, BF16 -> finite but
++    cosine ~ 0 vs reference. See doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md.
+     """
+     cache: dict[str, object] = {}
+     chunks: list[np.ndarray] = []
+@@ -135,25 +171,47 @@ def _build_q80_moe_tensor(
+             w = _dequant_int8(h.get_tensor(wk), h.get_tensor(sk))
+             tensors.append(w)
+ 
+-        stacked = torch.stack(tensors, dim=0)
++        stacked = torch.stack(tensors, dim=0).contiguous()
+         del tensors
+ 
+         if layout == "gate_up":
+-            # (E, n_ff, n_embd) -> (n_embd, n_ff, E)
+-            x = stacked.permute(2, 1, 0).contiguous()
++            # safetensors per-expert (intermediate, hidden) is exactly KT's
++            # expected per-expert layout. Stacked (E, intermediate, hidden) is
++            # C-contiguous with hidden inner — what KT and Q8_0 both want.
++            x = stacked
+         elif layout == "down":
+-            # (E, n_embd, n_ff) -> (n_ff, n_embd, E)
+-            x = stacked.permute(2, 1, 0).contiguous()
++            # safetensors per-expert (hidden, intermediate). Stacked
++            # (E, hidden, intermediate) is C-contiguous with intermediate inner
++            # — exactly KT's down-proj layout and Q8_0's row direction.
++            x = stacked
+         else:
+             raise ValueError(layout)
+ 
+         arr = x.numpy().astype(np.float32)
+         del stacked, x
+-        if not gguf.can_quantize_to_q8_0(arr):
+-            raise ValueError(f"Q8_0 requires last dim % 32 == 0, got shape {arr.shape}")
+-        chunks.append(gguf.quantize_q8_0(arr))
+ 
+-    return np.concatenate(chunks, axis=-1)
++        if quant == "q8_0":
++            if not gguf.can_quantize_to_q8_0(arr):
++                raise ValueError(f"Q8_0 requires last dim % 32 == 0, got shape {arr.shape}")
++            chunks.append(gguf.quantize_q8_0(arr))
++        elif quant == "bf16":
++            # Same shape as fp32, dtype uint16 (raw bf16 bit pattern); concat along E axis below.
++            chunks.append(_fp32_to_bf16_ndarray(arr))
++        else:
++            raise ValueError(quant)
++
++    # Experts are batched along axis 0 (outer, slowest dim) now that
++    # `_build_moe_tensor` keeps numpy layout as (E, ...). Concat along axis 0.
++    out = np.concatenate(chunks, axis=0)
++    if quant == "q8_0":
++        return out, gguf.GGMLQuantizationType.Q8_0
++    return out, gguf.GGMLQuantizationType.BF16
++
++
++# Backward compat — keep the old name so other batch tools still import.
++def _build_q80_moe_tensor(*args, **kwargs):
++    arr, _ = _build_moe_tensor(*args, quant="q8_0", **kwargs)
++    return arr
+ 
+ 
+ def convert_layer(
+@@ -164,11 +222,15 @@ def convert_layer(
+     expert_batch: int,
+     hidden_size: int,
+     moe_intermediate_size: int,
++    quant: str = "q8_0",
+ ) -> None:
++    if quant not in ("q8_0", "bf16"):
++        raise ValueError(f"--quant must be one of q8_0|bf16, got {quant!r}")
++
+     weight_map = _load_weight_map(model_dir)
+     experts_prefix, (gate_n, up_n, down_n) = _detect_experts_uri(weight_map, layer_idx)
+ 
+-    if num_experts % 32 != 0:
++    if quant == "q8_0" and num_experts % 32 != 0:
+         raise ValueError(f"num_experts ({num_experts}) must be a multiple of 32 for Q8_0 blocks along expert axis")
+ 
+     # Smoke keys
+@@ -176,37 +238,40 @@ def convert_layer(
+     if probe not in weight_map:
+         raise KeyError(f"Missing {probe!r}")
+ 
+-    print(f"[convert] layer={layer_idx} experts_prefix={experts_prefix!r} proj=({gate_n},{up_n},{down_n})")
++    print(f"[convert] layer={layer_idx} experts_prefix={experts_prefix!r} proj=({gate_n},{up_n},{down_n}) quant={quant}")
+ 
+-    gate_q = _build_q80_moe_tensor(
+-        model_dir, weight_map, experts_prefix, gate_n, num_experts, expert_batch, "gate_up"
++    gate_arr, ggml_type = _build_moe_tensor(
++        model_dir, weight_map, experts_prefix, gate_n, num_experts, expert_batch, "gate_up", quant=quant
+     )
+-    print(f"[convert] gate_q shape (bytes) {gate_q.shape} dtype={gate_q.dtype}")
++    print(f"[convert] gate shape {gate_arr.shape} dtype={gate_arr.dtype} ggml_type={ggml_type}")
+ 
+-    up_q = _build_q80_moe_tensor(
+-        model_dir, weight_map, experts_prefix, up_n, num_experts, expert_batch, "gate_up"
++    up_arr, _ = _build_moe_tensor(
++        model_dir, weight_map, experts_prefix, up_n, num_experts, expert_batch, "gate_up", quant=quant
+     )
+-    print(f"[convert] up_q shape (bytes) {up_q.shape} dtype={up_q.dtype}")
++    print(f"[convert] up   shape {up_arr.shape} dtype={up_arr.dtype}")
+ 
+-    down_q = _build_q80_moe_tensor(
+-        model_dir, weight_map, experts_prefix, down_n, num_experts, expert_batch, "down"
++    down_arr, _ = _build_moe_tensor(
++        model_dir, weight_map, experts_prefix, down_n, num_experts, expert_batch, "down", quant=quant
+     )
+-    print(f"[convert] down_q shape (bytes) {down_q.shape} dtype={down_q.dtype}")
++    print(f"[convert] down shape {down_arr.shape} dtype={down_arr.dtype}")
+ 
+     arch = "deepseek2"
+     writer = gguf.GGUFWriter(str(output_path), arch)
+     writer.add_quantization_version(2)
+-    writer.add_file_type(gguf.LlamaFileType.MOSTLY_Q8_0)
+-    writer.add_name(f"dsv4-w8a8-layer{layer_idx}-moe-q8_0")
++    if quant == "q8_0":
++        writer.add_file_type(gguf.LlamaFileType.MOSTLY_Q8_0)
++    else:
++        writer.add_file_type(gguf.LlamaFileType.MOSTLY_BF16)
++    writer.add_name(f"dsv4-w8a8-layer{layer_idx}-moe-{quant}")
+     writer.add_uint32(gguf.Keys.LLM.EXPERT_COUNT.format(arch=arch), num_experts)
+     writer.add_uint32(gguf.Keys.LLM.EXPERT_USED_COUNT.format(arch=arch), 6)
+     writer.add_uint32(gguf.Keys.LLM.EMBEDDING_LENGTH.format(arch=arch), hidden_size)
+     writer.add_uint32(gguf.Keys.LLM.EXPERT_FEED_FORWARD_LENGTH.format(arch=arch), moe_intermediate_size)
+ 
+     base = f"blk.{layer_idx}"
+-    writer.add_tensor(f"{base}.ffn_gate_exps.weight", gate_q, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+-    writer.add_tensor(f"{base}.ffn_up_exps.weight", up_q, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+-    writer.add_tensor(f"{base}.ffn_down_exps.weight", down_q, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
++    writer.add_tensor(f"{base}.ffn_gate_exps.weight", gate_arr, raw_dtype=ggml_type)
++    writer.add_tensor(f"{base}.ffn_up_exps.weight", up_arr, raw_dtype=ggml_type)
++    writer.add_tensor(f"{base}.ffn_down_exps.weight", down_arr, raw_dtype=ggml_type)
+ 
+     output_path.parent.mkdir(parents=True, exist_ok=True)
+     if output_path.exists():
+@@ -238,6 +303,13 @@ def main() -> None:
+     ap.add_argument("--expert-batch", type=int, default=32, help="Experts per FP32 batch before Q8_0")
+     ap.add_argument("--hidden-size", type=int, default=4096)
+     ap.add_argument("--moe-intermediate-size", type=int, default=2048)
++    ap.add_argument(
++        "--quant",
++        type=str,
++        default="q8_0",
++        choices=["q8_0", "bf16"],
++        help="Output element type: q8_0 (default, prod path) or bf16 (debug fallback for aarch64 Q8_0-NaN bug)",
++    )
+     ap.add_argument("--verify-reader", action="store_true", help="Print tensor table after write")
+     args = ap.parse_args()
+ 
+@@ -253,6 +325,7 @@ def main() -> None:
+         expert_batch=args.expert_batch,
+         hidden_size=args.hidden_size,
+         moe_intermediate_size=args.moe_intermediate_size,
++        quant=args.quant,
+     )
+ 
+     if args.verify_reader:

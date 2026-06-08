@@ -1,0 +1,1518 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: continuation (part 4/4)
+
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_small_kernels.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_small_kernels.c
+new file mode 100644
+index 0000000..d36be76
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_small_kernels.c
+@@ -0,0 +1,158 @@
++#include <stdint.h>
++#include <math.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include "integer_gemm_kernels.h"
++#include "helping_macros.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++
++#if defined(OC_FIX)
++    #define OC_TYPE f
++    #define OC_IDX(mi, nn) 0
++#elif defined(OC_COL)
++    #define OC_TYPE c
++    #define OC_IDX(mi, ni) mi
++#else // OC_ROW
++    #define OC_TYPE r
++    #define OC_IDX(mi, ni) ni
++#endif // OC_T
++
++#if defined(TRANSA)
++    #if defined TRANSB
++        #define ADD_SUFFIX(name) ADD_TRANSP_MACRO(name, t, t, OC_TYPE)
++    #elif defined(NOTRANSB)
++        #define ADD_SUFFIX(name) ADD_TRANSP_MACRO(name, t, n, OC_TYPE)
++    #else
++        #error "Neither TRANSB or NOTRANSB is defined"
++    #endif
++#elif defined(NOTRANSA)
++    #if defined TRANSB
++        #define ADD_SUFFIX(name) ADD_TRANSP_MACRO(name, n, t, OC_TYPE)
++    #elif defined(NOTRANSB)
++        #define ADD_SUFFIX(name) ADD_TRANSP_MACRO(name, n, n, OC_TYPE)
++    #else
++        #error "Neither TRANSB or NOTRANSB is defined"
++    #endif
++#else
++    #error "Neither TRANSA or NOTRANSA is defined"
++#endif
++
++#if (defined (LHS_INT) && defined(RHS_INT)) || (defined (LHS_UINT) && defined(RHS_UINT))
++    #define COMPUTE_DOT_TYPED(out, in1, in2, lhs_type, rhs_type) #lhs_type "dot " #out ".s, " #in1 ".b, " #in2 ".b\n"
++#else
++    #if defined(LHS_INT)
++        #define COMPUTE_DOT_TYPED(out, in1, in2, lhs_type, rhs_type) "usdot " #out ".s, " #in2 ".b," #in1 ".b\n"
++    #else // LHS_UINT
++        #define COMPUTE_DOT_TYPED(out, in1, in2, lhs_type, rhs_type) "usdot " #out ".s, " #in1 ".b," #in2 ".b\n"
++    #endif // LHS_INT
++#endif // LHS_INT
++
++#define COMPUTE_DOT_TYPED_MACRO(out, in1, in2, LHS_TYPE, RHS_TYPE) COMPUTE_DOT_TYPED(out, in1, in2, LHS_TYPE, RHS_TYPE)
++#define COMPUTE_DOT(out, in1, in2) COMPUTE_DOT_TYPED_MACRO(out, in1, in2, LHS_TYPE, RHS_TYPE)
++
++static inline double compute_dot(size_t k, const void *a, const BLASINT8* oa, 
++            const void *b, const BLASINT8* ob, int64_t sv_len) {
++    int32_t accum = 0;
++    int64_t run_k_depth = k;
++    int64_t run_sv_len = sv_len;
++    const void* lhs_ptr = a;
++    const void* rhs_ptr = b;
++    asm volatile(
++        "dup z4.s, #0\n"
++        "ptrue p0.b, all\n"
++        "ld1b {z0.b}, p0/z, [%[oa]]\n"
++        "ld1b {z1.b}, p0/z, [%[ob]]\n"
++        "1:\n"
++            "whilelt p1.b, xzr, %[run_k_depth]\n"
++            "ld1b {z2.b}, p1/z, [%[lhs_ptr]]\n"
++            "ld1b {z3.b}, p1/z, [%[rhs_ptr]]\n"
++            "add z2.b, p1/m, z2.b, z0.b\n"
++            "add z3.b, p1/m, z3.b, z1.b\n"
++            "add %[lhs_ptr], %[lhs_ptr], %[run_sv_len]\n"
++            "add %[rhs_ptr], %[rhs_ptr], %[run_sv_len]\n"
++            COMPUTE_DOT(z4, z2, z3)
++            "subs %[run_k_depth], %[run_k_depth], #1\n"
++        "bgt 1b\n"
++        "ptrue p2.s, all\n"
++        "saddv d1, p2, z4.s\n"
++        "fmov x2, d1\n"
++        "add %[accum], %[accum], x2\n"
++        : // outputs
++        [lhs_ptr] "+r"(lhs_ptr), [rhs_ptr] "+r"(rhs_ptr),
++        [run_k_depth] "+wr"(run_k_depth),
++        [accum] "+wr"(accum)
++            : // inputs
++            [run_sv_len] "r"(run_sv_len), [oa] "r"(oa), [ob] "r"(ob)
++            : // clobbers
++            "cc", "memory",
++            "d1", "x2",
++            "z0", "z1", "z2", "z3", "z4", "p0", "p1", "p2"
++        );
++    return (double) accum;
++}
++
++#if !defined(TRANSA) || defined(TRANSB)
++// performs transposition (n0 * n1) -> (n1 * n0) assuming col major
++static inline void simplest_transpose(const void *in, void *out, size_t n0, size_t ld0, size_t n1) {
++    // since we care only about size, we can use signed type always
++    BLASINT8* typed_in = (BLASINT8*) in;
++    BLASINT8* typed_out = (BLASINT8*) out;
++    for (size_t i = 0; i < n1; ++i) {
++        for (size_t j = 0; j < n0; ++j) {
++            typed_out[i + j * n1] = typed_in[j + i * ld0];
++        }
++    }
++}
++#endif // !defined(TRANSA) || defined(TRANSB)
++
++// A in row-major, B in col-major
++void ADD_SUFFIX(small_kernel)(const size_t m, const size_t n, const size_t k, const float alpha,
++                             const void *a, const size_t lda, const BLASINT8 oa,
++                             const void *b, const size_t ldb, const BLASINT8 ob,
++                             const float beta, int32_t *c, const size_t ldc, const int32_t *oc) {
++    double double_alpha = (double) alpha;
++    // we use typed pointers only for indexing, so we don't care about signess
++#ifdef TRANSA
++    BLASINT8* a_typed = (BLASINT8*) a;
++    const size_t used_lda = lda;
++#else
++    BLASINT8* a_typed = (BLASINT8*) aligned_alloc(128, sizeof(BLASINT8) * m * k);
++    simplest_transpose(a, a_typed, m, lda, k);
++    const size_t used_lda = k;
++#endif // TRANSA
++#ifndef TRANSB
++    BLASINT8* b_typed = (BLASINT8*) b;
++    const size_t used_ldb = ldb;
++#else // TRANSB
++    BLASINT8* b_typed = (BLASINT8*) aligned_alloc(128, sizeof(BLASINT8) * k * n);
++    simplest_transpose(b, b_typed, n, ldb, k);
++    const size_t used_ldb = k;
++#endif // TRANSB
++    BLASINT8 oa_buf[KERNEL_K_STEP];
++    BLASINT8 ob_buf[KERNEL_K_STEP];
++    for (size_t i = 0; i < KERNEL_K_STEP; ++i) {
++        oa_buf[i] = oa;
++        ob_buf[i] = ob;
++    }
++    // printf("\n========\n");
++    for (size_t mi = 0; mi < m; ++mi) {
++        for (size_t ni = 0; ni < n; ++ni) {
++            // printf("mi = %lu, ni = %lu, oc_idx = %lu\n", mi, ni, OC_IDX(mi, ni));
++            double tmp = compute_dot(k, a_typed + mi * used_lda, oa_buf, b_typed + ni * used_ldb, ob_buf, KERNEL_K_STEP);
++            c[mi + ni * ldc] = round(tmp * double_alpha + ((double)(beta * ((float)c[mi + ni * ldc]) + oc[OC_IDX(mi, ni)])));
++        }
++    }
++#ifdef TRANSA
++    free(a_typed);
++#endif // TRANSA
++#ifdef TRANSB
++    free(b_typed);
++#endif // TRANSB
++}
++
++#ifdef __cplusplus
++} // extern "C"
++#endif /* __cplusplus */
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_pack_a_kernels.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_pack_a_kernels.c
+new file mode 100644
+index 0000000..0df2b38
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_pack_a_kernels.c
+@@ -0,0 +1,140 @@
++#include <stdint.h>
++#include "integer_gemm_kernels.h"
++#include "helping_macros.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++
++#if defined(TRANSA)
++    // row major
++    #define INDEXING_A(row_idx, col_idx, lda) ((col_idx) * (lda) + row_idx)
++    #define ADD_A_SUFF(name) ADD_PACK_A_T_SUFF(name)
++#elif defined(NOTRANSA)
++    // col major
++    #define INDEXING_A(row_idx, col_idx, lda) ((row_idx) * (lda) + col_idx)
++    #define ADD_A_SUFF(name) ADD_PACK_A_N_SUFF(name)
++#else
++    #error "Neither TRANSA or NOTRANSA is defined"
++#endif
++
++#define OLD_N_SIZE 8
++#define NEW_N_SIZE 4
++
++void ADD_A_SUFF(pack_a)(void* bufferA, const void* curr_a_ptr, size_t m_block_size, size_t k_block_size, size_t lda, const BLASINT8 oa) {
++    LHS_INT_TYPE* bufferA_typed = (LHS_INT_TYPE*) bufferA;
++    LHS_INT_TYPE* curr_a_ptr_typed = (LHS_INT_TYPE*) curr_a_ptr;
++
++    // printf("m_block_size:%lu ,k_block_size: %lu\n", m_block_size, k_block_size);
++
++    for(size_t old_split_n = 0; old_split_n < (m_block_size / OLD_N_SIZE); old_split_n++) {
++        for(size_t split_k = 0; split_k < (k_block_size / (KERNEL_K_STEP * 2)); split_k++) {
++            for(size_t old_idx_n = 0; old_idx_n < OLD_N_SIZE; old_idx_n++) {
++                for(size_t idx_k = 0; idx_k < KERNEL_K_STEP; idx_k++) {
++                    size_t n_idx = old_split_n * OLD_N_SIZE + old_idx_n;
++                    size_t new_split_n = n_idx / NEW_N_SIZE;
++                    size_t new_idx_n   = n_idx % NEW_N_SIZE;
++
++                    size_t old_buff_idx = 
++                        old_split_n * OLD_N_SIZE * (lda / 2) +
++                        split_k * OLD_N_SIZE * KERNEL_K_STEP +
++                        old_idx_n * KERNEL_K_STEP +
++                        idx_k;
++                    
++                    uint8_t b01 = curr_a_ptr_typed[old_buff_idx];
++                    uint8_t b0  = b01 & 0xF0;
++                    uint8_t b1  = b01 << 4;
++ 
++                    size_t new_buff_idx = 
++                        new_split_n * NEW_N_SIZE * k_block_size +
++                        split_k * NEW_N_SIZE * (KERNEL_K_STEP * 2) +
++                        new_idx_n * KERNEL_K_STEP +
++                        idx_k;
++                    bufferA_typed[new_buff_idx] = b0;
++                    bufferA_typed[new_buff_idx + KERNEL_K_STEP * NEW_N_SIZE] = b1;
++                }
++            }
++        }
++    }
++
++    // for(size_t n_idx = 0; n_idx < m_block_size; n_idx++) {
++    //     for(size_t k_idx = 0; k_idx < k_block_size; k_idx++) {
++    //         size_t old_split_n = n_idx / OLD_N_SIZE;
++    //         size_t old_idx_n   = n_idx % OLD_N_SIZE;
++    //         size_t new_split_n = n_idx / NEW_N_SIZE;
++    //         size_t new_idx_n   = n_idx % NEW_N_SIZE;
++    //         size_t split_k     = k_idx / KERNEL_K_STEP;
++    //         size_t idx_k       = k_idx % KERNEL_K_STEP;
++
++    //         size_t old_buff_idx = 
++    //             old_split_n * OLD_N_SIZE * lda +
++    //             split_k * OLD_N_SIZE * KERNEL_K_STEP +
++    //             old_idx_n * KERNEL_K_STEP +
++    //             idx_k;
++    //         size_t new_buff_idx = 
++    //             new_split_n * NEW_N_SIZE * k_block_size +
++    //             split_k * NEW_N_SIZE * KERNEL_K_STEP +
++    //             new_idx_n * KERNEL_K_STEP +
++    //             idx_k;
++    //         bufferA_typed[new_buff_idx] = curr_a_ptr_typed[old_buff_idx] + oa;
++    //     }
++    // }
++
++    // size_t k_block_size_up = (k_block_size + KERNEL_K_STEP - 1) / KERNEL_K_STEP * KERNEL_K_STEP;
++    // size_t k_portions = k_block_size / KERNEL_K_STEP;
++    // size_t k_resid = k_block_size - KERNEL_K_STEP * k_portions;
++
++    // size_t m_portions = m_block_size / KERNEL_M_STEP;
++    // size_t m_resid = m_block_size - KERNEL_M_STEP * m_portions;
++
++    // for (size_t im4 = 0; im4 < m_portions; ++im4) {
++    //     for (size_t ik16 = 0; ik16 < k_portions; ++ik16) {
++    //         for (size_t im = 0; im < KERNEL_M_STEP; ++im) {
++    //             for (size_t ik = 0; ik < KERNEL_K_STEP; ++ik) {
++    //                 bufferA_typed[ik + im * KERNEL_K_STEP + KERNEL_K_STEP * KERNEL_M_STEP * ik16 + k_block_size_up * KERNEL_M_STEP * im4] = 
++    //                     curr_a_ptr_typed[INDEXING_A((ik16 * KERNEL_K_STEP + ik), (im4 * KERNEL_M_STEP + im), lda)] + oa;
++    //             }
++    //         }
++    //     }
++    //     if (k_resid) {
++    //         for (size_t im = 0; im < KERNEL_M_STEP; ++im) {
++    //             for (size_t ik = 0; ik < k_resid; ++ik) {
++    //                 bufferA_typed[ik + im * KERNEL_K_STEP + KERNEL_K_STEP * KERNEL_M_STEP * k_portions + k_block_size_up * KERNEL_M_STEP * im4] = 
++    //                     curr_a_ptr_typed[INDEXING_A((k_portions * KERNEL_K_STEP + ik), (im4 * KERNEL_M_STEP + im), lda)] + oa;
++    //             }
++    //         }
++    //         for (size_t im = 0; im < KERNEL_M_STEP; ++im) {
++    //             for (size_t ik = k_resid; ik < KERNEL_K_STEP; ++ik) {
++    //                 bufferA_typed[ik + im * KERNEL_K_STEP + KERNEL_K_STEP * KERNEL_M_STEP * k_portions + k_block_size_up * KERNEL_M_STEP * im4] = 0;
++    //             }
++    //         }
++    //     }
++    // }
++    // if (m_resid) {
++    //     for (size_t ik16 = 0; ik16 < k_portions; ++ik16) {
++    //         for (size_t im = 0; im < m_resid; ++im) {
++    //             for (size_t ik = 0; ik < KERNEL_K_STEP; ++ik) {
++    //                 bufferA_typed[ik + im * KERNEL_K_STEP + KERNEL_K_STEP * m_resid * ik16 + k_block_size_up * KERNEL_M_STEP * m_portions] = 
++    //                     curr_a_ptr_typed[INDEXING_A((ik16 * KERNEL_K_STEP + ik), (m_portions * KERNEL_M_STEP + im), lda)] + oa;
++    //             }
++    //         }
++    //     }
++    //     if (k_resid) {
++    //         for (size_t im = 0; im < m_resid; ++im) {
++    //             for (size_t ik = 0; ik < k_resid; ++ik) {
++    //                 bufferA_typed[ik + im * KERNEL_K_STEP + KERNEL_K_STEP * m_resid * k_portions + k_block_size_up * KERNEL_M_STEP * m_portions] = 
++    //                     curr_a_ptr_typed[INDEXING_A((k_portions * KERNEL_K_STEP + ik), (m_portions * KERNEL_M_STEP + im), lda)] + oa;
++    //             }
++    //         }
++    //         for (size_t im = 0; im < m_resid; ++im) {
++    //             for (size_t ik = k_resid; ik < KERNEL_K_STEP; ++ik) {
++    //                 bufferA_typed[ik + im * KERNEL_K_STEP + KERNEL_K_STEP * m_resid * k_portions + k_block_size_up * KERNEL_M_STEP * m_portions] = 0;
++    //             }
++    //         }
++    //     }
++    // }
++}
++
++#ifdef __cplusplus
++} // extern "C"
++#endif /* __cplusplus */
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_pack_b_kernels.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_pack_b_kernels.c
+new file mode 100644
+index 0000000..88c9995
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_pack_b_kernels.c
+@@ -0,0 +1,96 @@
++#include <stdint.h>
++#include "integer_gemm_kernels.h"
++#include "helping_macros.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++
++#if defined(TRANSB)
++    // row major
++    #define INDEXING_B(row_idx, col_idx, ldb) ((col_idx) * (ldb) + row_idx)
++    #define ADD_B_SUFF(name) ADD_PACK_B_T_SUFF(name)
++#elif defined(NOTRANSB)
++    // col major
++    #define INDEXING_B(row_idx, col_idx, ldb) ((row_idx) * (ldb) + col_idx)
++    #define ADD_B_SUFF(name) ADD_PACK_B_N_SUFF(name)
++#else
++    #error "Neither TRANSB or NOTRANSB is defined."
++#endif
++    
++void ADD_B_SUFF(pack_b)(void* bufferB, const void* curr_b_ptr, size_t n_block_size, size_t k_block_size, size_t ldb, const BLASINT8 ob) {
++    RHS_INT_TYPE* bufferB_typed = (RHS_INT_TYPE*) bufferB;
++    RHS_INT_TYPE* curr_b_ptr_typed = (RHS_INT_TYPE*) curr_b_ptr;
++    size_t k_block_size_up = (k_block_size + KERNEL_K_STEP - 1) / KERNEL_K_STEP * KERNEL_K_STEP;
++    size_t k_portions = k_block_size / KERNEL_K_STEP;
++    size_t k_resid = k_block_size - KERNEL_K_STEP * k_portions;
++
++    size_t n_portions = n_block_size / KERNEL_N_STEP;
++    size_t n_resid = n_block_size - KERNEL_N_STEP * n_portions;
++
++    for (size_t in4 = 0; in4 < n_portions; ++in4) {
++        for (size_t in = 0; in < KERNEL_N_STEP; ++in) {
++            for (size_t ik16 = 0; ik16 < k_block_size / KERNEL_K_STEP; ++ik16) {
++                for (size_t ik = 0; ik < KERNEL_K_STEP; ++ik) {
++                    bufferB_typed[ik + KERNEL_K_STEP * in + KERNEL_K_STEP * KERNEL_N_STEP * ik16 + k_block_size_up * KERNEL_N_STEP * in4] = curr_b_ptr_typed[INDEXING_B((KERNEL_N_STEP * in4 + in), (KERNEL_K_STEP * ik16 + ik), ldb)] + ob;
++                }
++            }
++
++            if (k_resid) {
++                for (size_t ik = 0; ik < k_resid; ++ik) {
++                    bufferB_typed[ik + KERNEL_K_STEP * in + KERNEL_K_STEP * KERNEL_N_STEP * k_portions + k_block_size_up * KERNEL_N_STEP * in4] = curr_b_ptr_typed[INDEXING_B((KERNEL_N_STEP * in4 + in), (KERNEL_K_STEP * k_portions + ik), ldb)] + ob;
++                }
++                for (size_t ik = k_resid; ik < KERNEL_K_STEP; ++ik) {
++                    bufferB_typed[ik + KERNEL_K_STEP * in + KERNEL_K_STEP * KERNEL_N_STEP * k_portions + k_block_size_up * KERNEL_N_STEP * in4] = 0;
++                }
++            }
++        }
++    }
++    if (n_resid) {
++        for (size_t in = 0; in < n_resid; ++in) {
++            for (size_t ik16 = 0; ik16 < k_block_size / KERNEL_K_STEP; ++ik16) {
++                for (size_t ik = 0; ik < KERNEL_K_STEP; ++ik) {
++                    bufferB_typed[ik + KERNEL_K_STEP * in + KERNEL_K_STEP * n_resid * ik16 + k_block_size_up * KERNEL_N_STEP * n_portions] = curr_b_ptr_typed[INDEXING_B((KERNEL_N_STEP * n_portions + in), (KERNEL_K_STEP * ik16 + ik), ldb)] + ob;
++                }
++            }
++            if (k_resid) {
++                for (size_t ik = 0; ik < k_resid; ++ik) {
++                    bufferB_typed[ik + KERNEL_K_STEP * in + KERNEL_K_STEP * n_resid * k_portions + k_block_size_up * KERNEL_N_STEP * n_portions] = curr_b_ptr_typed[INDEXING_B((KERNEL_N_STEP * n_portions + in), (KERNEL_K_STEP * k_portions + ik), ldb)] + ob;
++                }
++                for (size_t ik = k_resid; ik < KERNEL_K_STEP; ++ik) {
++                    bufferB_typed[ik + KERNEL_K_STEP * in + KERNEL_K_STEP * n_resid * k_portions + k_block_size_up * KERNEL_N_STEP * n_portions] = 0;
++                }
++            }
++        }
++    }
++    
++    // printf("n_block_size:%lu ,k_block_size: %lu\n", n_block_size, k_block_size);
++
++    // for(size_t n_idx = 0; n_idx < n_block_size; n_idx++) {
++    //     for(size_t k_idx = 0; k_idx < k_block_size; k_idx++) {
++    //         size_t old_split_n = n_idx / OLD_N_SIZE;
++    //         size_t old_idx_n   = n_idx % OLD_N_SIZE;
++    //         size_t new_split_n = n_idx / NEW_N_SIZE;
++    //         size_t new_idx_n   = n_idx % NEW_N_SIZE;
++    //         size_t split_k     = k_idx / KERNEL_K_STEP;
++    //         size_t idx_k       = k_idx % KERNEL_K_STEP;
++
++    //         size_t old_buff_idx = 
++    //             old_split_n * OLD_N_SIZE * ldb +
++    //             split_k * OLD_N_SIZE * KERNEL_K_STEP +
++    //             old_idx_n * KERNEL_K_STEP +
++    //             idx_k;
++    //         size_t new_buff_idx = 
++    //             new_split_n * NEW_N_SIZE * k_block_size +
++    //             split_k * NEW_N_SIZE * KERNEL_K_STEP +
++    //             new_idx_n * KERNEL_K_STEP +
++    //             idx_k;
++    //         bufferB_typed[new_buff_idx] = curr_b_ptr_typed[old_buff_idx] + ob;
++    //     }
++    // }
++
++}
++        
++#ifdef __cplusplus
++} // extern "C"
++#endif /* __cplusplus */
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_post_ops_kernels.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_post_ops_kernels.c
+new file mode 100644
+index 0000000..edbc779
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_post_ops_kernels.c
+@@ -0,0 +1,25 @@
++#include <stdint.h>
++#include <math.h>
++#include "integer_gemm_kernels.h"
++#include "helping_macros.h"
++#include "beta_macros.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++
++// Fixed OC
++void BETA_SUFF(post_ops)(float alpha, const int32_t* bufferC, int32_t* current_c_ptr, size_t m, size_t n_block, size_t ldc) {
++    float* current_c_float_ptr = (float*) current_c_ptr;
++    double double_alpha = (double) alpha;
++    for (size_t n_idx = 0; n_idx < n_block; ++n_idx) {
++        for (size_t m_idx = 0; m_idx < m; ++m_idx) {
++            current_c_ptr[m_idx + n_idx * ldc] = round(((double)(current_c_float_ptr[m_idx + n_idx * ldc]))
++                                                    + double_alpha * ((double) bufferC[m_idx + n_idx * LDC(m, ldc)]));
++        }
++    }
++}
++
++#ifdef __cplusplus
++} // extern "C"
++#endif /* __cplusplus */
+\ No newline at end of file
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/sequential_int_gemm_pipeline.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/sequential_int_gemm_pipeline.c
+new file mode 100644
+index 0000000..0469cb3
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/sequential_int_gemm_pipeline.c
+@@ -0,0 +1,35 @@
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include "integer_gemm_kernels.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++
++// here we will use BLASINT8, because we care only about type size, not signness (no math operations required)
++void gemm_impl_8bit(int_gemm_funcs* arg, size_t m, size_t n, size_t k, float alpha,
++                    const void* a, size_t lda, const BLASINT8 oa,
++                    const void* b, size_t ldb, const BLASINT8 ob,
++                    float beta, int32_t* c, size_t ldc, const int32_t* oc, size_t small_switch) {
++
++    void (*small_kernel)(const size_t, const size_t, const size_t, const float,
++                         const void *, const size_t, const BLASINT8,
++                         const void *, const size_t, const BLASINT8,
++                         const float, int32_t *, const size_t, const int32_t *) = arg->small_kernel;
++
++    if (m * n * k < small_switch) { // experimentally measured constant
++        small_kernel(m, n, k, alpha, a, lda, oa, b, ldb, ob, beta, c, ldc, oc);
++    } else {
++        // Corner cases optimizations
++        if ((alpha == 1.0f) && (beta == 0.0f || beta == 1.0f)) {
++            gemm_driver_opt(arg, m, n, k, alpha, a, lda, oa, b, ldb, ob, beta, c, ldc, oc);
++        } else {
++            gemm_driver(arg, m, n, k, alpha, a, lda, oa, b, ldb, ob, beta, c, ldc, oc);
++        }
++    }
++}
++
++#ifdef __cplusplus
++}
++#endif /* __cplusplus */
+\ No newline at end of file
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/test_int8_gemm/CMakeLists.txt b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/test_int8_gemm/CMakeLists.txt
+new file mode 100644
+index 0000000..3585c57
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/test_int8_gemm/CMakeLists.txt
+@@ -0,0 +1,30 @@
++cmake_minimum_required(VERSION 3.14.1)
++
++project(THREAD_TEST)
++
++
++set(CMAKE_CXX_FLAGS ${CFLAGS_OPT})
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fopenmp")
++
++
++message(STATUS "Current source dir: ${CMAKE_CURRENT_SOURCE_DIR}/..")
++set(BLAS_PATH "")
++message(STATUS "BLAS_PATH=${BLAS_PATH}")
++
++if ("${BLAS_PATH}" STREQUAL "")
++
++    set(BLAS_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../libint8gemm.so")
++    message(STATUS "BLAS_LIB=${BLAS_LIB}")
++
++    # Add threading library to linker
++    #find_package(Threads)
++
++    add_executable(integer_tester integer_gemm.cpp)
++    #target_include_directories(integer_tester PUBLIC "${BLAS_PATH}")
++    #target_include_directories(integer_tester PUBLIC "${BLAS_BUILD_PATH}")
++    target_link_libraries(integer_tester PRIVATE ${BLAS_LIB})
++    set_property(TARGET integer_tester PROPERTY CXX_STANDARD 17)
++    add_test(integer_tester ${CMAKE_CURRENT_BINARY_DIR}/integer_tester)
++else ()
++    message(FATAL_ERROR "Can not find int8_gemm path, pls set right path!")
++endif ()
+\ No newline at end of file
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/test_int8_gemm/integer_gemm.cpp b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/test_int8_gemm/integer_gemm.cpp
+new file mode 100644
+index 0000000..f7efb3b
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/test_int8_gemm/integer_gemm.cpp
+@@ -0,0 +1,438 @@
++#include <malloc.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <exception>
++#include <iostream>
++#include <limits>
++#include <random>
++#include <type_traits>
++#include <vector>
++
++/* matrix saved in rows or cols */
++typedef enum CBLAS_ORDER { CblasRowMajor = 101, CblasColMajor = 102 } CBLAS_ORDER;
++
++/* matrix transpose or conjugate transpose */
++typedef enum CBLAS_TRANSPOSE {
++  CblasNoTrans = 111,
++  CblasTrans = 112,
++  CblasConjTrans = 113,  // conjugate transpose
++  CblasConjNoTrans = 114
++} CBLAS_TRANSPOSE;
++
++typedef CBLAS_ORDER CBLAS_LAYOUT;
++
++typedef enum CBLAS_OFFSET { CblasRowOffset = 171, CblasColOffset = 172, CblasFixOffset = 173 } CBLAS_OFFSET;
++
++typedef int8_t BLASINT8;
++typedef uint8_t BLASUINT8;
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++
++void cblas_gemm_s8s8s32(const CBLAS_LAYOUT layout, const CBLAS_TRANSPOSE transa, const CBLAS_TRANSPOSE transb,
++                        const CBLAS_OFFSET offsetc, const size_t m, const size_t n, const size_t k, const float alpha,
++                        const void* a, const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb,
++                        const BLASINT8 ob, const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void cblas_gemm_u8u8s32(const CBLAS_LAYOUT layout, const CBLAS_TRANSPOSE transa, const CBLAS_TRANSPOSE transb,
++                        const CBLAS_OFFSET offsetc, const size_t m, const size_t n, const size_t k, const float alpha,
++                        const void* a, const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb,
++                        const BLASINT8 ob, const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void cblas_gemm_s8u8s32(const CBLAS_LAYOUT layout, const CBLAS_TRANSPOSE transa, const CBLAS_TRANSPOSE transb,
++                        const CBLAS_OFFSET offsetc, const size_t m, const size_t n, const size_t k, const float alpha,
++                        const void* a, const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb,
++                        const BLASINT8 ob, const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void cblas_gemm_u8s8s32(const CBLAS_LAYOUT layout, const CBLAS_TRANSPOSE transa, const CBLAS_TRANSPOSE transb,
++                        const CBLAS_OFFSET offsetc, const size_t m, const size_t n, const size_t k, const float alpha,
++                        const void* a, const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb,
++                        const BLASINT8 ob, const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++#ifdef __cplusplus
++}
++#endif /* __cplusplus */
++
++namespace test {
++
++namespace tools {
++
++template <typename T, std::size_t alignment = 128>
++struct aligned_allocator {
++  using value_type = T;
++  using pointer = T*;
++  using const_pointer = const T*;
++  using reference = T&;
++  using const_reference = const T&;
++  using size_type = std::size_t;
++  using difference_type = std::ptrdiff_t;
++
++  template <typename U>
++  struct rebind {
++    typedef aligned_allocator<U, alignment> other;
++  };
++
++  [[nodiscard]] T* allocate(std::size_t n) {
++    if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) throw std::bad_array_new_length();
++    if (auto p = static_cast<T*>(memalign(alignment, n * sizeof(T)))) {
++      return p;
++    }
++
++    throw std::bad_alloc();
++  }
++
++  void deallocate(T* p, std::size_t n) noexcept {
++    (void)(n);
++    free(p);
++  }
++
++  ~aligned_allocator() {}
++};
++template <typename T, std::size_t alignment_1, typename U, std::size_t alignment_2>
++bool operator==(const aligned_allocator<T, alignment_1>&, const aligned_allocator<U, alignment_2>&) {
++  return (alignment_1 == alignment_2) && std::is_same_v<T, U>;
++}
++
++template <typename T, std::size_t alignment_1, typename U, std::size_t alignment_2>
++bool operator!=(const aligned_allocator<T, alignment_1>& lhs, const aligned_allocator<U, alignment_2>& rhs) {
++  return !(lhs == rhs);
++}
++template <typename Func, typename... Args>
++double timing(Func&& func, Args&&... args) {
++  double time = 0.0;
++  double time_begin = 0.0;
++  std::size_t n_run = 0;
++
++  auto start_begin = std::chrono::steady_clock::now();
++  std::forward<Func>(func)(std::forward<Args>(args)...);
++  auto end_begin = std::chrono::steady_clock::now();
++
++  time_begin = std::chrono::duration_cast<std::chrono::nanoseconds>(end_begin - start_begin).count() / 1e9;
++  n_run = std::max<std::size_t>(std::size_t(1.0 / time_begin), 3);
++
++  auto start = std::chrono::steady_clock::now();
++  for (std::size_t i = 0; i < n_run; ++i) {
++    std::forward<Func>(func)(std::forward<Args>(args)...);
++  }
++  auto end = std::chrono::steady_clock::now();
++
++  time += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1e9;
++  return time / n_run;
++}
++}  // namespace tools
++namespace helpers {
++std::size_t get_oc_size(CBLAS_OFFSET offset, std::size_t m, std::size_t n) {
++  std::size_t ret_val = 0;
++  switch (offset) {
++    case CblasFixOffset:
++      ret_val = 1;
++      break;
++    case CblasColOffset:
++      ret_val = m;
++      break;
++    case CblasRowOffset:
++      ret_val = n;
++      break;
++    default:
++      std::cout << "Incorrect value of offset to the function " << __PRETTY_FUNCTION__ << std::endl;
++  }
++  return ret_val;
++}
++template <typename T>
++auto get_ab_matrix(CBLAS_LAYOUT lt, CBLAS_TRANSPOSE trans_, T&& non_trans_mtx, T&& trans_mtx) {
++  if (lt == CblasColMajor) {
++    if (trans_ == CblasNoTrans) {
++      return non_trans_mtx.data();
++    } else {
++      return trans_mtx.data();
++    }
++  } else {
++    if (trans_ == CblasNoTrans) {
++      return trans_mtx.data();
++    } else {
++      return non_trans_mtx.data();
++    }
++  }
++}
++auto get_ldab(CBLAS_LAYOUT lt, CBLAS_TRANSPOSE trans_mtx, std::size_t ld_n, std::size_t ld_t) {
++  if (lt == CblasColMajor) {
++    if (trans_mtx == CblasNoTrans) {
++      return ld_n;
++    } else {
++      return ld_t;
++    }
++  } else {
++    if (trans_mtx == CblasNoTrans) {
++      return ld_t;
++    } else {
++      return ld_n;
++    }
++  }
++}
++
++// returns copy of the matrix
++template <typename T>
++auto get_c_matrix(CBLAS_LAYOUT lt, T&& non_trans_mtx, T&& trans_mtx) {
++  if (lt == CblasColMajor) {
++    return non_trans_mtx;
++  } else {
++    return trans_mtx;
++  }
++}
++
++auto get_ldc(CBLAS_LAYOUT lt, std::size_t ldc_n, std::size_t ldc_t) {
++  if (lt == CblasColMajor) {
++    return ldc_n;
++  } else {
++    return ldc_t;
++  }
++}
++template <typename A_Type, typename B_Type>
++void cblas_gemm_wrapper(const CBLAS_LAYOUT Layout, const CBLAS_TRANSPOSE transa, const CBLAS_TRANSPOSE transb,
++                        const CBLAS_OFFSET offsetc, const size_t m, const size_t n, const size_t k, const float alpha,
++                        const A_Type* a, const size_t lda, const int8_t oa, const B_Type* b, const size_t ldb,
++                        const int8_t ob, const float beta, int32_t* c, const size_t ldc, const int32_t* oc) {
++  if constexpr (std::is_same_v<A_Type, std::int8_t>) {
++    if constexpr (std::is_same_v<B_Type, std::int8_t>) {
++      cblas_gemm_s8s8s32(Layout, transa, transb, offsetc, m, n, k, alpha, a, lda, oa, b, ldb, ob, beta, c, ldc, oc);
++    } else {
++      cblas_gemm_s8u8s32(Layout, transa, transb, offsetc, m, n, k, alpha, a, lda, oa, b, ldb, ob, beta, c, ldc, oc);
++    }
++  } else {
++    if constexpr (std::is_same_v<B_Type, std::int8_t>) {
++      cblas_gemm_u8s8s32(Layout, transa, transb, offsetc, m, n, k, alpha, a, lda, oa, b, ldb, ob, beta, c, ldc, oc);
++    } else {
++      cblas_gemm_u8u8s32(Layout, transa, transb, offsetc, m, n, k, alpha, a, lda, oa, b, ldb, ob, beta, c, ldc, oc);
++    }
++  }
++}
++
++std::size_t return_oc_idx(const CBLAS_OFFSET offsetc, std::size_t mi, std::size_t ni) {
++  return (offsetc == CblasFixOffset) ? 0 : ((offsetc == CblasColOffset) ? mi : ni);
++}
++}  // namespace helpers
++enum class status_t { passed, failed };
++
++std::ostream& operator<<(std::ostream& os, const status_t& st) {
++  if (status_t::passed == st) {
++    os << "PASSED";
++  } else if (status_t::failed == st) {
++    os << "FAILED";
++  }
++  return os;
++}
++// column major
++template <typename A_Type, typename B_Type>
++void ref_gemm(const CBLAS_OFFSET offsetc, const std::size_t m, const std::size_t n, const std::size_t k,
++              const float alpha, const A_Type* a, const std::size_t lda, const std::int8_t oa, const B_Type* b,
++              const std::size_t ldb, const std::int8_t ob, const float beta, std::int32_t* c, const std::size_t ldc,
++              const std::int32_t* oc) {
++  for (std::size_t mi = 0; mi < m; ++mi) {
++    for (std::size_t ni = 0; ni < n; ++ni) {
++      std::int32_t tmp = 0;
++      for (std::size_t ki = 0; ki < k; ++ki) {
++        tmp += (a[mi + ki * lda] + oa) * (b[ki + ni * ldb] + ob);
++      }
++      c[mi + ni * ldc] = std::round(alpha * static_cast<double>(tmp) +
++                                    static_cast<double>(beta * static_cast<float>(c[mi + ni * ldc])) +
++                                    static_cast<float>(oc[helpers::return_oc_idx(offsetc, mi, ni)]));
++    }
++  }
++}
++template <typename DataType>
++void fill_random(DataType* buffer, std::size_t len) {
++  static std::mt19937 generator(0);
++  std::uniform_int_distribution<DataType> dist(0, 64);
++  for (std::size_t i = 0; i < len; i++) {
++    buffer[i] = static_cast<DataType>(dist(generator));
++  }
++}
++
++template <typename DataType>
++void fill_const(DataType* buffer, std::size_t len) {
++  for (std::size_t i = 0; i < len; i++) {
++    buffer[i] = DataType{-8};
++  }
++}
++// performs transposition (n0 * n1) -> (n1 * n0), assuming col major
++template <typename T>
++void simplest_transpose(T* in, T* out, std::size_t n0, std::size_t n1, std::size_t ld0, std::size_t ld1) {
++  for (std::size_t i = 0; i < n0; ++i) {
++    for (std::size_t j = 0; j < n1; ++j) {
++      out[i + j * ld1] = in[j + i * ld0];
++    }
++  }
++}
++
++template <typename DataType>
++status_t compare(DataType* ref, DataType* test, std::size_t m, std::size_t n, std::size_t ld) {
++  for (std::size_t mi = 0; mi < m; ++mi) {
++    for (std::size_t ni = 0; ni < n; ++ni) {
++      if (ref[mi + ni * ld] != test[mi + ni * ld]) {
++        return status_t::failed;
++      }
++    }
++  }
++  return status_t::passed;
++}
++template <typename DataType>
++void print_matrix(DataType* buffer, std::size_t m, std::size_t n) {
++  for (std::size_t mi = 0; mi < m; ++mi) {
++    for (std::size_t ni = 0; ni < n; ++ni) {
++      std::cout << static_cast<std::int32_t>(buffer[mi + ni * m]) << ", ";
++    }
++    std::cout << std::endl;
++  }
++  std::cout << std::endl;
++}
++template <typename A_Type, typename B_Type>
++status_t gemm(std::size_t m, std::size_t n, std::size_t k, float alpha, float beta) {
++  std::int8_t oa = 4;
++  std::int8_t ob = 9;
++
++  std::size_t lda_n = m;
++  std::size_t ldb_n = k;
++  std::size_t ldc_n = m;
++
++  std::size_t lda_t = k;
++  std::size_t ldb_t = n;
++  std::size_t ldc_t = n;
++
++  if (std::getenv("LD_STRIDE")) {
++    lda_n += 2;
++    ldb_n += 7;
++    ldc_n += 3;
++
++    lda_t += 8;
++    ldb_t += 3;
++    ldc_t += 23;
++  }
++
++  bool only_performance = false;
++  if (std::getenv("ONLY_PERF")) {
++    only_performance = true;
++  }
++  std::vector<A_Type, tools::aligned_allocator<A_Type, 128>> a_n(lda_n * k);
++  std::vector<A_Type, tools::aligned_allocator<A_Type, 128>> a_t(m * lda_t);
++  std::vector<B_Type, tools::aligned_allocator<B_Type, 128>> b_n(ldb_n * n);
++  std::vector<B_Type, tools::aligned_allocator<B_Type, 128>> b_t(k * ldb_t);
++  std::vector<std::int32_t, tools::aligned_allocator<std::int32_t, 128>> c_ref(ldc_n * n);
++  std::vector<std::int32_t, tools::aligned_allocator<std::int32_t, 128>> c_n(ldc_n * n);
++  std::vector<std::int32_t, tools::aligned_allocator<std::int32_t, 128>> c_t(m * ldc_t);
++
++  // fill the whole array even if ld* > corresponding dim
++  fill_random(a_n.data(), a_n.size());
++  fill_random(b_n.data(), b_n.size());
++
++  simplest_transpose(a_n.data(), a_t.data(), m, k, lda_n, lda_t);
++  simplest_transpose(b_n.data(), b_t.data(), k, n, ldb_n, ldb_t);
++
++  fill_const(c_ref.data(), ldc_n * n);
++  c_n = c_ref;
++
++  simplest_transpose(c_n.data(), c_t.data(), m, ldc_n, n, ldc_t);
++
++  auto return_st = status_t::passed;
++  double total = 0;
++  size_t cnt = 0;
++  for (auto c_offset : {CblasFixOffset, CblasColOffset, CblasRowOffset}) {
++    std::vector<std::int32_t, tools::aligned_allocator<std::int32_t, 128>> oc(helpers::get_oc_size(c_offset, m, n));
++    for (std::size_t i = 0; i < oc.size(); ++i) {
++      oc[i] = i + i;
++    }
++
++    std::vector<std::int32_t, tools::aligned_allocator<std::int32_t, 128>> c_ref_copy = c_ref;
++    if (!only_performance) {
++      ref_gemm(c_offset, m, n, k, alpha, a_n.data(), lda_n, oa, b_n.data(), ldb_n, ob, beta, c_ref_copy.data(), ldc_n,
++               oc.data());
++    }
++    for (auto layout : {CblasColMajor, CblasRowMajor}) {
++      for (auto transa : {CblasNoTrans, CblasTrans}) {
++        for (auto transb : {CblasNoTrans, CblasTrans}) {
++          auto&& c_tested = helpers::get_c_matrix(layout, c_n, c_t);
++          if (!only_performance) {
++            helpers::cblas_gemm_wrapper(
++                layout, transa, transb, c_offset, m, n, k, alpha, helpers::get_ab_matrix(layout, transa, a_n, a_t),
++                helpers::get_ldab(layout, transa, lda_n, lda_t), oa, helpers::get_ab_matrix(layout, transb, b_n, b_t),
++                helpers::get_ldab(layout, transb, ldb_n, ldb_t), ob, beta, c_tested.data(),
++                helpers::get_ldc(layout, ldc_n, ldc_t), oc.data());
++
++            // transpose c_tested to col-major if required
++            auto loc_st = status_t::passed;
++            if (layout == CblasRowMajor) {
++              std::vector<std::int32_t, tools::aligned_allocator<std::int32_t, 128>> c_tested_n(ldc_n * n);
++              simplest_transpose(c_tested.data(), c_tested_n.data(), n, ldc_t, m, ldc_n);
++              loc_st = compare(c_ref_copy.data(), c_tested_n.data(), m, n, ldc_n);
++            } else {
++              loc_st = compare(c_ref_copy.data(), c_tested.data(), m, n, ldc_n);
++            }
++            if (loc_st != status_t::passed) {
++              std::cout << "-";
++              return_st = status_t::failed;
++            } else {
++              std::cout << "+";
++            }
++          } else {
++            double cur = (2.0 * m * n * k) /
++                         tools::timing(helpers::cblas_gemm_wrapper<A_Type, B_Type>, layout, transa, transb, c_offset, m,
++                                       n, k, alpha, helpers::get_ab_matrix(layout, transa, a_n, a_t),
++                                       helpers::get_ldab(layout, transa, lda_n, lda_t), oa,
++                                       helpers::get_ab_matrix(layout, transb, b_n, b_t),
++                                       helpers::get_ldab(layout, transb, ldb_n, ldb_t), ob, beta, c_tested.data(),
++                                       helpers::get_ldc(layout, ldc_n, ldc_t), oc.data()) /
++                         1e12;
++            total += cur;
++            ++cnt;
++
++            std::cout << cur << ", ";
++          }
++        }
++      }
++    }
++  }
++  if (only_performance) {
++    std::cout << "Average " << total / cnt << " TFlops";
++  }
++  std::cout << "    ";
++  return return_st;
++}
++}  // namespace test
++
++int main(int argc, char** argv) {
++  std::size_t m = 128;
++  std::size_t n = 128;
++  std::size_t k = 128;
++  float alpha = 1.0f;
++  float beta = 1.0f;
++
++  if (argc > 1) {
++    m = std::stoi(argv[1]);
++    if (argc > 2) {
++      n = std::stoi(argv[2]);
++      if (argc > 3) {
++        k = std::stoi(argv[3]);
++        if (argc > 4) {
++          alpha = std::stof(argv[4]);
++          if (argc > 5) {
++            beta = std::stof(argv[5]);
++          }
++        }
++      }
++    }
++  }
++  std::cout << "Testing matrix m = " << m << ", n = " << n << ", k = " << k << ", alpha = " << alpha
++            << ", beta = " << beta << std::endl;
++
++  std::cout << "\tTesting i8i8i32: " << test::gemm<std::int8_t, std::int8_t>(m, n, k, alpha, beta) << std::endl;
++  std::cout << "\tTesting i8u8i32: " << test::gemm<std::int8_t, std::uint8_t>(m, n, k, alpha, beta) << std::endl;
++  std::cout << "\tTesting u8i8i32: " << test::gemm<std::uint8_t, std::int8_t>(m, n, k, alpha, beta) << std::endl;
++  std::cout << "\tTesting u8u8i32: " << test::gemm<std::uint8_t, std::uint8_t>(m, n, k, alpha, beta) << std::endl;
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/utils.hpp b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/utils.hpp
+new file mode 100644
+index 0000000..163f839
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/utils.hpp
+@@ -0,0 +1,45 @@
++
++#pragma once
++/*** gemm helper ***/
++#include "../../api/common.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++#define COMP_SV_LEN 32
++#define K_SIZE COMP_SV_LEN
++#define M_SIZE 1
++#define N_SIZE 8
++
++#define INDEXING_B(row_idx, col_idx, ldb) ((col_idx) * (ldb) + row_idx)
++
++#define PROCESS_ACCUM(reg_idx, z_reg_idx, tmp_reg, dst, p) \
++  "mov w" #reg_idx                                         \
++  ", #0\n"                                                 \
++  "saddv d" #reg_idx ", " #p ", z" #z_reg_idx              \
++  ".s\n"                                                   \
++  "fmov " #tmp_reg ", d" #reg_idx                          \
++  "\n"                                                     \
++  "add x" #reg_idx ", x" #reg_idx ", " #tmp_reg            \
++  "\n"                                                     \
++  "str w" #reg_idx ", [%[" #dst "]], #4\n"
++
++#define INT4_CP_MASK_SHIFT_1x8(src_reg, dst_reg, mask_reg1, mask_reg2, shift) \
++  "movprfx z" #dst_reg ", z" #src_reg                                         \
++  "\n"                                                                        \
++  "lsl z" #dst_reg ".b, p0/m, z" #dst_reg ".b, #" #shift                      \
++  "\n"                                                                        \
++  "and z" #src_reg ".b, p0/m, z" #src_reg ".b, z" #mask_reg1 ".b\n"
++
++void pack_b_1x8(void* bufferB, const void* cur_b_ptr, size_t n, size_t k, size_t ldb, const BLASINT8 ob);
++void pack_b_1x8_int4(void* bufferB, const void* cur_b_ptr, size_t n, size_t k, size_t ldb, const BLASINT8 ob);
++
++void gemm_kernel_1x8(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                     int64_t sv_len);
++
++void gemm_kernel_1x8_int4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                          int64_t sv_len);
++
++#ifdef __cplusplus
++}
++#endif
++/*** gemm helper ***/
+\ No newline at end of file
+diff --git a/kt-kernel/setup.py b/kt-kernel/setup.py
+index a14b0a5..6633e0d 100644
+--- a/kt-kernel/setup.py
++++ b/kt-kernel/setup.py
+@@ -34,10 +34,18 @@ Environment knobs (export before running pip install .):
+   CPUINFER_NATIVE=ON               (override LLAMA_NATIVE)
+ 
+ 
+-GPU backends (if ever added later, keep placeholders):
++GPU/NPU backends (if ever added later, keep placeholders):
+   CPUINFER_USE_CUDA=0/1           -DKTRANSFORMERS_USE_CUDA
+   CPUINFER_USE_ROCM=0/1           -DKTRANSFORMERS_USE_ROCM
+   CPUINFER_USE_MUSA=0/1           -DKTRANSFORMERS_USE_MUSA
++  CPUINFER_USE_ASCEND_NPU=0/1     -DKTRANSFORMERS_USE_ASCEND_NPU (auto-detects $ASCEND_TOOLKIT_HOME)
++
++ARM aarch64 feature toggles (Kunpeng / Neoverse / Apple Silicon):
++  CPUINFER_ARM_DOTPROD=ON/OFF     -DLLAMA_ARM_DOTPROD (default ON on armv8.2+)
++  CPUINFER_ARM_FP16=ON/OFF        -DLLAMA_ARM_FP16    (default ON on armv8.2+)
++  CPUINFER_ARM_SVE=ON/OFF         -DLLAMA_ARM_SVE     (default OFF; K920 lacks SVE)
++  CPUINFER_ARM_BF16=ON/OFF        -DLLAMA_ARM_BF16    (default OFF; K920 lacks BF16)
++  CPUINFER_ARM_I8MM=ON/OFF        -DLLAMA_ARM_I8MM    (default OFF; needs Neoverse N2/V1+)
+ 
+ Usage:
+   pip install .
+@@ -197,6 +205,20 @@ class CMakeBuild(build_ext):
+                         flags.update(m.group(1).lower().split())
+                 info["raw"]["flags"] = flags
+ 
++                # ARM feature summary (Kunpeng / Neoverse / Apple Silicon).
++                # /proc/cpuinfo on Linux/aarch64 lists these in "Features:".
++                if info["vendor"] == "arm" or "aarch64" in info["arch"]:
++                    if "asimddp" in flags:
++                        info["features"].add("ARM_DOTPROD")
++                    if "asimdhp" in flags or "fphp" in flags:
++                        info["features"].add("ARM_FP16")
++                    if "sve" in flags:
++                        info["features"].add("ARM_SVE")
++                    if "bf16" in flags:
++                        info["features"].add("ARM_BF16")
++                    if "i8mm" in flags:
++                        info["features"].add("ARM_I8MM")
++
+                 # feature summary
+                 if any(f in flags or f in low for f in ["avx512f", "avx512bw", "avx512dq", "avx512vl"]):
+                     info["features"].add("AVX512")
+@@ -469,6 +491,20 @@ class CMakeBuild(build_ext):
+                 return True
+             return False
+ 
++        # Auto-detect Ascend CANN toolkit if user did not explicitly set CPUINFER_USE_ASCEND_NPU.
++        # We check $ASCEND_TOOLKIT_HOME, $CANN_HOME, and the default install
++        # prefix /usr/local/Ascend/ascend-toolkit/latest; treat the toolkit as
++        # available iff include/acl/acl_rt.h exists under that root.
++        def detect_cann_toolkit() -> str | None:
++            for env_name in ("ASCEND_TOOLKIT_HOME", "CANN_HOME"):
++                p = os.environ.get(env_name)
++                if p and (Path(p) / "include" / "acl" / "acl_rt.h").exists():
++                    return p
++            default_root = Path("/usr/local/Ascend/ascend-toolkit/latest")
++            if (default_root / "include" / "acl" / "acl_rt.h").exists():
++                return str(default_root)
++            return None
++
+         # Locate nvcc executable (without forcing user to set -DCMAKE_CUDA_COMPILER)
+         def find_nvcc_path() -> str | None:
+             cuda_home = os.environ.get("CUDA_HOME")
+@@ -501,6 +537,22 @@ class CMakeBuild(build_ext):
+             os.environ["CPUINFER_USE_CUDA"] = "1" if auto_cuda else "0"
+             print(f"-- CPUINFER_USE_CUDA not set; auto-detected CUDA toolkit: {'YES' if auto_cuda else 'NO'}")
+ 
++        # Normalize CPUINFER_USE_ASCEND_NPU. We only auto-enable when the host
++        # is aarch64 and no CUDA was detected; on x86 boxes with CUDA we keep
++        # the CUDA path even if a CANN toolkit happens to be installed.
++        npu_env = _env_get_bool("CPUINFER_USE_ASCEND_NPU", None)
++        if npu_env is None:
++            cann_root = detect_cann_toolkit()
++            host_is_arm = (platform.machine().lower() in ("aarch64", "arm64"))
++            cuda_active = os.environ.get("CPUINFER_USE_CUDA") == "1"
++            auto_npu = (cann_root is not None) and host_is_arm and (not cuda_active)
++            os.environ["CPUINFER_USE_ASCEND_NPU"] = "1" if auto_npu else "0"
++            if auto_npu:
++                # Forward toolkit root so CMake's find_path can locate acl/acl_rt.h.
++                os.environ.setdefault("ASCEND_TOOLKIT_HOME", cann_root)
++            print(f"-- CPUINFER_USE_ASCEND_NPU not set; auto-detected CANN toolkit: "
++                  f"{'YES (' + str(cann_root) + ')' if auto_npu else 'NO'}")
++
+         # Base CMake args
+         cmake_args = [
+             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}/",
+@@ -647,6 +699,45 @@ class CMakeBuild(build_ext):
+             cmake_args.append("-DKTRANSFORMERS_USE_ROCM=ON")
+         if _env_get_bool("CPUINFER_USE_MUSA", False):
+             cmake_args.append("-DKTRANSFORMERS_USE_MUSA=ON")
++        if _env_get_bool("CPUINFER_USE_ASCEND_NPU", False):
++            cmake_args.append("-DKTRANSFORMERS_USE_ASCEND_NPU=ON")
++            print("-- Enabling Ascend NPU backend (-DKTRANSFORMERS_USE_ASCEND_NPU=ON)")
++            cann_root = os.environ.get("ASCEND_TOOLKIT_HOME") or os.environ.get(
++                "CANN_HOME") or detect_cann_toolkit()
++            if cann_root:
++                print(f"-- CANN root: {cann_root}")
++            else:
++                print("-- Warning: ASCEND_TOOLKIT_HOME not set and no default CANN install"
++                      " found; CMake configure will likely fail.")
++            # CPU-only MoE on Kunpeng must NOT enable the KML SVE micro-kernels
++            # (kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/*.cpp). These
++            # require SVE which K920/Cortex-A76 lacks. Force them off unless the
++            # user explicitly opts in.
++            if not _env_get_bool("CPUINFER_ENABLE_KML", None):
++                os.environ.setdefault("CPUINFER_ENABLE_KML", "OFF")
++            if not _env_get_bool("CPUINFER_ENABLE_BLIS", None):
++                os.environ.setdefault("CPUINFER_ENABLE_BLIS", "OFF")
++
++        # ---- ARM feature toggles (aarch64 only) -------------------------
++        # The CMake side starts from armv8.2-a baseline and appends features
++        # via LLAMA_ARM_{DOTPROD,FP16,SVE,BF16,I8MM}. Auto-detect once and
++        # forward as -D flags so binary distribution still works.
++        if platform.machine().lower() in ("aarch64", "arm64"):
++            arm_feature_map = [
++                ("CPUINFER_ARM_DOTPROD", "LLAMA_ARM_DOTPROD", "ARM_DOTPROD"),
++                ("CPUINFER_ARM_FP16",    "LLAMA_ARM_FP16",    "ARM_FP16"),
++                ("CPUINFER_ARM_SVE",     "LLAMA_ARM_SVE",     "ARM_SVE"),
++                ("CPUINFER_ARM_BF16",    "LLAMA_ARM_BF16",    "ARM_BF16"),
++                ("CPUINFER_ARM_I8MM",    "LLAMA_ARM_I8MM",    "ARM_I8MM"),
++            ]
++            for env_name, cmake_flag, feature in arm_feature_map:
++                if _forward_bool_env(cmake_args, env_name, cmake_flag):
++                    continue
++                if feature in d["features"]:
++                    cmake_args.append(f"-D{cmake_flag}=ON")
++                    print(f"-- aarch64 {feature} detected; -D{cmake_flag}=ON")
++                else:
++                    cmake_args.append(f"-D{cmake_flag}=OFF")
+ 
+         # Respect user extra CMAKE_ARGS (space separated)
+         extra = os.environ.get("CMAKE_ARGS")
+diff --git a/run_mindie_pip_light.sh b/run_mindie_pip_light.sh
+new file mode 100755
+index 0000000..7f40655
+--- /dev/null
++++ b/run_mindie_pip_light.sh
+@@ -0,0 +1,102 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# ===== 用户配置 =====
++export IMAGE=${IMAGE:-swr.cn-south-1.myhuaweicloud.com/ascendhub/mindie:2.2.RC1-800I-A2-py311-openeuler24.03-lts}
++export NAME=${NAME:-ktransformers}
++export PORT_RANGE=${PORT_RANGE:-8000-8010}
++export HOST_PORT_RANGE=${HOST_PORT_RANGE:-18070-18080}
++export SHM_SIZE=${SHM_SIZE:-32g}
++export PROJECT_DIR=${PROJECT_DIR:-$(pwd)}
++export NPU_VISIBLE_DEVICES=${NPU_VISIBLE_DEVICES:-auto}
++# =====================
++
++DEVICES=()
++for d in /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc; do
++  [[ -e "$d" ]] && DEVICES+=(--device "$d")
++done
++
++if [[ "$NPU_VISIBLE_DEVICES" == "auto" ]]; then
++  mapfile -t DLIST < <(ls -1 /dev/davinci[0-9]* 2>/dev/null | sort -V)
++else
++  IFS=',' read -ra IDS <<<"$NPU_VISIBLE_DEVICES"
++  DLIST=()
++  for i in "${IDS[@]}"; do
++    [[ -e "/dev/davinci${i}" ]] && DLIST+=("/dev/davinci${i}")
++  done
++fi
++for d in "${DLIST[@]}"; do DEVICES+=(--device "$d"); done
++
++MOUNTS=(
++  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver
++  -v /etc/ascend_install.info:/etc/ascend_install.info
++  -v /var/log/npu/:/usr/slog
++  -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi
++  -v /sys/fs/cgroup:/sys/fs/cgroup:ro
++  -v /usr/local/dcmi:/usr/local/dcmi
++  -v "${PROJECT_DIR}":/workspace
++)
++
++CMD='
++set -e
++
++echo "==> 配置 Pip 镜像源..."
++pip config set global.index-url https://repo.huaweicloud.com/repository/pypi/simple
++pip config set global.trusted-host repo.huaweicloud.com
++
++echo "==> 全局禁用 Python SSL 校验（内网代理兼容）..."
++SITEPKG=$(python3 -c "import site; print(site.getsitepackages()[0])")
++cat > "${SITEPKG}/sitecustomize_ssl.py" <<PYEOF
++import ssl, os, urllib3
++ssl._create_default_https_context = ssl._create_unverified_context
++os.environ["CURL_CA_BUNDLE"] = ""
++os.environ["REQUESTS_CA_BUNDLE"] = ""
++urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
++
++import requests
++_orig = requests.Session.send
++def _patched(self, request, **kwargs):
++    kwargs["verify"] = False
++    return _orig(self, request, **kwargs)
++requests.Session.send = _patched
++PYEOF
++EXISTING=$(cat "${SITEPKG}/sitecustomize.py" 2>/dev/null || true)
++if ! echo "$EXISTING" | grep -q "sitecustomize_ssl"; then
++  echo "import sitecustomize_ssl" >> "${SITEPKG}/sitecustomize.py"
++fi
++
++echo "==> 当前代理:"
++env | grep -i proxy || true
++echo "==> pip 配置:"
++pip config list || true
++
++echo "容器初始化完毕，已进入交互模式。"
++exec bash
++'
++
++docker rm -f "${NAME}" >/dev/null 2>&1 || true
++
++docker run -it -d \
++  --name "${NAME}" \
++  "${DEVICES[@]}" \
++  "${MOUNTS[@]}" \
++  -e http_proxy="${http_proxy:-}" \
++  -e https_proxy="${https_proxy:-}" \
++  -e HTTP_PROXY="${http_proxy:-}" \
++  -e HTTPS_PROXY="${https_proxy:-}" \
++  -e no_proxy="${no_proxy:-}" \
++  -e NO_PROXY="${no_proxy:-}" \
++  -e ASCEND_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" \
++  -e NPU_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" \
++  --cap-add=SYS_PTRACE \
++  --security-opt seccomp=unconfined \
++  --ipc=host \
++  --privileged=true \
++  --shm-size "${SHM_SIZE}" \
++  -w /workspace \
++  -p "${HOST_PORT_RANGE}:${PORT_RANGE}" \
++  "${IMAGE}" /bin/bash -c "${CMD}"
++
++echo "[INFO] Started container: ${NAME}"
++echo "[INFO] Port mapping: ${HOST_PORT_RANGE} -> ${PORT_RANGE}"
++echo "[INFO] Enter container: docker exec -it ${NAME} bash"
+diff --git a/script/launch_ds4flash_sglang.sh b/script/launch_ds4flash_sglang.sh
+new file mode 100755
+index 0000000..338f35a
+--- /dev/null
++++ b/script/launch_ds4flash_sglang.sh
+@@ -0,0 +1,100 @@
++pkill -9 python | pkill -9 sglang
++sleep 3
++pkill -9 python | pkill -9 sglang
++sleep 2
++rm -rf kernel_meta
++rm -rf extra-info
++rm -rf /root/ascend/
++
++# cpu high performance
++echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
++sysctl -w vm.swappiness=0
++sysctl -w kernel.numa_balancing=0
++export SGLANG_SET_CPU_AFFINITY=1
++
++# unset proxy
++unset http_proxy
++unset https_proxy
++unset HTTPS_PROXY
++unset HTTP_PROXY
++
++# CANN env var
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++source /usr/local/Ascend/nnal/atb/set_env.sh
++source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
++source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
++export TASK_QUEUE_ENABLE=1
++# unset sync kernel
++unset ASCEND_LAUNCH_BLOCKING
++
++# torch stream upper limit setting
++export STREAMS_PER_DEVICE=32
++# torch optimize memory fragmentation
++export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
++
++# 设置SGLANG代码路径
++export PYTHONPATH=${PWD}/python:$PYTHONPATH
++MODEL_PATH=/workspace/models/DeepSeek-V4-Flash-W8A8/
++
++### HCCL env
++IFNAMES=eth0  # get name according to ifconfig
++export HCCL_SOCKET_IFNAME=$IFNAMES
++export GLOO_SOCKET_IFNAME=$IFNAMES
++export HCCL_OP_EXPANSION_MODE=AIV
++export HCCL_BUFFSIZE=2048
++
++# Fused Kernels
++# Compressor
++export USE_FUSED_COMPRESSOR=1
++# Lightning Indexer
++export LI_KV_DTYPE_INT8=1
++# SparseAttentionSharedKV
++export USE_PA_DECODE=1
++export USE_PA_PREFILL=1
++#HC Pre / HC Post
++export USE_FUSED_HC_POST_ASCENDC=1
++export USE_FUSED_HC_PRE_ASCENDC=1
++# MOE Gating TopK
++export USE_NPU_MOE_GATING_TOP_K=1
++# Transpose BatchMatmul
++export USE_FUSED_TRANSPOSE_BATCHMATMUL=1
++# Inplace Partial Rotary Mul
++export USE_ROPE_PARTIAL_IN_PLACE_ASCENDC=1
++
++# deepep vars
++export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
++export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
++export DEEPEP_NORMAL_LONG_SEQ_ROUND=8
++export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=8192
++export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
++
++export ASCEND_USE_FIA=1
++# transfer dsv4 weight suffix, will be removed in a future version
++export IS_DEEPSEEK_V4=1
++
++QUANT_MODE=compressed-tensors  # [compressed-tensors, modelslim]
++
++# MTP
++export SGLANG_ENABLE_SPEC_V2=1
++export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
++export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
++
++python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
++    --page-size 128 \
++    --tp-size 8 \
++    --trust-remote-code \
++    --attention-backend ascend \
++    --device npu \
++    --watchdog-timeout 18000 \
++    --host 0.0.0.0 --port 30000 \
++    --mem-fraction-static 0.75 \
++    --cuda-graph-bs 1  \
++    --disable-radix-cache --chunked-prefill-size -1 --max-prefill-tokens 65535 --context-length 65536 \
++    --max-running-requests 8 \
++    --dtype bfloat16 \
++    --dp-size 8 --enable-dp-attention --enable-dp-lm-head \
++    --quantization ${QUANT_MODE} --disable-shared-experts-fusion \
++    --skip-server-warmup \
++    --moe-a2a-backend deepep --deepep-mode auto \
++    --speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3
++
+diff --git a/sglang_dsv4_ascend_cann850.sh b/sglang_dsv4_ascend_cann850.sh
+new file mode 100644
+index 0000000..a0b2a06
+--- /dev/null
++++ b/sglang_dsv4_ascend_cann850.sh
+@@ -0,0 +1,124 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# ===== 用户配置 =====
++export IMAGE=${IMAGE:-lmsysorg/sglang:deepseek-v4-npu-910b}
++export NAME=${NAME:-sglang_ds_v4}
++export PORT_RANGE=${PORT_RANGE:-8000-8010}
++export HOST_PORT_RANGE=${HOST_PORT_RANGE:-8070-8080}
++export SHM_SIZE=${SHM_SIZE:-16g}
++export CACHE_DIR=${CACHE_DIR:-$HOME/.cache}
++export MODEL_DIR=${MODEL_DIR:-/home/y00359136/models}
++export SGLANG_DIR=${SGLANG_DIR:-/home/y00359136/code}
++export NPU_VISIBLE_DEVICES=${NPU_VISIBLE_DEVICES:-auto}
++# =====================
++
++DEVICES=()
++for d in /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc; do
++  [[ -e "$d" ]] && DEVICES+=(--device "$d")
++done
++
++if [[ "$NPU_VISIBLE_DEVICES" == "auto" ]]; then
++  mapfile -t DLIST < <(ls -1 /dev/davinci[0-9]* 2>/dev/null | sort -V)
++else
++  IFS=',' read -ra IDS <<<"$NPU_VISIBLE_DEVICES"
++  DLIST=()
++  for i in "${IDS[@]}"; do
++    [[ -e "/dev/davinci${i}" ]] && DLIST+=("/dev/davinci${i}")
++  done
++fi
++for d in "${DLIST[@]}"; do DEVICES+=(--device "$d"); done
++VISIBLE_IDS=$(printf "%s\n" "${DLIST[@]}" | sed -E 's#.*/davinci([0-9]+)#\1#' | paste -sd, -)
++
++#for d in  /dev/davinci1 /dev/davinci4 /dev/davinci5 /dev/davinci7; do
++#  [[ -e "$d" ]] && DEVICES+=(--device "$d")
++#done
++
++MOUNTS=(
++  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver
++  -v /etc/ascend_install.info:/etc/ascend_install.info
++  -v /var/log/npu/:/usr/slog
++  -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi
++  -v /sys/fs/cgroup:/sys/fs/cgroup:ro
++  -v /usr/local/dcmi:/usr/local/dcmi
++  -v "${MODEL_DIR}":/workspace/models/
++  -v "${SGLANG_DIR}":/workspace/code/
++  -v "${CACHE_DIR}":/root/.cache
++)
++
++# 组装容器内部初始化命令（注意必须是一行）
++CMD='
++
++# 0. 强制让 APT 使用环境变量中的代理
++echo "==> 配置 APT 代理..."
++mkdir -p /etc/apt/apt.conf.d
++echo "Acquire::http::Proxy \"$http_proxy\";" > /etc/apt/apt.conf.d/proxy.conf
++echo "Acquire::https::Proxy \"$https_proxy\";" >> /etc/apt/apt.conf.d/proxy.conf
++
++set -e
++# 1. 配置 APT 镜像源 (使用华为云公共镜像源 repo.huaweicloud.com)
++echo "==> 配置 APT 镜像源..."
++sed -i "s@http://ports.ubuntu.com/ubuntu-ports/@http://repo.huaweicloud.com/ubuntu-ports/@g" /etc/apt/sources.list
++# 如果基础镜像中包含原有的 mirrors.tools.huawei.com，也一并替换掉
++sed -i "s@http://mirrors.tools.huawei.com/ubuntu-ports/@http://repo.huaweicloud.com/ubuntu-ports/@g" /etc/apt/sources.list
++sed -i "s@https://mirrors.tools.huawei.com/ubuntu-ports/@http://repo.huaweicloud.com/ubuntu-ports/@g" /etc/apt/sources.list
++
++# 2. 安装并配置 SSH 服务
++echo "==> 安装 SSH 服务..."
++apt-get update
++apt-get install -y openssh-server
++apt-get install -y libgl1-mesa-glx
++
++echo "==> 配置 SSH 参数 (端口 8010)..."
++mkdir -p /var/run/sshd
++# 修改配置文件：允许 Root 登录、开启密码认证、修改端口为 8010
++sed -i "s/#PermitRootLogin prohibit-password/PermitRootLogin yes/" /etc/ssh/sshd_config
++sed -i "s/#PasswordAuthentication yes/PasswordAuthentication yes/" /etc/ssh/sshd_config
++sed -i "s/#Port 22/Port 8010/" /etc/ssh/sshd_config
++# 确保端口确实被修改（处理没有默认注释行的情况）
++echo "Port 8010" >> /etc/ssh/sshd_config
++
++echo "==> 设置 Root 密码为 123456..."
++echo "root:123456" | chpasswd
++
++echo "==> 启动 SSH 服务..."
++service ssh start
++
++# 3. 配置 Pip 镜像源 (使用华为云公共 Pip 源)
++echo "==> 配置 Pip 镜像源..."
++pip config set global.index-url https://repo.huaweicloud.com/repository/pypi/simple
++pip config set global.trusted-host repo.huaweicloud.com
++
++echo "==> 升级 pip 和基础工具..."
++pip install --upgrade pip
++pip install tabulate rich
++
++# 4. 验证与显示
++echo "==> 可见 NPU: $NPU_VISIBLE_DEVICES"
++if command -v npu-smi >/dev/null 2>&1; then
++    npu-smi info || true
++fi
++
++echo "容器初始化完毕，已进入交互模式。"
++exec bash
++'
++
++docker run --rm \
++  --name "${NAME}" \
++  "${DEVICES[@]}" \
++  "${MOUNTS[@]}" \
++  -e http_proxy="${http_proxy:-}" \
++  -e https_proxy="${https_proxy:-}" \
++  -e HTTP_PROXY="${http_proxy:-}" \
++  -e HTTPS_PROXY="${https_proxy:-}" \
++  -e no_proxy="${no_proxy:-}" \
++  -e NO_PROXY="${no_proxy:-}" \
++  -e ASCEND_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" \
++  -e NPU_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"\
++  --cap-add=SYS_PTRACE \
++  --security-opt seccomp=unconfined \
++  --ipc=host \
++  --privileged=true \
++  --shm-size "${SHM_SIZE}" \
++  -p "${HOST_PORT_RANGE}:${PORT_RANGE}" \
++  -it "${IMAGE}" /bin/bash -c "${CMD}"
+diff --git a/third_party/llamafile/iqk_mul_mat_arm82.cpp b/third_party/llamafile/iqk_mul_mat_arm82.cpp
+index 505437c..6ab57f2 100644
+--- a/third_party/llamafile/iqk_mul_mat_arm82.cpp
++++ b/third_party/llamafile/iqk_mul_mat_arm82.cpp
+@@ -4,6 +4,11 @@
+ // Copyright(c) 2024 by KVCache.AI, All Rights Reserved.
+ 
+ #ifdef __aarch64__
++// Mirror the zen4 path: rename the symbols emitted from iqk_mul_mat_arm.inc
++// so that sgemm.cpp's iqk_mul_mat_{,moe_}arm82 references resolve at link
++// time. Without this rename, .inc emits the un-suffixed iqk_mul_mat / _moe
++// and `kt_kernel_ext.so` reports `undefined symbol: iqk_mul_mat_moe_arm82`
++// at import time.
+ #define iqk_mul_mat iqk_mul_mat_arm82
+ #define iqk_mul_mat_moe iqk_mul_mat_moe_arm82
+ #include "iqk_mul_mat_arm.inc"

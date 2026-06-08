@@ -1,0 +1,909 @@
+From 0ddd0e12d2fbbb3d36d18aeeaeb55b896193bff8 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Thu, 14 May 2026 02:21:31 +0000
+Subject: [PATCH 1/5] =?UTF-8?q?fix(npu):=20Triton=20=E4=B8=8D=E5=8F=AF?=
+ =?UTF-8?q?=E7=94=A8=E6=97=B6=20KV/req=5Fto=5Ftoken=20=E5=9B=9E=E9=80=80?=
+ =?UTF-8?q?=EF=BC=9BKT=20EP=20NPU=20=E9=80=82=E9=85=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ python/pyproject.toml                         | 106 +++--------
+ python/pyproject_npu.toml                     | 149 ----------------
+ .../srt/hardware_backend/npu/allocator_npu.py |  36 +++-
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 128 +++++++++++---
+ python/sglang/srt/mem_cache/common.py         | 165 +++++++++++++++++-
+ python/sglang/srt/utils/kt_accel.py           |  70 ++++++++
+ 6 files changed, 391 insertions(+), 263 deletions(-)
+ mode change 100755 => 100644 python/pyproject.toml
+ delete mode 100644 python/pyproject_npu.toml
+ create mode 100644 python/sglang/srt/utils/kt_accel.py
+
+diff --git a/python/pyproject.toml b/python/pyproject.toml
+old mode 100755
+new mode 100644
+index 538ad4908..704df6e3e
+--- a/python/pyproject.toml
++++ b/python/pyproject.toml
+@@ -17,27 +17,23 @@ classifiers = [
+ dependencies = [
+   "IPython",
+   "aiohttp",
+-  "apache-tvm-ffi>=0.1.5,<0.2",
+   "anthropic>=0.20.0",
+   "blobfile==3.0.0",
++  "av",
+   "build",
+   "compressed-tensors",
+-  "cuda-python==12.9",
+-  "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+   "datasets",
+   "einops",
+   "fastapi",
+-  "flashinfer_python==0.6.7.post3", # keep it aligned with jit-cache version in Dockerfile
+-  "flashinfer_cubin==0.6.7.post3",
+   "gguf",
++  "hf_transfer",
++  "huggingface_hub",
+   "interegular",
+   "llguidance>=0.7.11,<0.8.0",
+   "modelscope",
+   "msgspec",
+   "ninja",
+   "numpy",
+-  "nvidia-cutlass-dsl>=4.4.1",
+-  "nvidia-ml-py",
+   "openai-harmony==0.0.4",
+   "openai==2.6.1",
+   "orjson",
+@@ -52,75 +48,39 @@ dependencies = [
+   "pydantic",
+   "python-multipart",
+   "pyzmq>=25.1.2",
+-  "quack-kernels>=0.3.0",
+   "requests",
+   "scipy",
+   "sentencepiece",
+   "setproctitle",
+-  "flash-attn-4>=4.0.0b4",
+-  "sglang-kernel==0.4.1",
+   "soundfile==0.13.1",
+   "tiktoken",
+   "timm==1.0.16",
+-  "torch_memory_saver==0.0.9",
+-  "torch==2.9.1",
+   "torchao==0.9.0",
+-  "torchaudio==2.9.1",
+-  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.9.1 for torch 2.9.x. Not available on Linux ARM.
+-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+-  "torchvision",
+   "tqdm",
+   "mistral_common>=1.9.0",
+   "transformers==5.3.0",
+   "uvicorn",
+   "uvloop",
+-  "watchfiles",
+   "xgrammar==0.1.32",
+   "smg-grpc-servicer>=0.5.0",
+-  "kernels",
+-]
+-
+-[[tool.uv.index]]
+-name = "pypi"
+-url = "https://pypi.org/simple"
+-default = true
+-
+-[[tool.uv.index]]
+-name = "torch-cu129"
+-url = "https://download.pytorch.org/whl/cu129"
+-explicit = true
+-
+-[tool.uv.sources]
+-torch = [
+-  { index = "pypi", marker = "platform_machine == 'x86_64'"},
+-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+ ]
+ 
+ [project.optional-dependencies]
+ checkpoint-engine = ["checkpoint-engine==0.1.2"]
+-runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+ diffusion = [
+-  "PyYAML==6.0.1",
+-  "cloudpickle==3.1.2",
+-  "diffusers==0.37.0",
+-  "imageio==2.36.0",
+-  "imageio-ffmpeg==0.5.1",
+-  "moviepy>=2.0.0",
+-  "opencv-python-headless==4.10.0.84",
+-  "remote-pdb==2.1.0",
+-  "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+-  "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+-  "runai_model_streamer>=0.15.7",
+-  "cache-dit==1.3.0",
+-  "addict==2.4.0",
+-  "av==16.1.0",
+-  "scikit-image==0.25.2",
+-  "trimesh>=4.0.0",
+-  "xatlas",
+-]
+-
+-ray = [
+-  "ray[default]>=2.54.0",
++    "PyYAML==6.0.1",
++    "cloudpickle",
++    "diffusers==0.37.0",
++    "imageio==2.36.0",
++    "imageio-ffmpeg==0.5.1",
++    "moviepy>=2.0.0",
++    "opencv-python==4.10.0.84",
++    "remote-pdb",
++    "cache-dit==1.2.1",
++    "addict",
++    "scikit-image==0.25.2",
++    "trimesh>=4.0.0",
++    "xatlas",
+ ]
+ 
+ tracing = [
+@@ -130,41 +90,23 @@ tracing = [
+   "opentelemetry-sdk",
+ ]
+ 
+-http2 = [
+-  "granian>=2.6.0",
+-]
+-
+ test = [
+   "accelerate",
+-  "addict",
+-  "bitsandbytes",
+   "expecttest",
++  "gguf",
+   "jsonlines",
+-  "lm-eval[api]>=0.4.9.2",
+   "matplotlib",
+   "pandas",
+-  "parameterized",
+   "peft>=0.18.0",
+-  "polars",
+   "pytest",
+-  "pytest-cov",
+-  "diff-cover",
+   "sentence_transformers",
+   "tabulate",
+-  "granian>=2.6.0",
+-]
+-
+-dev = ["sglang[test]"]
+-
+-all = [
+-  "sglang[diffusion]",
+-  "sglang[tracing]",
+-  "sglang[http2]",
+ ]
+ 
+-[tool.uv.extra-build-dependencies]
+-st-attn = ["torch", "setuptools"]
+-vsa = ["torch", "setuptools"]
++# https://docs.sglang.io/platforms/ascend_npu.html
++srt_npu = []
++all_npu = ["sglang[diffusion]"]
++dev_npu = ["sglang[all_npu]", "sglang[test]"]
+ 
+ [project.urls]
+ "Homepage" = "https://github.com/sgl-project/sglang"
+@@ -172,7 +114,6 @@ vsa = ["torch", "setuptools"]
+ 
+ [project.scripts]
+ sglang = "sglang.cli.main:main"
+-killall_sglang = "sglang.cli.killall:main"
+ 
+ [tool.setuptools.package-data]
+ "sglang" = [
+@@ -206,8 +147,3 @@ exclude = [
+ root = ".."
+ version_file = "sglang/_version.py"
+ git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
+-# Allow editable installs even when .git metadata is not available.
+-fallback_version = "0.0.0.dev0"
+-
+-[tool.kernels.dependencies]
+-"kernels-community/sgl-flash-attn3" = 1
+diff --git a/python/pyproject_npu.toml b/python/pyproject_npu.toml
+deleted file mode 100644
+index 704df6e3e..000000000
+--- a/python/pyproject_npu.toml
++++ /dev/null
+@@ -1,149 +0,0 @@
+-[build-system]
+-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+-build-backend = "setuptools.build_meta"
+-
+-[project]
+-name = "sglang"
+-dynamic = ["version"]
+-description = "SGLang is a fast serving framework for large language models and vision language models."
+-readme = "README.md"
+-requires-python = ">=3.10"
+-license = { file = "LICENSE" }
+-classifiers = [
+-  "Programming Language :: Python :: 3",
+-  "License :: OSI Approved :: Apache Software License",
+-]
+-
+-dependencies = [
+-  "IPython",
+-  "aiohttp",
+-  "anthropic>=0.20.0",
+-  "blobfile==3.0.0",
+-  "av",
+-  "build",
+-  "compressed-tensors",
+-  "datasets",
+-  "einops",
+-  "fastapi",
+-  "gguf",
+-  "hf_transfer",
+-  "huggingface_hub",
+-  "interegular",
+-  "llguidance>=0.7.11,<0.8.0",
+-  "modelscope",
+-  "msgspec",
+-  "ninja",
+-  "numpy",
+-  "openai-harmony==0.0.4",
+-  "openai==2.6.1",
+-  "orjson",
+-  "outlines==0.1.11",
+-  "packaging",
+-  "partial_json_parser",
+-  "pillow",
+-  "prometheus-client>=0.20.0",
+-  "psutil",
+-  "py-spy",
+-  "pybase64",
+-  "pydantic",
+-  "python-multipart",
+-  "pyzmq>=25.1.2",
+-  "requests",
+-  "scipy",
+-  "sentencepiece",
+-  "setproctitle",
+-  "soundfile==0.13.1",
+-  "tiktoken",
+-  "timm==1.0.16",
+-  "torchao==0.9.0",
+-  "tqdm",
+-  "mistral_common>=1.9.0",
+-  "transformers==5.3.0",
+-  "uvicorn",
+-  "uvloop",
+-  "xgrammar==0.1.32",
+-  "smg-grpc-servicer>=0.5.0",
+-]
+-
+-[project.optional-dependencies]
+-checkpoint-engine = ["checkpoint-engine==0.1.2"]
+-diffusion = [
+-    "PyYAML==6.0.1",
+-    "cloudpickle",
+-    "diffusers==0.37.0",
+-    "imageio==2.36.0",
+-    "imageio-ffmpeg==0.5.1",
+-    "moviepy>=2.0.0",
+-    "opencv-python==4.10.0.84",
+-    "remote-pdb",
+-    "cache-dit==1.2.1",
+-    "addict",
+-    "scikit-image==0.25.2",
+-    "trimesh>=4.0.0",
+-    "xatlas",
+-]
+-
+-tracing = [
+-  "opentelemetry-api",
+-  "opentelemetry-exporter-otlp",
+-  "opentelemetry-exporter-otlp-proto-grpc",
+-  "opentelemetry-sdk",
+-]
+-
+-test = [
+-  "accelerate",
+-  "expecttest",
+-  "gguf",
+-  "jsonlines",
+-  "matplotlib",
+-  "pandas",
+-  "peft>=0.18.0",
+-  "pytest",
+-  "sentence_transformers",
+-  "tabulate",
+-]
+-
+-# https://docs.sglang.io/platforms/ascend_npu.html
+-srt_npu = []
+-all_npu = ["sglang[diffusion]"]
+-dev_npu = ["sglang[all_npu]", "sglang[test]"]
+-
+-[project.urls]
+-"Homepage" = "https://github.com/sgl-project/sglang"
+-"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+-
+-[project.scripts]
+-sglang = "sglang.cli.main:main"
+-
+-[tool.setuptools.package-data]
+-"sglang" = [
+-  "srt/**/*",
+-  "jit_kernel/**/*"
+-]
+-
+-[tool.setuptools.packages.find]
+-exclude = [
+-  "assets*",
+-  "benchmark*",
+-  "docs*",
+-  "dist*",
+-  "playground*",
+-  "scripts*",
+-  "tests*",
+-]
+-
+-[tool.wheel]
+-exclude = [
+-  "assets*",
+-  "benchmark*",
+-  "docs*",
+-  "dist*",
+-  "playground*",
+-  "scripts*",
+-  "tests*",
+-]
+-
+-[tool.setuptools_scm]
+-root = ".."
+-version_file = "sglang/_version.py"
+-git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
+diff --git a/python/sglang/srt/hardware_backend/npu/allocator_npu.py b/python/sglang/srt/hardware_backend/npu/allocator_npu.py
+index c7a9f8c1d..5b970e066 100644
+--- a/python/sglang/srt/hardware_backend/npu/allocator_npu.py
++++ b/python/sglang/srt/hardware_backend/npu/allocator_npu.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -15,6 +16,39 @@ if TYPE_CHECKING:
+     from sglang.srt.mem_cache.memory_pool import KVCache
+ 
+ 
++# ---------------------------------------------------------------------------
++# Triton availability probe (single-card NPU + KT downstream patch)
++# ---------------------------------------------------------------------------
++# 上游 `sgl_kernel_npu.mem_cache.allocator.alloc_extend_kernel` 是个 ``@triton.jit``
++# 内核，需要 triton-ascend 后端注册到 ``triton.runtime.driver``。在我们这台 NPU
++# docker 里 ``triton 3.7`` 与 ``triton-ascend 3.2`` 是版本错配（ascend/compiler.py
++# 引用了 upstream 已删除的 ``AttrsDescriptor``），后端注册失败，调用就会抛
++# ``RuntimeError: 0 active drivers ([])``；而本文件已经自带的 ``alloc_extend_naive``
++# 是纯 PyTorch 等价实现，bs 较小时性能差异可以忽略。我们在 import 期做一次性探测，
++# 失败则把后续 prefill 全部切到 naive 分支；若 triton-ascend 后续修好，把环境
++# 变量 ``SGLANG_NPU_ALLOC_FORCE_NAIVE`` 显式置 0 即可保留旧行为以做对比测试。
++def _detect_triton_driver_available() -> bool:
++    if os.environ.get("SGLANG_NPU_ALLOC_FORCE_NAIVE", "") == "1":
++        return False
++    try:
++        from triton.runtime.driver import driver as _triton_driver  # type: ignore
++
++        _ = _triton_driver.active  # triggers _create_driver()
++        return True
++    except Exception as e:  # ImportError / RuntimeError("0 active drivers") / etc.
++        logger.warning(
++            "[allocator_npu] Triton driver unavailable (%s: %s); falling back to "
++            "alloc_extend_naive for KV slot allocation. This is a pure-PyTorch path "
++            "and does not affect forward numerics.",
++            type(e).__name__,
++            e,
++        )
++        return False
++
++
++_TRITON_DRIVER_AVAILABLE = _detect_triton_driver_available()
++
++
+ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+     def __init__(
+         self,
+@@ -56,7 +90,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+             )
+             return None
+ 
+-        if num_new_pages_item < 200:
++        if num_new_pages_item < 200 and _TRITON_DRIVER_AVAILABLE:
+             from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
+ 
+             out_indices = torch.empty(
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 128853931..4dcb01dac 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -7,14 +7,19 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
+ (using any quantization method) and CPU experts (using AMX/AVX instructions).
+ """
+ 
++import logging
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, Optional
++from typing import TYPE_CHECKING, Optional, Tuple
+ 
+ import torch
+ 
+ from sglang.srt.distributed import get_tensor_model_parallel_rank
+ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+ from sglang.srt.utils import get_compiler_backend
++from sglang.srt.utils.kt_accel import (
++    kt_current_stream_handle,
++    kt_device_synchronize,
++)
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.moe import MoeRunnerConfig
+@@ -32,6 +37,34 @@ except ImportError:
+     KTRANSFORMERS_AVAILABLE = False
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
++def resolve_kt_weight_path_for_layer(weight_path_template: str, layer_idx: int) -> str:
++    """Expand ``--kt-weight-path`` for per-layer split GGUFs (e.g. DeepSeek-V4-Flash).
++
++    Supported placeholders:
++
++    - ``{layer_idx}`` — named, recommended (e.g. ``.../dsv4_layer{layer_idx}.gguf``).
++    - A single anonymous ``{}`` — filled with the integer ``layer_idx`` (e.g. handoff
++      ``.../dsv4_layer{}.gguf``).
++
++    If there is no placeholder, the path is returned unchanged (one shared weight path).
++    """
++    if "{layer_idx}" in weight_path_template:
++        return weight_path_template.format(layer_idx=layer_idx)
++    if weight_path_template.count("{}") == 1:
++        # Use replace (not str.format) so a lone ``{}`` is unambiguous. Some
++        # deployment/YAML layers mangle ``{}``; ``{layer_idx}`` is safer (see p27 script).
++        return weight_path_template.replace("{}", str(layer_idx), 1)
++    if weight_path_template.count("{}") > 1:
++        logger.warning(
++            "[KT] kt_weight_path contains multiple `{}` placeholders; "
++            "using literal path without per-layer expansion."
++        )
++    return weight_path_template
++
++
+ @dataclass
+ class KTConfig:
+     """Configuration for KTransformers heterogeneous computing CPU part.
+@@ -96,22 +129,49 @@ def create_kt_config_from_server_args(
+ 
+ 
+ @torch.compile(dynamic=True, backend=get_compiler_backend())
+-def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
+-    """Mask CPU expert IDs by setting them to -1.
+-
+-    This function masks expert IDs that should be computed on CPU (IDs >= num_gpu_experts)
+-    so they won't be computed on GPU. The masked IDs are set to -1, which causes the
+-    GPU MoE kernel to skip those experts.
++def mask_cpu_expert_routing(
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    num_gpu_experts: int,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Make ``topk_ids/topk_weights`` safe for *both* CUDA and NPU MoE kernels.
++
++    Semantics:
++      - For positions where ``topk_ids < num_gpu_experts`` (GPU experts) — keep id
++        and weight unchanged.
++      - For positions where ``topk_ids >= num_gpu_experts`` (CPU experts owned by
++        ``KTMoEWrapper.submit_forward`` on the other path) — replace the id with
++        ``0`` (a valid GPU expert) and zero the weight.
++
++    Why not just ``topk_ids[mask] = -1`` like baseline?
++      The baseline assumed the downstream GPU MoE accepts ``-1`` as a "skip"
++      sentinel. The NPU path (``hardware_backend/npu/quantization/fused_moe_method_npu.py
++      ::npu_fused_experts``) uses ``npu_moe_init_routing`` (V1) +
++      ``npu_moe_compute_expert_tokens``, which do ``count[expert_idx]++`` with
++      *no* range/sign check — ``-1`` triggers a negative-offset DMA and aicore
++      exception (CANN error 507015, "D-cache→UB bus non-zero response").
++      Mapping CPU rows to ``(expert 0, weight 0)`` is mathematically equivalent
++      (GPU contribution is multiplied by 0) and is the safest single-rewrite
++      that keeps shapes static for graph capture.
++
++    Also avoids ``aten.index_put`` (no NPU torchair ge_converter for it, see
++    ERR03007 during graph capture).
++    """
++    is_gpu = topk_ids < num_gpu_experts
++    safe_ids = torch.where(is_gpu, topk_ids, torch.zeros_like(topk_ids))
++    safe_weights = torch.where(is_gpu, topk_weights, torch.zeros_like(topk_weights))
++    return safe_ids, safe_weights
+ 
+-    Args:
+-        topk_ids: Tensor of shape [num_tokens, top_k] containing expert IDs
+-        num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
+ 
+-    Returns:
+-        Modified topk_ids tensor with CPU expert IDs masked as -1
+-    """
+-    topk_ids[topk_ids >= num_gpu_experts] = -1
+-    return topk_ids
++# Kept as a thin shim for any external caller still using the old name; the
++# meaningful work is now in ``mask_cpu_expert_routing`` (which also zeroes the
++# weights). Do *not* use the ``-1`` sentinel form below for NPU paths.
++def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
++    return torch.where(
++        topk_ids < num_gpu_experts,
++        topk_ids,
++        torch.full_like(topk_ids, -1),
++    )
+ 
+ 
+ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -216,16 +276,26 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         # 2. Initialize KT wrapper for CPU experts
+         # CPU experts: num_gpu_experts to num_experts-1
+         if self.tp_rank == 0:
++            resolved_weight_path = resolve_kt_weight_path_for_layer(
++                self.kt_config.weight_path, self.kt_config.layer_idx
++            )
++            # The installed ``kt_kernel`` wheel expects a per-layer Bool mask
++            # ``[num_experts]`` instead of an int ``num_gpu_experts``. Build the
++            # baseline-equivalent "first N experts on GPU" mask here so we don't
++            # need to introduce fork's full placement-strategy machinery.
++            gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
++            gpu_experts_mask[: self.num_gpu_experts] = True
+             self.wrapper = KTMoEWrapper(
+                 layer_idx=self.kt_config.layer_idx,
+                 num_experts=num_experts,
+                 num_experts_per_tok=num_experts_per_tok,
+                 hidden_size=hidden_size,
+                 moe_intermediate_size=intermediate_size_full,
+-                num_gpu_experts=self.num_gpu_experts,
++                gpu_experts_mask=gpu_experts_mask,
+                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                 threadpool_count=self.kt_config.threadpool_count,
+-                weight_path=self.kt_config.weight_path,
++                numa_nodes=None,
++                weight_path=resolved_weight_path,
+                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                 method=self.kt_config.method,
+                 max_deferred_experts_per_token=layer_max_deferred,
+@@ -243,7 +313,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         # 2. Load CPU weights using KT wrapper
+         if self.tp_rank == 0 and self.wrapper is not None:
+-            torch.cuda.synchronize()
++            kt_device_synchronize()
+ 
+             # Get expert location metadata for CPU expert mapping
+             from sglang.srt.eplb.expert_location_dispatch import (
+@@ -299,7 +369,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         # Submit forward task to CPU (non-blocking)
+         self.wrapper.submit_forward(
+-            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
++            x, topk_ids, topk_weights, kt_current_stream_handle(x.device)
+         )
+ 
+     def sync(self, x: torch.Tensor) -> torch.Tensor:
+@@ -317,9 +387,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             return torch.zeros_like(x)
+ 
+         # Wait for CPU computation and retrieve results
+-        return self.wrapper.sync_forward(
+-            x, torch.cuda.current_stream(x.device).cuda_stream
+-        )
++        return self.wrapper.sync_forward(x, kt_current_stream_handle(x.device))
+ 
+     def apply(
+         self,
+@@ -349,13 +417,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         if self.tp_rank == 0:
+             self.submit(layer, dispatch_output)
+ 
+-        # Step 2: Prepare GPU computation by masking CPU expert IDs
+-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
++        # Step 2: Prepare GPU computation by masking out CPU expert rows.
++        # CPU rows (id >= num_gpu_experts) are remapped to (expert 0, weight 0)
++        # — see ``mask_cpu_expert_routing`` docstring for why we do not use
++        # ``-1`` here (would crash NPU ``npu_moe_init_routing/compute_expert_tokens``).
+         topk_ids = topk_output.topk_ids
+-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
++        topk_weights = topk_output.topk_weights
++        masked_topk_ids, masked_topk_weights = mask_cpu_expert_routing(
++            topk_ids, topk_weights, self.num_gpu_experts
++        )
+ 
+         # Create modified dispatch output for GPU computation
+-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
++        masked_topk_output = topk_output._replace(
++            topk_ids=masked_topk_ids,
++            topk_weights=masked_topk_weights,
++        )
+         masked_dispatch_output = dispatch_output._replace(
+             topk_output=masked_topk_output
+         )
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index a35458426..064aeca56 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -35,6 +35,104 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
+ logger = logging.getLogger(__name__)
+ 
+ 
++# ---------------------------------------------------------------------------
++# NPU + KT downstream patch:
++# ---------------------------------------------------------------------------
++# 在我们的 NPU docker 里 ``triton 3.7`` 与 ``triton-ascend 3.2`` 版本错配，
++# 任何 ``@triton.jit`` kernel 在调用时都会抛 ``0 active drivers ([])``。基线
++# 已经为 attention backend == "ascend" 在 ``support_triton`` 里把 ascend 标
++# 成 False，但本文件里 ``write_multi_cache_indices`` / ``get_last_loc`` 等公
++# 共函数并没全部去判这个旗子（应该是 oversight，因为 baseline 8 卡机器上
++# triton 装得是好的），到了 NPU 单卡 prefill 就会炸。
++#
++# 这里加一次性 driver 探测；探到不可用，则把所有调用点切到 torch 等价路径
++# （纯 PyTorch、bs=1/2 单卡场景性能可接受，且数值完全等价）。该探测和
++# ``hardware_backend/npu/allocator_npu.py`` 里那个用的是同样的逻辑，保持一致。
++def _detect_triton_driver_available() -> bool:
++    import os as _os
++
++    if _os.environ.get("SGLANG_NPU_ALLOC_FORCE_NAIVE", "") == "1":
++        return False
++    try:
++        from triton.runtime.driver import driver as _triton_driver  # type: ignore
++
++        _ = _triton_driver.active
++        return True
++    except Exception:
++        return False
++
++
++_TRITON_DRIVER_AVAILABLE = _detect_triton_driver_available()
++
++
++def _write_req_to_token_pool_torch(
++    req_to_token_ptr: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    prefix_tensors: list[torch.Tensor],
++    pre_lens: torch.Tensor,
++    seq_lens: torch.Tensor,
++    extend_lens: torch.Tensor,
++    out_cache_loc: torch.Tensor,
++) -> None:
++    """Pure-PyTorch equivalent of ``write_req_to_token_pool_triton`` for NPU.
++
++    Mirrors the Triton kernel: for batch ``i`` copy ``prefix_tensors[i][:pre_len]``
++    into ``req_to_token_ptr[req_pool_index, :pre_len]`` and the extend slice of
++    ``out_cache_loc`` into ``req_to_token_ptr[req_pool_index, pre_len:seq_len]``.
++    """
++    bs = req_pool_indices.shape[0]
++    if bs == 0:
++        return
++    cumsum_start = 0
++    for i in range(bs):
++        req_idx = int(req_pool_indices[i].item())
++        pre_len = int(pre_lens[i].item())
++        seq_len = int(seq_lens[i].item())
++        extend_len = int(extend_lens[i].item())
++        if pre_len > 0:
++            req_to_token_ptr[req_idx, :pre_len] = prefix_tensors[i][:pre_len].to(
++                req_to_token_ptr.dtype
++            )
++        write_len = seq_len - pre_len
++        if write_len > 0:
++            req_to_token_ptr[req_idx, pre_len:seq_len] = out_cache_loc[
++                cumsum_start : cumsum_start + write_len
++            ].to(req_to_token_ptr.dtype)
++        cumsum_start += extend_len
++
++
++def _write_req_to_token_pool_only_alloc_size_torch(
++    req_to_token_ptr: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    prefix_tensors: list[torch.Tensor],
++    pre_lens: torch.Tensor,
++    seq_lens: torch.Tensor,
++    alloc_lens: torch.Tensor,
++    out_cache_loc: torch.Tensor,
++) -> None:
++    bs = req_pool_indices.shape[0]
++    if bs == 0:
++        return
++    cumsum_start = 0
++    for i in range(bs):
++        req_idx = int(req_pool_indices[i].item())
++        pre_len = int(pre_lens[i].item())
++        seq_len = int(seq_lens[i].item())
++        alloc_len = int(alloc_lens[i].item())
++        alloc_offset = seq_len - alloc_len
++        if pre_len > 0:
++            req_to_token_ptr[req_idx, :pre_len] = prefix_tensors[i][:pre_len].to(
++                req_to_token_ptr.dtype
++            )
++        if alloc_len > 0:
++            req_to_token_ptr[
++                req_idx, alloc_offset : alloc_offset + alloc_len
++            ] = out_cache_loc[cumsum_start : cumsum_start + alloc_len].to(
++                req_to_token_ptr.dtype
++            )
++        cumsum_start += alloc_len
++
++
+ @triton.jit
+ def write_req_to_token_pool_triton(
+     req_to_token_ptr,  # [max_batch, max_context_len]
+@@ -154,7 +252,7 @@ def write_cache_indices(
+     prefix_tensors: list[torch.Tensor],
+     req_to_token_pool: ReqToTokenPool,
+ ):
+-    if support_triton(get_global_server_args().attention_backend):
++    if support_triton(get_global_server_args().attention_backend) and _TRITON_DRIVER_AVAILABLE:
+         prefix_pointers = torch.tensor(
+             [t.data_ptr() for t in prefix_tensors],
+             device=req_to_token_pool.device,
+@@ -203,6 +301,66 @@ def write_multi_cache_indices(
+     prefix_tensors: list[torch.Tensor],
+     req_to_token_pool: ReqToTokenPool,
+ ):
++    if not _TRITON_DRIVER_AVAILABLE:
++        # NPU pure-PyTorch path. 与 write_cache_indices 的 else 分支一脉相承，
++        # 把每条 triton kernel 调用替换成 torch 等价实现。bs 在我们单卡场景下
++        # 通常 == 1，性能可接受。
++        _write_req_to_token_pool_torch(
++            req_to_token_pool.req_to_token,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.full_kv_len,
++            seq_lens_tensor.full_kv_len,
++            out_cache_loc.out_full_loc,
++        )
++        _write_req_to_token_pool_only_alloc_size_torch(
++            req_to_token_pool.req_to_token_swa,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.full_kv_len,
++            seq_lens_tensor.swa_kv_len,
++            out_cache_loc.out_swa_loc,
++        )
++        _write_req_to_token_pool_torch(
++            req_to_token_pool.req_to_token_c4,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.c4_kv_len,
++            seq_lens_tensor.c4_kv_len,
++            out_cache_loc.out_c4_loc,
++        )
++        _write_req_to_token_pool_torch(
++            req_to_token_pool.req_to_token_c128,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.c128_kv_len,
++            seq_lens_tensor.c128_kv_len,
++            out_cache_loc.out_c128_loc,
++        )
++        _write_req_to_token_pool_only_alloc_size_torch(
++            req_to_token_pool.req_to_token_c4_state,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.full_kv_len,
++            seq_lens_tensor.c4_state_kv_len,
++            out_cache_loc.out_c4_state_loc,
++        )
++        _write_req_to_token_pool_only_alloc_size_torch(
++            req_to_token_pool.req_to_token_c128_state,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.full_kv_len,
++            seq_lens_tensor.c128_state_kv_len,
++            out_cache_loc.out_c128_state_loc,
++        )
++        return
++
+     prefix_pointers = torch.tensor(
+         [t.data_ptr() for t in prefix_tensors],
+         device=req_to_token_pool.device,
+@@ -280,7 +438,10 @@ def get_last_loc(
+     req_pool_indices_tensor: torch.Tensor,
+     prefix_lens_tensor: torch.Tensor,
+ ) -> torch.Tensor:
+-    if get_global_server_args().attention_backend != "torch_native":
++    if (
++        get_global_server_args().attention_backend != "torch_native"
++        and _TRITON_DRIVER_AVAILABLE
++    ):
+         impl = get_last_loc_triton
+     else:
+         impl = get_last_loc_torch
+diff --git a/python/sglang/srt/utils/kt_accel.py b/python/sglang/srt/utils/kt_accel.py
+new file mode 100644
+index 000000000..d7bbc9cd4
+--- /dev/null
++++ b/python/sglang/srt/utils/kt_accel.py
+@@ -0,0 +1,70 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CUDA / Ascend NPU helpers for KT EP hybrid paths in ``kt_ep_wrapper``.
++
++``torch_npu`` mocks ``torch.cuda.is_available`` as False on Ascend; branch on
++``torch.Tensor.device.type`` instead of ``torch.cuda.is_available()`` alone.
++"""
++
++from __future__ import annotations
++
++from contextlib import AbstractContextManager, nullcontext
++from typing import Any, Optional
++
++import torch
++
++
++def _accel_mod(device: torch.device) -> Any:
++    if device.type == "cuda":
++        return torch.cuda
++    if device.type == "npu":
++        import torch_npu  # noqa: F401
++
++        return torch.npu
++    raise TypeError(
++        f"KT EP hybrid stream APIs require device type 'cuda' or 'npu', got {device.type!r}"
++    )
++
++
++def kt_device_synchronize(device: Optional[torch.device] = None) -> None:
++    """Synchronize the current thread with work on ``device`` (or default accel)."""
++    if device is None:
++        if torch.cuda.is_available() and getattr(torch.version, "cuda", None):
++            torch.cuda.synchronize()
++            return
++        if hasattr(torch, "npu") and torch.npu.is_available():
++            torch.npu.synchronize()
++        return
++    _accel_mod(device).synchronize(device)
++
++
++def kt_current_stream(device: torch.device) -> Any:
++    return _accel_mod(device).current_stream(device)
++
++
++def kt_current_stream_handle(device: torch.device) -> int:
++    """Native stream handle for ``kt_kernel`` / ``submit_with_cuda_stream``."""
++    stream = kt_current_stream(device)
++    if device.type == "npu":
++        return int(stream.npu_stream)
++    return int(stream.cuda_stream)
++
++
++def kt_new_stream(device: torch.device) -> Any:
++    return _accel_mod(device).Stream(device=device)
++
++
++def kt_new_event(device: torch.device) -> Any:
++    return _accel_mod(device).Event()
++
++
++def kt_stream_context(stream: Any, device: torch.device) -> AbstractContextManager:
++    return _accel_mod(device).stream(stream)
++
++
++def kt_maybe_cuda_host_register(
++    cpu_tensor: torch.Tensor, nbytes: int, device: torch.device
++) -> None:
++    """Pin host memory for DMA when running on CUDA; no-op on NPU."""
++    if device.type != "cuda" or not torch.cuda.is_available():
++        return
++    torch.cuda.cudart().cudaHostRegister(cpu_tensor.data_ptr(), nbytes, 0)
+-- 
+2.34.1

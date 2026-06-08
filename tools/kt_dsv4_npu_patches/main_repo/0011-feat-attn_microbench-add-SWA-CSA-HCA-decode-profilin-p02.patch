@@ -1,0 +1,2102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 11/13] feat(attn_microbench): add SWA/CSA/HCA decode profiling (part 2/5)
+
+diff --git a/tools/attn_microbench/PLAN.md b/tools/attn_microbench/PLAN.md
+new file mode 100644
+index 0000000..a714ea8
+--- /dev/null
++++ b/tools/attn_microbench/PLAN.md
+@@ -0,0 +1,365 @@
++# 方案 A：32k Decode Attention Microbench 详细计划
++
++> **目标**：独立小工程，直调当前生产通路 `torch.ops.custom.*`，分别 profiling **SWA / CSA / HCA** 三类 attention 层在 **seq_len=32768** decode 步的耗时。  
++> **不跑全模型 forward**，但 KV / page table 需与真实 prefill 一致或可追溯。  
++> **代码锚点**：`third_party/sglang/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py`
++
++---
++
++## 1. 三类 Layer 定义（与生产对齐）
++
++DeepSeek-V4-Flash 43 层 decode 共用 `npu_sparse_attn_sharedkv`，按 `compress_ratios[layer_id]` 分三种 metadata 路径：
++
++| 代号 | 含义 | compress_ratio | 代表 layer_id | metadata key | 额外算子 |
++|------|------|----------------|---------------|--------------|----------|
++| **SWA** | Sliding Window Attention only | **1** | **0, 1** | `c1a_metadata` | 无 cmp 分支 |
++| **CSA** | Compressed Sparse Attention (c4 + LI topk) | **4** | **2, 4, 6, …**（21 层） | `c4a_metadata` | **`npu_quant_lightning_indexer`** → attn |
++| **HCA** | Highly Compressed Attention (c128 全量 cmp) | **128** | **3, 5, 7, …**（20 层） | `c128a_metadata` | 无 indexer（`cmp_sparse_indices=None`） |
++
++`config.json` 中 `compress_ratios` 模式（前 10 层）：`[1, 1, 4, 128, 4, 128, …]`，L42=`4`。
++
++**共同点（三类都有）**：
++- SWA 本地窗：`ori_kv` + `ori_block_table`，`ori_mask_mode=4`，`ori_win_left=127`
++- decode 单 token：`q` shape `[1, 64, 512]`（TND），`cu_seqlens_q=[0,1]`，`seqused_kv=[32768]`
++
++**差异点**：
++
++| 字段 | SWA | CSA | HCA |
++|------|-----|-----|-----|
++| `has_cmp_kv` | False | True | True |
++| `cmp_ratio` | — | 4 | 128 |
++| `cmp_kv` | — | paged compress buffer | paged compress buffer |
++| `cmp_block_table` | — | `[1, ⌈32768/4/128⌉]` = `[1,64]` pages | `[1, ⌈32768/128/128⌉]` = `[1,2]` pages |
++| `cmp_sparse_indices` | — | `[1,1,512]` from indexer | **None** |
++| 逻辑 cmp token 数 | — | ~8192 | ~256 |
++
++---
++
++## 2. 工程目录结构（建议）
++
++```text
++tools/attn_microbench/
++├── PLAN.md                          # 本文
++├── README.md                        # 用法与 env
++├── run_all.sh                       # 一键：dump + bench + report
++├── env.sh                           # CANN / DSv4 环境变量（与 p27 launch 对齐）
++├── config/
++│   └── dsv4_flash_32k.yaml          # seq_len, page_size, layer_ids, head 数
++├── dump/
++│   ├── hook_dump_kv.py              # 可选：server prefill 后 dump 一层 KV
++│   └── snapshot_format.md           # .pt 字段说明
++├── build/
++│   ├── metadata_builder.py          # 从 ascend_backend.compute_kernel_metadata 抽取
++│   ├── tensor_builder.py            # 由 snapshot 或 synthetic 构造 PA buffers
++│   └── page_table_utils.py          # swa/c4/c128 page table 与 seq_len 关系
++├── bench/
++│   ├── bench_swa.py                 # 只调 npu_sparse_attn_sharedkv (c1a)
++│   ├── bench_csa.py                 # indexer + attn (c4a)
++│   ├── bench_hca.py                 # 只调 attn (c128a)
++│   └── common.py                    # warmup, Event 计时, profiler 封装
++├── profile/
++│   ├── run_level0_profiler.sh       # torch_npu.profiler Text 导出
++│   └── parse_operator_csv.py      # 从 operator_details 抽 Device Self
++└── report/
++    └── summarize.py                 # 合并 SWA/CSA/HCA 表格输出
++```
++
++**依赖边界**：
++- 必须：`torch_npu`、`sgl_kernel_npu`（注册 `torch.ops.custom.*`）
++- 可选引用：`sglang.srt.hardware_backend.npu.attention.ascend_backend` 中常量/逻辑（不启动 server）
++- 不需要：KT MoE、全量 W8A8 权重、scheduler
++
++---
++
++## 3. 实施阶段
++
++### Phase 0：环境与准入（0.5 天）
++
++**任务**：
++1. `env.sh` 对齐 `p27_launch_ds4flash_npu_num_expert_0.sh`：
++   ```bash
++   export ASCEND_USE_FIA=1
++   export USE_PA_DECODE=1
++   export USE_PA_PREFILL=1
++   export IS_DEEPSEEK_V4=1
++   export LI_KV_DTYPE_INT8=1
++   export USE_FUSED_COMPRESSOR=1
++   ```
++2. 验证算子可 import：
++   ```python
++   import sgl_kernel_npu  # noqa
++   assert hasattr(torch.ops.custom, "npu_sparse_attn_sharedkv")
++   assert hasattr(torch.ops.custom, "npu_quant_lightning_indexer")
++   ```
++3. 单卡 NPU 可见，`page_size=128`。
++
++**准入标准**：三类 metadata op 各调用一次不 crash（可用 synthetic 小 seq_len=512 冒烟）。
++
++---
++
++### Phase 1：32k KV 状态准备（1–2 天）
++
++Attention 计时的前提是 **decode 步的 KV / page table 与 seq_len=32768 一致**。两种路径（二选一或并存）：
++
++#### 路径 1：Snapshot（推荐，生产 faithful）
++
++1. 用现有 `p27_long_context_decode_test.sh` 或 32k prefill workload 跑到 **profile decode token**：
++   ```bash
++   TARGET_SEQ_LEN=32768 PREFILL_TOKENS=32760 PROFILE_DECODE_TOKEN=8 ...
++   ```
++2. 在 `AscendAttnBackend.forward_sparse` 或 `token_to_kv_pool.get_*_buffer` 加 **一次性 dump hook**（环境变量 `ATTN_MICROBENCH_DUMP=1`）：
++   - 对代表层 **L0(SWA), L2(CSA), L3(HCA)** 保存：
++     - `ori_kv`, `cmp_kv`（若有）
++     - `swa_page_table`, `c4_page_table`, `c128_page_table`
++     - `seqused_kv`, `cu_seqlens_q`
++     - `sinks`（fp32 `[64]`）
++     - CSA 额外：`indexer` 的 `q,k,k_scale,weights` 或 dump 后的 `topk_idxs`
++3. 存为 `fixtures/seq32768_layer{L}.pt`。
++
++#### 路径 2：Synthetic（快速打通，精度次之）
++
++1. 按 `HybridSWAC4C128PoolConfigurator` 的 **paged shape** 分配 empty/random tensor：
++   - `ori_kv`: `[num_swa_blocks, 128, 1, 512]` bf16
++   - `cmp_kv` c4: `[num_c4_blocks, 128, 1, 512]`
++   - `cmp_kv` c128: `[num_c128_blocks, 128, 1, 512]`
++2. page table 填 **单调递增物理页号**（通过 `init_forward_metadata` decode 分支逻辑复现）。
++3. CSA 的 `topk_idxs` 可先 random valid indices，或通过 **小 seq prefill 一次** 生成后 freeze。
++
++**准入标准**：三类层 `npu_sparse_attn_sharedkv` forward 数值不 NaN，shape 与 CANN 一致。
++
++---
++
++### Phase 2：Metadata 与参数构造（1 天）
++
++从 `ascend_backend.compute_kernel_metadata()` **原样抽取**（避免手写参数漂移）：
++
++```python
++# metadata_builder.py 伪代码
++fa_common = {
++    "cu_seqlens_q": tensor([0, 1], int32, npu),
++    "seqused_kv": tensor([32768], int32, npu),
++    "cmp_ratio": 1,  # 会被 c4/c128 覆盖
++    "ori_mask_mode": 4,
++    "cmp_mask_mode": 3,
++    "ori_win_left": 127,
++    "ori_win_right": 0,
++    "layout_q": "TND",
++    "layout_kv": "PA_ND",
++}
++c1a = npu_sparse_attn_sharedkv_metadata(
++    batch_size=1, num_heads_q=64, num_heads_kv=1, head_dim=512,
++    has_ori_kv=True, has_cmp_kv=False, **fa_common,
++)
++c4a = ... has_cmp_kv=True, cmp_ratio=4, cmp_topk=512 ...
++c128a = ... has_cmp_kv=True, cmp_ratio=128 ...
++li_quant_metadata = npu_quant_lightning_indexer_metadata(
++    actual_seq_lengths_query=..., actual_seq_lengths_key=...,
++    sparse_count=512, cmp_ratio=4, num_heads_q=64, num_heads_k=1, head_dim=128, ...
++)
++```
++
++**decode attn 公共 kwargs**（`forward_sparse` decode + `USE_PA_DECODE` 分支）：
++
++```python
++attn_kwargs = {
++    "q": q,  # [1,64,512]
++    "ori_kv": ori_kv,
++    "ori_block_table": swa_page_table,
++    "sinks": sinks,
++    "metadata": metadata,  # c1a / c4a / c128a
++    "softmax_scale": 512**-0.5,
++    "cu_seqlens_q": [0,1],
++    "seqused_kv": [32768],
++    "ori_mask_mode": 4,
++    "ori_win_left": 127,
++    "ori_win_right": 0,
++    "layout_q": "TND",
++    "layout_kv": "PA_ND",
++}
++# CSA 追加:
++# cmp_ratio=4, cmp_kv, cmp_block_table, cmp_sparse_indices=topk.view(-1,1,512), cmp_mask_mode=3
++# HCA 追加:
++# cmp_ratio=128, cmp_kv, cmp_block_table, cmp_sparse_indices=None, cmp_mask_mode=3
++```
++
++**代表层选取**（microbench 默认）：
++
++| 类型 | layer_id | 说明 |
++|------|----------|------|
++| SWA | 0 | 无 compressor |
++| CSA | 2 | 第一个 c4 + indexer |
++| HCA | 3 | 第一个 c128 |
++
++---
++
++### Phase 3：三类 Benchmark 实现（1–2 天）
++
++#### 3.1 SWA (`bench_swa.py`)
++
++**调用链**：
++```text
++npu_sparse_attn_sharedkv(metadata=c1a) × repeat
++```
++
++**计时**：
++- `torch.npu.Event`：`enable=True` → op → `synchronize` → `elapsed_time`
++- warmup 20，measure 100，报 mean / p50 / p99
++
++**Profiling 输出字段**：
++- `swa_attn_device_us`（Event）
++- 可选 Level0：`aclnnSparseAttnSharedkv` Device Self
++
++---
++
++#### 3.2 CSA (`bench_csa.py`)
++
++**调用链**（与生产一致，**两段计时 + 合计**）：
++```text
++1) npu_dynamic_quant(q)  # 若 snapshot 已含量化 q 可跳过
++2) npu_quant_lightning_indexer → topk_idxs [1,512]
++3) npu_sparse_attn_sharedkv(cmp_sparse_indices=topk.view(-1,1,512))
++```
++
++**Indexer 输入**（`nsa_indexer.forward_npu_dsv4_fusion`）：
++- `query`, `key`, `key_dequant_scale`, `weights`
++- `block_table=c4_page_table`
++- `actual_seq_lengths_query`, `actual_seq_lengths_key`
++- `metadata=li_quant_metadata`
++
++**Profiling 输出字段**：
++- `csa_indexer_device_us`
++- `csa_attn_device_us`
++- `csa_total_device_us`（indexer + attn，中间不插 host 大开销）
++- Level0 算子：`aclnnQuantLightningIndexer*` + `aclnnSparseAttnSharedkv`
++
++---
++
++#### 3.3 HCA (`bench_hca.py`)
++
++**调用链**：
++```text
++npu_sparse_attn_sharedkv(metadata=c128a, cmp_sparse_indices=None) × repeat
++```
++
++**Profiling 输出字段**：
++- `hca_attn_device_us`
++- Level0：`aclnnSparseAttnSharedkv`（HCA 路径 kernel 名可能含 Compressor 相关）
++
++---
++
++### Phase 4：Profiling 方法论（0.5 天）
++
++三层 profiling，由轻到重：
++
++| 层级 | 工具 | 用途 | 三类是否共用 |
++|------|------|------|--------------|
++| **L1 设备 Event** | `torch.npu.Event` | 纯 NPU op 窗口，**默认验收** | SWA/CSA/HCA 各自 loop |
++| **L2 inline profiler** | `torch_npu.profiler` Level0, `analyse_flag=0` | `operator_details` Device Self | 每类单独采 1 step |
++| **L3 msprof** | `msprof` 外挂 | kernel_details Duration 分类 | 可选，与 L1 交叉验证 |
++
++**注意**：
++- `Duration` / Device Self = **设备 busy，不含 launch head**
++- CSA 必须 **分开报 indexer 与 attn**，与生产路径一致
++- inline profiler 有 `aten::item` 噪音；microbench 无 scheduler，噪音远小于 server
++
++**seq_len 扫描（可选扩展）**：
++```text
++seq_lens = [512, 2048, 8192, 16384, 32768]
++```
++固定 snapshot 或按 seq 各 dump 一套 fixture，画 **SWA/CSA/HCA attn_us vs seq_len** 曲线。
++
++---
++
++### Phase 5：验证与验收（0.5 天）
++
++| 检查项 | 方法 |
++|--------|------|
++| 形状 | 与 `forward_sparse` decode 分支 assert 一致 |
++| 层类型 | metadata key 与 `compress_ratio` 匹配 |
++| 32k page table | `c4_page_table` width ≥ 8192/128；`c128` ≥ 256/128 |
++| 数值 | 输出 `o` 无 NaN/Inf |
++| 与 server 交叉 | 同 seq_len 下 microbench L1 与 server profiler 中 **单层** `SparseAttnSharedkv` Device Self 量级接近（±20%） |
++| CSA 完整性 | total ≈ indexer + attn（Event 口径） |
++
++**交付物**：
++- `report/summary_32k.json`：`{swa, csa_indexer, csa_attn, csa_total, hca}` 微秒
++- `report/summary_32k.md`：表格 + 占 decode 单步 NPU busy 比例（可选）
++
++---
++
++## 4. 32k 关键尺寸速查（bs=1, page_size=128）
++
++| 量 | 值 |
++|----|-----|
++| `seqused_kv` | 32768 |
++| SWA 逻辑 pages | 32768 / 128 = **256** |
++| c4 逻辑 cmp tokens | 32768 / 4 = **8192** → **64** pages |
++| c128 逻辑 cmp tokens | 32768 / 128 = **256** → **2** pages |
++| SWA 物理池（生产） | **128 tokens**（sliding window），非 32k 全量 |
++| `q` | `[1, 64, 512]` bf16 |
++| `index_topk` | 512 |
++
++---
++
++## 5. 风险与缓解
++
++| 风险 | 缓解 |
++|------|------|
++| PA_ND layout 不对 | 优先 snapshot；synthetic 对照 `get_swa_buffer` 返回 tensor 的 `.shape` |
++| metadata 参数漂移 | 直接复用 `compute_kernel_metadata`，不手写 |
++| CSA 缺 indexer 输入 | snapshot 同时 dump indexer 的 k/k_scale/weights 或 dump 最终 topk 做 A/B |
++| 32k prefill 耗时长 | 先 `seq=8192` 打通，再升到 32768；或复用 `REUSE_PROMPT` |
++| `sgl_kernel_npu` 版本 | `env.sh` 固定 CANN / 包版本，README 记录 |
++| 与 wall ITL 混淆 | 报告明确：**本 bench 仅 NPU attention 算子，不含 QKV 投影 / MoE / HC** |
++
++---
++
++## 6. 排期建议
++
++| 阶段 | 工时 | 产出 |
++|------|------|------|
++| Phase 0 环境 | 0.5d | `env.sh` + smoke |
++| Phase 1 KV | 1–2d | `fixtures/seq32768_layer*.pt` |
++| Phase 2 Metadata | 1d | `metadata_builder.py` |
++| Phase 3 Bench ×3 | 1–2d | `bench_swa/csa/hca.py` |
++| Phase 4 Profiling | 0.5d | Event + Level0 脚本 |
++| Phase 5 验证 | 0.5d | report + server 交叉 |
++| **合计** | **4–6d** | 可复用 microbench 工程 |
++
++---
++
++## 7. 最小首跑命令（目标态）
++
++```bash
++# 1) 可选：从 server dump 32k KV
++ATTN_MICROBENCH_DUMP=1 TARGET_SEQ_LEN=32768 ... bash tools/p27_long_context_decode_test.sh
++
++# 2) microbench
++source tools/attn_microbench/env.sh
++python tools/attn_microbench/bench/bench_swa.py --seq-len 32768 --fixture fixtures/seq32768_layer0.pt
++python tools/attn_microbench/bench/bench_csa.py --seq-len 32768 --fixture fixtures/seq32768_layer2.pt
++python tools/attn_microbench/bench/bench_hca.py --seq-len 32768 --fixture fixtures/seq32768_layer3.pt
++
++# 3) 汇总
++python tools/attn_microbench/report/summarize.py --out report/summary_32k.md
++```
++
++---
++
++## 8. 与现有通路关系
++
++```text
++生产 decode（43 层）
++├── SWA 层 ×3   → bench_swa
++├── CSA 层 ×21  → bench_csa（indexer + attn）
++└── HCA 层 ×20  → bench_hca
++
++单步 decode NPU attention 粗算：
++  3×T_swa + 21×(T_li + T_c4a) + 20×T_c128a
++```
++
++本 microbench **不测** QKV 线性、RMSNorm、RoPE、HC、MoE；若需「单层 full attention block」需另开 Phase 6（扩展 scope）。
++
++---
++
++*计划版本：2026-05-25，对应 SGLang ascend_backend + DSv4-Flash W8A8 num_expert_0 通路。*
+diff --git a/tools/attn_microbench/README.md b/tools/attn_microbench/README.md
+new file mode 100644
+index 0000000..9bb5106
+--- /dev/null
++++ b/tools/attn_microbench/README.md
+@@ -0,0 +1,82 @@
++# Synthetic NPU Attention Microbench（独立小工程）
++
++> **已知局限（读数前必看）**
++> 1. 主 KV = **bf16**（NPU 当前仅支持 bf16 attention；论文 bf16+fp8 mixed 路径**未测**）
++> 2. Synthetic 数据不区分 RoPE / 非 RoPE 维
++> 3. 默认 **decode-only**（`q_len=1`），batch=1
++> 4. 正式计时默认 **`repeat=1000`**；报告看 **mean ± std**，不单看 mean
++> 5. **`isolated_device_sum_us`** = indexer + attn **分开计时之和**，不是 fused 端到端
++> 6. `csa`/`hca` 的 `attn_us` **已含 SWA branch**，不能与 `swa` 简单相加
++> 7. ⚠️ **seq_len scaling 待诊断**：跑 `bash run_diag.sh` 看 `results/diag_seq_scaling.json`；在诊断通过前勿用 §4 绝对值做 long-context 结论
++> 8. B4 `cmp_kv` page 第二维语义（128 vs 32）未完全钉死；小 case：`python -m attn_bench.reference_check --seq-len 512`
++
++在 **不修改仓库主干** 的前提下，用 Synthetic KV / page table 直调生产通路算子：
++
++- **SWA**：`npu_sparse_attn_sharedkv`（c1a）
++- **CSA**：`npu_quant_lightning_indexer` + `npu_sparse_attn_sharedkv`（c4a）
++- **HCA**：`npu_sparse_attn_sharedkv`（c128a）
++
++默认 **seq_len=32768** decode 单 token。
++
++## NPU 卡选择
++
++```bash
++npu-smi info                    # 看 HBM-Usage 与 Process，避开已占用卡（如 NPU 2）
++export ASCEND_RT_VISIBLE_DEVICES=0   # 物理卡号；进程内为 npu:0
++cd tools/attn_microbench
++source env.sh
++```
++
++详见 [`IMPLEMENTATION_PLAN.md` §0](./IMPLEMENTATION_PLAN.md#0-npu-环境与卡选择)。
++
++## 快速开始
++
++```bash
++# 形状校验（CPU）
++DRY_RUN=1 SEQ_LEN=32768 bash run_all.sh
++
++# NPU sanity + 正式计时
++export ASCEND_RT_VISIBLE_DEVICES=0
++source env.sh
++SEQ_LEN=32768 bash run_all.sh
++# → results/summary_32768.md
++
++# 单独跑
++python -m attn_bench.bench_swa --seq-len 32768 --sanity --repeat 50
++python -m attn_bench.bench_csa --seq-len 32768 --skip-indexer --sanity
++```
++
++## seq_len / batch 扫描
++
++```bash
++for S in 512 8192 32768; do
++  SEQ_LEN=$S OUT_DIR=results/seq_$S bash run_all.sh
++done
++for B in 1 8 32; do
++  BATCH_SIZE=$B SEQ_LEN=32768 OUT_DIR=results/batch_$B bash run_all.sh
++done
++```
++
++## 依赖
++
++- `torch_npu` + CANN **`custom_ops`**（`torch.ops.custom.npu_sparse_attn_sharedkv*` / `npu_quant_lightning_indexer*`）
++- 只读 `../../third_party/sglang/python`（不改主干）
++
++## P0 诊断（Claude review 后必跑）
++
++```bash
++export ASCEND_RT_VISIBLE_DEVICES=0
++source env.sh
++bash run_diag.sh          # → results/diag_seq_scaling.json
++python -m attn_bench.reference_check --seq-len 512
++```
++
++## CSA fallback
++
++```bash
++SKIP_INDEXER=1 bash run_all.sh
++# 或
++python -m attn_bench.bench_csa --seq-len 32768 --skip-indexer
++```
++
++详细模块 API 见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
+diff --git a/tools/attn_microbench/attn_bench/__init__.py b/tools/attn_microbench/attn_bench/__init__.py
+new file mode 100644
+index 0000000..377db8e
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/__init__.py
+@@ -0,0 +1,3 @@
++"""Synthetic NPU attention microbench (SWA / CSA / HCA). Independent of SGLang server."""
++
++__version__ = "0.1.0"
+diff --git a/tools/attn_microbench/attn_bench/bench_common.py b/tools/attn_microbench/attn_bench/bench_common.py
+new file mode 100644
+index 0000000..e5ea800
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/bench_common.py
+@@ -0,0 +1,63 @@
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++from attn_bench.config import apply_overrides, load_config, repo_root
++from attn_bench.init_npu import init_custom_ops, log_versions, require_npu, setup_pythonpath
++from attn_bench.sanity import require_sane, sanity_check
++from attn_bench.synthetic import assert_shapes, build_synthetic
++
++
++def add_common_args(p: argparse.ArgumentParser) -> None:
++    p.add_argument("--config", type=str, default=None)
++    p.add_argument("--seq-len", type=int, default=None)
++    p.add_argument("--batch-size", type=int, default=None)
++    p.add_argument("--q-len", type=int, default=None)
++    p.add_argument("--warmup", type=int, default=None)
++    p.add_argument("--repeat", type=int, default=None)
++    p.add_argument("--out", type=str, default="")
++    p.add_argument("--dry-run", action="store_true")
++    p.add_argument("--sanity", action="store_true")
++    p.add_argument("--msprof", action="store_true",
++                   help="Capture pure NPU hardware device time via torch_npu.profiler")
++    p.add_argument("--msprof-out", default=None,
++                   help="msprof trace root dir; default cfg.msprof.out_dir")
++
++
++def load_cfg_from_args(args: argparse.Namespace):
++    cfg = load_config(args.config)
++    cfg = apply_overrides(
++        cfg,
++        seq_len=args.seq_len,
++        batch_size=args.batch_size,
++        q_len=args.q_len,
++        warmup=args.warmup,
++        repeat=args.repeat,
++    )
++    if args.dry_run:
++        cfg = apply_overrides(cfg, device="cpu")
++    return cfg
++
++
++def prepare_npu(args: argparse.Namespace):
++    init_custom_ops()
++    log_versions()
++    require_npu()
++
++
++def write_payload(payload: dict, out: str) -> None:
++    text = json.dumps(payload, indent=2)
++    print(text)
++    if out:
++        Path(out).parent.mkdir(parents=True, exist_ok=True)
++        Path(out).write_text(text, encoding="utf-8")
++
++
++def run_sanity(name: str, fn) -> dict:
++    report = sanity_check(name, fn())
++    print(json.dumps({"sanity": report}, indent=2))
++    require_sane(report)
++    return report
+diff --git a/tools/attn_microbench/attn_bench/bench_csa.py b/tools/attn_microbench/attn_bench/bench_csa.py
+new file mode 100644
+index 0000000..fb6dfb7
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/bench_csa.py
+@@ -0,0 +1,133 @@
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++
++import torch
++
++from attn_bench.bench_common import (
++    add_common_args,
++    load_cfg_from_args,
++    prepare_npu,
++    run_sanity,
++    write_payload,
++)
++from attn_bench.config import repo_root
++from attn_bench.init_npu import setup_pythonpath
++from attn_bench.metadata import build_metadata
++from attn_bench.msprof_runner import msprof_kwargs_from_cfg, parse_op_summary, run_with_msprof
++from attn_bench.ops_runner import run_csa_attn, run_csa_indexer
++from attn_bench.synthetic import assert_shapes, build_synthetic, build_topk_random
++from attn_bench.timing import bench_op
++
++
++def main(argv: list[str] | None = None) -> int:
++    p = argparse.ArgumentParser(description="CSA (c4+indexer) synthetic microbench")
++    add_common_args(p)
++    p.add_argument(
++        "--skip-indexer",
++        action="store_true",
++        help="Use random topk; only benchmark attn segment",
++    )
++    args = p.parse_args(argv)
++
++    setup_pythonpath(repo_root())
++    cfg = load_cfg_from_args(args)
++    # CSA/HCA layers use attention sinks (zeros).
++    t = build_synthetic(cfg, swa_no_sink=False)
++    assert_shapes(cfg, t)
++
++    if args.dry_run:
++        print(
++            json.dumps(
++                {
++                    "kind": "csa",
++                    "seq_len": cfg.seq_len,
++                    "batch_size": cfg.batch_size,
++                    "c4_page_table": list(t.c4_page_table.shape),
++                    "c4_page_max": int(t.c4_page_table.max()),
++                    "cmp_kv_c4": list(t.cmp_kv_c4.shape),
++                    "li_key": list(t.li_key.shape),
++                    "li_key_dtype": str(t.li_key.dtype),
++                },
++                indent=2,
++            )
++        )
++        return 0
++
++    prepare_npu(args)
++    meta = build_metadata(cfg, t)
++
++    if args.msprof:
++        kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++        trace_idx = run_with_msprof(
++            lambda: run_csa_indexer(t, meta, cfg),
++            name=f"csa_indexer_seq{cfg.seq_len}",
++            **kw,
++        )
++        indexer_hw = parse_op_summary(trace_idx, "QuantLightningIndexer")
++        topk_static = run_csa_indexer(t, meta, cfg)
++        trace_attn = run_with_msprof(
++            lambda: run_csa_attn(t, meta, cfg, topk_static),
++            name=f"csa_attn_seq{cfg.seq_len}",
++            **kw,
++        )
++        attn_hw = parse_op_summary(trace_attn, "SparseAttnSharedkv")
++        payload = {
++            "kind": "csa",
++            "mode": "msprof_hardware_only",
++            "seq_len": cfg.seq_len,
++            "batch_size": cfg.batch_size,
++            "indexer_hw": indexer_hw,
++            "attn_hw": attn_hw,
++            "trace_dirs": [str(trace_idx), str(trace_attn)],
++        }
++        write_payload(payload, args.out)
++        return 0
++
++    if args.skip_indexer:
++        gen = torch.Generator(device=t.q.device)
++        gen.manual_seed(cfg.seed)
++        topk = build_topk_random(cfg, t.page_spec.c4_cols, t.q.device, gen)
++        indexer_result = None
++    else:
++        if args.sanity:
++            run_sanity("csa_indexer", lambda: run_csa_indexer(t, meta, cfg))
++        indexer_result = bench_op(
++            lambda: run_csa_indexer(t, meta, cfg), cfg.warmup, cfg.repeat
++        )
++        topk = run_csa_indexer(t, meta, cfg)
++
++    if args.sanity:
++        run_sanity("csa_attn", lambda: run_csa_attn(t, meta, cfg, topk))
++
++    attn_result = bench_op(
++        lambda: run_csa_attn(t, meta, cfg, topk), cfg.warmup, cfg.repeat
++    )
++
++    payload = {
++        "kind": "csa",
++        "seq_len": cfg.seq_len,
++        "batch_size": cfg.batch_size,
++        "skip_indexer": args.skip_indexer,
++        "attn_us": attn_result.to_dict(),
++    }
++    if indexer_result is not None:
++        payload["indexer_us"] = indexer_result.to_dict()
++        payload["isolated_device_sum_us"] = {
++            "device_mean_us": indexer_result.device_mean_us + attn_result.device_mean_us,
++            "device_std_us": (
++                (indexer_result.device_std_us**2 + attn_result.device_std_us**2) ** 0.5
++            ),
++            "host_mean_us": indexer_result.host_mean_us + attn_result.host_mean_us,
++            "mean_us": indexer_result.mean_us + attn_result.mean_us,
++            "note": "NOT end-to-end; sum of independently timed indexer + attn",
++        }
++
++    write_payload(payload, args.out)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/attn_microbench/attn_bench/bench_diag.py b/tools/attn_microbench/attn_bench/bench_diag.py
+new file mode 100644
+index 0000000..5d59cf5
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/bench_diag.py
+@@ -0,0 +1,296 @@
++"""P0/P1 diagnostics: seq scaling, c4_cols sweep, page-table modes."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++from dataclasses import replace
++from pathlib import Path
++
++import torch
++
++from attn_bench.config import apply_overrides, load_config, repo_root
++from attn_bench.init_npu import setup_pythonpath
++from attn_bench.metadata import build_metadata
++from attn_bench.ops_runner import run_csa_indexer, run_swa_attn
++from attn_bench.synthetic import assert_shapes, build_synthetic
++from attn_bench.timing import TimingResult, bench_op
++
++
++def _fmt_us(r: TimingResult) -> str:
++    return (
++        f"{r.device_mean_us:.1f} ± {r.device_std_us:.1f} "
++        f"(p95={r.device_p95_us:.1f}, n={len(r.samples_device)})"
++    )
++
++
++def _row(test: str, cfg, t, idx: TimingResult, extra: dict, swa: TimingResult | None = None) -> dict:
++    row = {
++        "test": test,
++        "seq_len": cfg.seq_len,
++        "c4_cols": t.page_spec.c4_cols,
++        "c4_pages": t.page_spec.c4_num_pages,
++        "seqused_kv": int(t.seqused_kv[0]),
++        "diag_snapshot": dict(cfg.diag),
++        "indexer_us": idx.to_dict(),
++        "indexer_summary": _fmt_us(idx),
++        **extra,
++    }
++    if swa is not None:
++        row["swa_attn_us"] = swa.to_dict()
++        row["swa_summary"] = _fmt_us(swa)
++    return row
++
++
++def _bench(cfg, warmup: int, repeat: int) -> tuple:
++    t = build_synthetic(cfg, swa_no_sink=False)
++    assert_shapes(cfg, t)
++    meta = build_metadata(cfg, t)
++    idx = bench_op(lambda: run_csa_indexer(t, meta, cfg), warmup, repeat)
++    swa = bench_op(lambda: run_swa_attn(t, meta, cfg), warmup, repeat)
++    return t, idx, swa
++
++
++def run_c4_cols_sweep(base_cfg, cols_list: list[int], warmup: int, repeat: int) -> list[dict]:
++    """Each col in a fresh subprocess — small c4_cols can abort NPU without killing sweep."""
++    rows: list[dict] = []
++    for cols in cols_list:
++        cfg = apply_overrides(base_cfg, diag={"override_c4_cols": cols})
++        env = os.environ.copy()
++        env["DIAG_OVERRIDE_C4_COLS"] = str(cols)
++        out_tmp = f"/tmp/attn_diag_c4_{cols}.json"
++        cmd = [
++            sys.executable,
++            "-m",
++            "attn_bench.bench_diag",
++            "--scenario",
++            "c4_cols_single",
++            "--seq-len",
++            str(cfg.seq_len),
++            "--warmup",
++            str(warmup),
++            "--repeat",
++            str(repeat),
++            "--out",
++            out_tmp,
++        ]
++        proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
++        if proc.returncode != 0 or not Path(out_tmp).is_file():
++            err = (proc.stderr or proc.stdout or "").strip().splitlines()
++            rows.append(
++                {
++                    "test": "c4_cols_sweep",
++                    "override_c4_cols": cols,
++                    "error": err[-1] if err else f"exit={proc.returncode}",
++                    "diag_snapshot": dict(cfg.diag),
++                }
++            )
++            continue
++        try:
++            payload = json.loads(Path(out_tmp).read_text(encoding="utf-8"))
++            rows.extend(payload.get("results", []))
++        except json.JSONDecodeError:
++            rows.append(
++                {
++                    "test": "c4_cols_sweep",
++                    "override_c4_cols": cols,
++                    "error": "invalid subprocess json",
++                }
++            )
++    return rows
++
++
++def run_c4_cols_single(base_cfg, cols_list: list[int], warmup: int, repeat: int) -> list[dict]:
++    rows = []
++    for cols in cols_list:
++        cfg = apply_overrides(base_cfg, diag={"override_c4_cols": cols})
++        try:
++            t, idx, swa = _bench(cfg, warmup, repeat)
++            rows.append(_row("c4_cols_sweep", cfg, t, idx, {"override_c4_cols": cols}, swa))
++        except Exception as exc:  # noqa: BLE001
++            rows.append(
++                {
++                    "test": "c4_cols_sweep",
++                    "override_c4_cols": cols,
++                    "error": str(exc),
++                    "diag_snapshot": dict(cfg.diag),
++                }
++            )
++    return rows
++
++
++def run_unique_pages(base_cfg, warmup: int, repeat: int) -> list[dict]:
++    rows = []
++    for label, unique in (("default_modulo", False), ("unique_pages", True)):
++        cfg = apply_overrides(base_cfg, diag={"page_table_unique_pages": unique})
++        t, idx, swa = _bench(cfg, warmup, repeat)
++        rows.append(
++            _row(
++                "unique_pages",
++                cfg,
++                t,
++                idx,
++                {"label": label, "page_table_unique_pages": unique},
++                swa,
++            )
++        )
++    return rows
++
++
++def run_seq_sweep(base_cfg, warmup: int, repeat: int) -> list[dict]:
++    rows = []
++    for seq_len in (1024, 4096, 8192, 16384, 32768):
++        cfg = apply_overrides(base_cfg, seq_len=seq_len)
++        t, idx, swa = _bench(cfg, warmup, repeat)
++        rows.append(_row("seq_sweep", cfg, t, idx, {}, swa))
++    return rows
++
++
++def run_extreme_seqused(base_cfg, warmup: int, repeat: int) -> list[dict]:
++    rows = []
++    base = apply_overrides(base_cfg, seq_len=32768)
++    for label, seqused in (("baseline", 32768), ("extreme_128", 128)):
++        cfg = apply_overrides(base, diag={"override_seqused_kv": seqused})
++        t, idx, _ = _bench(cfg, warmup, repeat)
++        rows.append(_row("extreme_seqused_kv", cfg, t, idx, {"label": label}))
++    return rows
++
++
++def run_key_len_variant(base_cfg, warmup: int, repeat: int) -> list[dict]:
++    rows = []
++    base = apply_overrides(base_cfg, seq_len=32768)
++    for label, key_len in (("token_len", 32768), ("c4_len", 8192)):
++        cfg = apply_overrides(base, diag={"override_seqused_kv": key_len})
++        t, idx, _ = _bench(cfg, warmup, repeat)
++        rows.append(
++            _row("key_len_variant", cfg, t, idx, {"label": label, "key_len": key_len})
++        )
++    return rows
++
++
++def _floor_verdict(results: list[dict]) -> dict:
++    means = [
++        r["indexer_us"]["device_mean_us"]
++        for r in results
++        if "indexer_us" in r and "error" not in r
++    ]
++    errors = [r.get("override_c4_cols") for r in results if r.get("error")]
++    if not means:
++        return {"verdict": "no_data", "kernel_errors": errors}
++    lo, hi = min(means), max(means)
++    spread_pct = (hi - lo) / lo * 100 if lo else 0.0
++    return {
++        "indexer_min_us": lo,
++        "indexer_max_us": hi,
++        "spread_pct": spread_pct,
++        "floor_confirmed": spread_pct < 5.0,
++        "verdict": "floor confirmed" if spread_pct < 5.0 else "floor refuted",
++        "kernel_errors": errors,
++        "successful_cols": [
++            r.get("override_c4_cols", r.get("c4_cols"))
++            for r in results
++            if "indexer_us" in r and "error" not in r
++        ],
++    }
++
++
++def main(argv: list[str] | None = None) -> int:
++    p = argparse.ArgumentParser(description="Attention microbench diagnostics")
++    p.add_argument("--config", type=str, default=None)
++    p.add_argument("--seq-len", type=int, default=32768)
++    p.add_argument("--warmup", type=int, default=30)
++    p.add_argument("--repeat", type=int, default=100)
++    p.add_argument(
++        "--scenario",
++        type=str,
++        default="all",
++        help="c4_cols_sweep|c4_cols_single|unique_pages|seq_sweep|extreme|key_len|all|p0",
++    )
++    p.add_argument("--out", type=str, default="")
++    args = p.parse_args(argv)
++
++    setup_pythonpath(repo_root())
++    from attn_bench.bench_common import prepare_npu
++
++    base_cfg = load_config(args.config)
++    base_cfg = apply_overrides(
++        base_cfg, seq_len=args.seq_len, warmup=args.warmup, repeat=args.repeat
++    )
++    prepare_npu(argparse.Namespace(dry_run=False))
++
++    scenario = args.scenario
++    results: list[dict] = []
++
++    if scenario in ("c4_cols_sweep", "all", "p1"):
++        cols_env = os.environ.get("DIAG_OVERRIDE_C4_COLS", "")
++        cols_list = (
++            [int(x) for x in cols_env.split()]
++            if cols_env
++            else [4, 16, 64, 256, 1024, 8192]
++        )
++        results.extend(run_c4_cols_sweep(base_cfg, cols_list, args.warmup, args.repeat))
++
++    if scenario == "c4_cols_single":
++        cols_env = os.environ.get("DIAG_OVERRIDE_C4_COLS", "8192")
++        cols_list = [int(x) for x in cols_env.split()]
++        results.extend(run_c4_cols_single(base_cfg, cols_list, args.warmup, args.repeat))
++
++    if scenario in ("unique_pages", "all", "p1"):
++        results.extend(run_unique_pages(base_cfg, args.warmup, args.repeat))
++
++    if scenario in ("seq_sweep", "all", "p0", "p1"):
++        results.extend(run_seq_sweep(base_cfg, args.warmup, args.repeat))
++
++    if scenario in ("extreme", "all", "p0"):
++        results.extend(run_extreme_seqused(base_cfg, args.warmup, args.repeat))
++
++    if scenario in ("key_len", "all", "p0"):
++        results.extend(run_key_len_variant(base_cfg, args.warmup, args.repeat))
++
++    payload = {
++        "scenario": scenario,
++        "warmup": args.warmup,
++        "repeat": args.repeat,
++        "results": results,
++    }
++    if scenario in ("c4_cols_sweep", "all", "p1") and any(
++        r["test"] == "c4_cols_sweep" for r in results
++    ):
++        payload["p1_1_floor_evidence"] = _floor_verdict(
++            [r for r in results if r["test"] == "c4_cols_sweep"]
++        )
++
++    out_path = args.out or {
++        "c4_cols_sweep": "results/diag_c4_cols_sweep.json",
++        "unique_pages": "results/diag_unique_pages.json",
++        "seq_sweep": "results/diag_seq_scaling.json",
++    }.get(scenario, "results/diag_combined.json")
++
++    text = json.dumps(payload, indent=2)
++    print(text)
++    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
++    Path(out_path).write_text(text, encoding="utf-8")
++    print(f"[diag] wrote {out_path}", flush=True)
++
++    if "p1_1_floor_evidence" in payload:
++        fe = payload["p1_1_floor_evidence"]
++        fe_path = Path("results/p1_1_floor_evidence.json")
++        fe_path.parent.mkdir(parents=True, exist_ok=True)
++        fe_path.write_text(json.dumps(fe, indent=2), encoding="utf-8")
++        print(f"[diag] wrote {fe_path}", flush=True)
++        if "spread_pct" in fe:
++            print(
++                f"P1.1 done: c4_cols spread = {fe['spread_pct']:.1f}%; "
++                f"floor假说 {fe['verdict']}",
++                flush=True,
++            )
++        else:
++            print(f"P1.1 done: {fe.get('verdict', 'no_data')}", flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/attn_microbench/attn_bench/bench_hca.py b/tools/attn_microbench/attn_bench/bench_hca.py
+new file mode 100644
+index 0000000..91f97c5
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/bench_hca.py
+@@ -0,0 +1,86 @@
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++
++from attn_bench.bench_common import (
++    add_common_args,
++    load_cfg_from_args,
++    prepare_npu,
++    run_sanity,
++    write_payload,
++)
++from attn_bench.config import repo_root
++from attn_bench.init_npu import setup_pythonpath
++from attn_bench.metadata import build_metadata
++from attn_bench.msprof_runner import msprof_kwargs_from_cfg, parse_op_summary, run_with_msprof
++from attn_bench.ops_runner import run_hca_attn
++from attn_bench.synthetic import assert_shapes, build_synthetic
++from attn_bench.timing import bench_op
++
++
++def main(argv: list[str] | None = None) -> int:
++    p = argparse.ArgumentParser(description="HCA (c128) synthetic microbench")
++    add_common_args(p)
++    args = p.parse_args(argv)
++
++    setup_pythonpath(repo_root())
++    cfg = load_cfg_from_args(args)
++    t = build_synthetic(cfg, swa_no_sink=False)
++    assert_shapes(cfg, t)
++
++    if args.dry_run:
++        print(
++            json.dumps(
++                {
++                    "kind": "hca",
++                    "seq_len": cfg.seq_len,
++                    "batch_size": cfg.batch_size,
++                    "c128_page_table": list(t.c128_page_table.shape),
++                    "c128_page_max": int(t.c128_page_table.max()),
++                    "cmp_kv_c128": list(t.cmp_kv_c128.shape),
++                },
++                indent=2,
++            )
++        )
++        return 0
++
++    prepare_npu(args)
++    meta = build_metadata(cfg, t)
++
++    if args.msprof:
++        kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++        trace = run_with_msprof(
++            lambda: run_hca_attn(t, meta, cfg),
++            name=f"hca_attn_seq{cfg.seq_len}",
++            **kw,
++        )
++        attn_hw = parse_op_summary(trace, "SparseAttnSharedkv")
++        payload = {
++            "kind": "hca",
++            "mode": "msprof_hardware_only",
++            "seq_len": cfg.seq_len,
++            "batch_size": cfg.batch_size,
++            "attn_hw": attn_hw,
++            "trace_dir": str(trace),
++        }
++        write_payload(payload, args.out)
++        return 0
++
++    if args.sanity:
++        run_sanity("hca", lambda: run_hca_attn(t, meta, cfg))
++
++    result = bench_op(lambda: run_hca_attn(t, meta, cfg), cfg.warmup, cfg.repeat)
++    payload = {
++        "kind": "hca",
++        "seq_len": cfg.seq_len,
++        "batch_size": cfg.batch_size,
++        "attn_us": result.to_dict(),
++    }
++    write_payload(payload, args.out)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/attn_microbench/attn_bench/bench_swa.py b/tools/attn_microbench/attn_bench/bench_swa.py
+new file mode 100644
+index 0000000..1bd5054
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/bench_swa.py
+@@ -0,0 +1,97 @@
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++
++from attn_bench.bench_common import (
++    add_common_args,
++    load_cfg_from_args,
++    prepare_npu,
++    run_sanity,
++    write_payload,
++)
++from attn_bench.config import repo_root
++from attn_bench.init_npu import setup_pythonpath
++from attn_bench.metadata import build_metadata
++from attn_bench.msprof_runner import msprof_kwargs_from_cfg, parse_op_summary, run_with_msprof
++from attn_bench.ops_runner import run_swa_attn
++from attn_bench.synthetic import assert_shapes, build_synthetic
++from attn_bench.timing import bench_op
++
++
++def main(argv: list[str] | None = None) -> int:
++    p = argparse.ArgumentParser(description="SWA synthetic attention microbench")
++    add_common_args(p)
++    p.add_argument(
++        "--with-sink",
++        action="store_true",
++        help="Use zero sinks (default: -inf = no sink, pure SWA)",
++    )
++    args = p.parse_args(argv)
++
++    setup_pythonpath(repo_root())
++    cfg = load_cfg_from_args(args)
++    t = build_synthetic(cfg, swa_no_sink=not args.with_sink)
++    assert_shapes(cfg, t)
++
++    if args.dry_run:
++        spec = t.page_spec
++        print(
++            json.dumps(
++                {
++                    "kind": "swa",
++                    "seq_len": cfg.seq_len,
++                    "batch_size": cfg.batch_size,
++                    "shapes": {
++                        "q": list(t.q.shape),
++                        "ori_kv": list(t.ori_kv.shape),
++                        "swa_page_table": list(t.swa_page_table.shape),
++                        "swa_page_max": int(t.swa_page_table.max()),
++                        "seqused_kv": list(t.seqused_kv.shape),
++                    },
++                    "pages": spec.__dict__,
++                },
++                indent=2,
++            )
++        )
++        return 0
++
++    prepare_npu(args)
++    meta = build_metadata(cfg, t)
++
++    if args.msprof:
++        kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++        trace = run_with_msprof(
++            lambda: run_swa_attn(t, meta, cfg),
++            name=f"swa_attn_seq{cfg.seq_len}",
++            **kw,
++        )
++        attn_hw = parse_op_summary(trace, "SparseAttnSharedkv")
++        payload = {
++            "kind": "swa",
++            "mode": "msprof_hardware_only",
++            "seq_len": cfg.seq_len,
++            "batch_size": cfg.batch_size,
++            "attn_hw": attn_hw,
++            "trace_dir": str(trace),
++        }
++        write_payload(payload, args.out)
++        return 0
++
++    if args.sanity:
++        run_sanity("swa", lambda: run_swa_attn(t, meta, cfg))
++
++    result = bench_op(lambda: run_swa_attn(t, meta, cfg), cfg.warmup, cfg.repeat)
++    payload = {
++        "kind": "swa",
++        "seq_len": cfg.seq_len,
++        "batch_size": cfg.batch_size,
++        "attn_us": result.to_dict(),
++    }
++    write_payload(payload, args.out)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/attn_microbench/attn_bench/config.py b/tools/attn_microbench/attn_bench/config.py
+new file mode 100644
+index 0000000..a8ab96d
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/config.py
+@@ -0,0 +1,155 @@
++from __future__ import annotations
++
++import math
++import os
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++import yaml
++
++
++@dataclass(frozen=True)
++class BenchConfig:
++    seq_len: int
++    page_size: int
++    batch_size: int
++    q_len: int
++    num_heads_q: int
++    num_heads_kv: int
++    head_dim: int
++    index_n_heads: int
++    index_head_dim: int
++    index_topk: int
++    sliding_window_size: int
++    warmup: int
++    repeat: int
++    seed: int
++    device: str
++    dtype: str
++    dtypes: dict[str, str]
++    softmax_scale: float
++    indexer_kv_dtype: str
++    indexer_weight_dtype: str
++    swa_layer_id: int
++    csa_layer_id: int
++    hca_layer_id: int
++    metadata_keys: dict[str, Any] = field(default_factory=dict)
++    invariants: dict[str, Any] = field(default_factory=dict)
++    diag: dict[str, Any] = field(default_factory=dict)
++    roofline: dict[str, Any] = field(default_factory=dict)
++    msprof: dict[str, Any] = field(default_factory=dict)
++    quick_mode_repeat: int = 100
++    quick_mode_warmup: int = 10
++
++    @property
++    def num_tokens(self) -> int:
++        return self.batch_size * self.q_len
++
++    def effective_seqused_kv(self) -> int:
++        v = self.diag.get("override_seqused_kv")
++        return int(v) if v is not None else self.seq_len
++
++    def effective_c4_cols(self) -> int:
++        v = self.diag.get("override_c4_cols")
++        if v is not None:
++            return int(v)
++        return max(1, self.seq_len // 4)
++
++
++def microbench_root() -> Path:
++    return Path(__file__).resolve().parent.parent
++
++
++def repo_root() -> Path:
++    return microbench_root().parent.parent
++
++
++def default_config_path() -> Path:
++    return microbench_root() / "config" / "dsv4_flash.yaml"
++
++
++def _merge_diag(base: dict, overrides: dict | None) -> dict:
++    out = dict(base)
++    if overrides:
++        for k, v in overrides.items():
++            if v is not None:
++                out[k] = v
++    # env overrides (P1 CLI)
++    if os.environ.get("DIAG_OVERRIDE_C4_COLS"):
++        out["override_c4_cols"] = int(os.environ["DIAG_OVERRIDE_C4_COLS"])
++    if os.environ.get("DIAG_OVERRIDE_SEQUSED_KV"):
++        out["override_seqused_kv"] = int(os.environ["DIAG_OVERRIDE_SEQUSED_KV"])
++    if os.environ.get("DIAG_PAGE_TABLE_UNIQUE", "").lower() in ("1", "true", "yes"):
++        out["page_table_unique_pages"] = True
++    return out
++
++
++def load_config(path: str | Path | None = None, diag_overrides: dict | None = None) -> BenchConfig:
++    cfg_path = Path(path) if path else default_config_path()
++    with open(cfg_path, encoding="utf-8") as f:
++        raw: dict[str, Any] = yaml.safe_load(f)
++
++    model = raw["model"]
++    runtime = raw["runtime"]
++    bench = raw["bench"]
++    layers = raw.get("layers", {})
++    metadata_keys = raw.get("metadata_keys", {})
++    invariants = raw.get("invariants", {})
++    diag = _merge_diag(raw.get("diag", {}), diag_overrides)
++    roofline = raw.get("roofline", {})
++    msprof = raw.get("msprof", {})
++    dtypes = runtime.get("dtypes", {})
++
++    dtype = dtypes.get("q", runtime.get("dtype", "bfloat16"))
++    softmax_scale = float(
++        model.get("softmax_scale", 1.0 / math.sqrt(int(model["head_dim"])))
++    )
++
++    return BenchConfig(
++        seq_len=int(bench["seq_len"]),
++        page_size=int(runtime["page_size"]),
++        batch_size=int(runtime["batch_size"]),
++        q_len=int(bench.get("q_len", 1)),
++        num_heads_q=int(model["num_heads_q"]),
++        num_heads_kv=int(model["num_heads_kv"]),
++        head_dim=int(model["head_dim"]),
++        index_n_heads=int(model["index_n_heads"]),
++        index_head_dim=int(model["index_head_dim"]),
++        index_topk=int(model["index_topk"]),
++        sliding_window_size=int(model["sliding_window_size"]),
++        warmup=int(bench["warmup"]),
++        repeat=int(bench["repeat"]),
++        seed=int(bench["seed"]),
++        device=str(runtime["device"]),
++        dtype=str(dtype),
++        dtypes=dict(dtypes) if dtypes else {"q": str(dtype)},
++        softmax_scale=softmax_scale,
++        indexer_kv_dtype=str(dtypes.get("indexer_kv", runtime.get("indexer_kv_dtype", "int8"))),
++        indexer_weight_dtype=str(
++            dtypes.get("indexer_weight", runtime.get("indexer_weight_dtype", "float16"))
++        ),
++        swa_layer_id=int(layers.get("swa_layer_id", 0)),
++        csa_layer_id=int(layers.get("csa_layer_id", 2)),
++        hca_layer_id=int(layers.get("hca_layer_id", 3)),
++        metadata_keys=dict(metadata_keys),
++        invariants=dict(invariants),
++        diag=diag,
++        roofline=dict(roofline),
++        msprof=dict(msprof),
++        quick_mode_repeat=int(bench.get("quick_mode_repeat", 100)),
++        quick_mode_warmup=int(bench.get("quick_mode_warmup", 10)),
++    )
++
++
++def apply_overrides(cfg: BenchConfig, **kwargs: Any) -> BenchConfig:
++    data = cfg.__dict__.copy()
++    diag_extra = kwargs.pop("diag", None)
++    for k, v in kwargs.items():
++        if v is not None and k in data:
++            data[k] = v
++    if diag_extra:
++        merged = dict(data.get("diag", {}))
++        merged.update({k: v for k, v in diag_extra.items() if v is not None})
++        data["diag"] = merged
++    return BenchConfig(**data)
+diff --git a/tools/attn_microbench/attn_bench/init_npu.py b/tools/attn_microbench/attn_bench/init_npu.py
+new file mode 100644
+index 0000000..1debf05
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/init_npu.py
+@@ -0,0 +1,82 @@
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++
++def setup_pythonpath(repo_root: Path) -> None:
++    sglang_py = repo_root / "third_party" / "sglang" / "python"
++    microbench = repo_root / "tools" / "attn_microbench"
++    for p in (str(microbench), str(sglang_py)):
++        if p not in sys.path:
++            sys.path.insert(0, p)
++
++
++def init_custom_ops() -> None:
++    import torch
++
++    import torch_npu  # noqa: F401
++
++    # DSv4 sparse attention 算子在 CANN custom_ops 包（与 p27 / deepseek_v4.py 一致），
++    # 不是 sgl_kernel_npu.so 注册。
++    import custom_ops  # noqa: F401
++
++    try:
++        import sgl_kernel_npu  # noqa: F401
++    except ImportError:
++        pass
++
++    from torch_npu.contrib import transfer_to_npu  # noqa: F401
++
++    if not hasattr(torch.ops, "custom"):
++        raise RuntimeError(
++            "torch.ops.custom not registered — source env.sh (LD_LIBRARY_PATH + CANN set_env) "
++            "then import custom_ops"
++        )
++    for name in (
++        "npu_sparse_attn_sharedkv",
++        "npu_sparse_attn_sharedkv_metadata",
++        "npu_quant_lightning_indexer",
++        "npu_quant_lightning_indexer_metadata",
++    ):
++        if not hasattr(torch.ops.custom, name):
++            raise RuntimeError(f"missing torch.ops.custom.{name}")
++
++
++def log_versions() -> None:
++    import torch
++
++    import torch_npu
++
++    try:
++        import custom_ops
++    except ImportError as exc:
++        print(f"[microbench][WARN] custom_ops import failed: {exc}")
++        return
++
++    try:
++        import sgl_kernel_npu
++
++        sk_ver = getattr(sgl_kernel_npu, "__version__", "unknown")
++    except ImportError:
++        sk_ver = "not installed"
++
++    co_ver = getattr(custom_ops, "__version__", "unknown")
++    print(f"[microbench] torch_npu={torch_npu.__version__}")
++    print(f"[microbench] custom_ops={co_ver}")
++    print(f"[microbench] sgl_kernel_npu={sk_ver}")
++    print(
++        "[microbench] custom ops: "
++        f"sparse_attn={hasattr(torch.ops.custom, 'npu_sparse_attn_sharedkv')}, "
++        f"li={hasattr(torch.ops.custom, 'npu_quant_lightning_indexer')}"
++    )
++    visible = __import__("os").environ.get("ASCEND_RT_VISIBLE_DEVICES", "(all)")
++    print(f"[microbench] ASCEND_RT_VISIBLE_DEVICES={visible}")
++
++
++def require_npu():
++    import torch
++
++    if not hasattr(torch, "npu") or not torch.npu.is_available():
++        raise RuntimeError("NPU not available")
++    return torch.device("npu:0")
+diff --git a/tools/attn_microbench/attn_bench/metadata.py b/tools/attn_microbench/attn_bench/metadata.py
+new file mode 100644
+index 0000000..5b8545c
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/metadata.py
+@@ -0,0 +1,71 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import torch
++
++from attn_bench.config import BenchConfig
++from attn_bench.synthetic import SyntheticTensors
++
++
++@dataclass
++class KernelMetadata:
++    c1a: torch.Tensor
++    c4a: torch.Tensor
++    c128a: torch.Tensor
++    li_quant: torch.Tensor
++
++
++def build_metadata(cfg: BenchConfig, t: SyntheticTensors) -> KernelMetadata:
++    mk = cfg.metadata_keys
++    fa_common = {
++        "cu_seqlens_q": t.cu_seqlens_q_pa,
++        "seqused_kv": t.seqused_kv,
++        "ori_mask_mode": int(mk.get("ori_mask_mode", 4)),
++        "cmp_mask_mode": int(mk.get("cmp_mask_mode", 3)),
++        "ori_win_left": cfg.sliding_window_size - 1,
++        "ori_win_right": 0,
++        "layout_q": str(mk.get("layout_q", "TND")),
++        "layout_kv": str(mk.get("layout_kv", "PA_ND")),
++    }
++    base = {
++        "batch_size": cfg.batch_size,
++        "num_heads_q": cfg.num_heads_q,
++        "num_heads_kv": cfg.num_heads_kv,
++        "head_dim": cfg.head_dim,
++        "has_ori_kv": True,
++        **fa_common,
++    }
++
++    c1a = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
++        has_cmp_kv=False,
++        cmp_ratio=1,
++        **base,
++    )
++    c4a = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
++        has_cmp_kv=True,
++        cmp_ratio=4,
++        cmp_topk=cfg.index_topk,
++        **base,
++    )
++    c128a = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
++        has_cmp_kv=True,
++        cmp_ratio=128,
++        **base,
++    )
++    li_quant = torch.ops.custom.npu_quant_lightning_indexer_metadata(
++        device=str(t.q.device),
++        actual_seq_lengths_query=t.actual_seq_lengths_q,
++        actual_seq_lengths_key=t.seqused_kv,
++        layout_key=str(mk.get("layout_li_key", "PA_BSND")),
++        sparse_count=cfg.index_topk,
++        sparse_mode=int(mk.get("sparse_mode", 3)),
++        layout_query=str(mk.get("layout_q", "TND")),
++        cmp_ratio=4,
++        key_quant_mode=int(mk.get("key_quant_mode", 0)),
++        query_quant_mode=int(mk.get("query_quant_mode", 0)),
++        num_heads_q=cfg.index_n_heads,
++        num_heads_k=cfg.num_heads_kv,
++        head_dim=cfg.index_head_dim,
++    )
++    return KernelMetadata(c1a, c4a, c128a, li_quant)
+diff --git a/tools/attn_microbench/attn_bench/msprof_runner.py b/tools/attn_microbench/attn_bench/msprof_runner.py
+new file mode 100644
+index 0000000..5822614
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/msprof_runner.py
+@@ -0,0 +1,258 @@
++"""Pure NPU hardware op timing via torch_npu.profiler Level1 + profiler CSV."""
++
++from __future__ import annotations
++
++import csv
++import glob
++from pathlib import Path
++from typing import Callable
++
++import torch_npu
++
++
++def _glob_csv(trace_dir: Path, rel: str) -> list[str]:
++    return sorted(glob.glob(str(trace_dir / "**" / rel), recursive=True))
++
++
++def _read_csv(path: str) -> list[dict]:
++    with open(path, newline="", encoding="utf-8-sig") as f:
++        return list(csv.DictReader(f))
++
++
++def _find_profiler_csvs(trace_dir: Path) -> dict[str, list[str]]:
++    td = Path(trace_dir)
++    return {
++        "op_summary": _glob_csv(td, "ASCEND_PROFILER_OUTPUT/op_summary_*.csv"),
++        "kernel_details": _glob_csv(td, "ASCEND_PROFILER_OUTPUT/kernel_details.csv"),
++        "op_statistic": _glob_csv(td, "ASCEND_PROFILER_OUTPUT/op_statistic.csv"),
++        "operator_details": _glob_csv(td, "ASCEND_PROFILER_OUTPUT/operator_details.csv"),
++    }
++
++
++def _stats(values: list[float]) -> dict:
++    if not values:
++        raise ValueError("no duration samples")
++    s = sorted(values)
++    n = len(s)
++
++    def q(p: float) -> float:
++        if n == 1:
++            return s[0]
++        k = (n - 1) * p
++        f = int(k)
++        c = min(f + 1, n - 1)
++        if f == c:
++            return s[f]
++        return s[f] + (s[c] - s[f]) * (k - f)
++
++    mean = sum(s) / n
++    var = sum((x - mean) ** 2 for x in s) / n if n > 1 else 0.0
++    return {
++        "device_mean_us": mean,
++        "device_std_us": var**0.5,
++        "device_p50_us": q(0.50),
++        "device_p95_us": q(0.95),
++        "device_p99_us": q(0.99),
++        "device_max_us": s[-1],
++        "device_min_us": s[0],
++        "matched_rows": n,
++    }
++
++
++def _match_text(text: str, pattern: str) -> bool:
++    return pattern.lower() in (text or "").lower()
++
++
++def _parse_kernel_details(path: str, op_pattern: str) -> list[float]:
++    rows = _read_csv(path)
++    dur: list[float] = []
++    for row in rows:
++        name = row.get("Name") or row.get("Type") or ""
++        if not _match_text(name, op_pattern):
++            continue
++        step = (row.get("Step Id") or "").strip()
++        if not step:
++            continue
++        col = "Duration(us)"
++        if col not in row:
++            continue
++        val = row[col].strip().replace("\t", "")
++        if val:
++            dur.append(float(val))
++    return dur
++
++
++def _parse_op_summary(path: str, op_pattern: str) -> list[float]:
++    rows = _read_csv(path)
++    op_col = next((c for c in ("OP Type", "Op Type", "op_type") if rows and c in rows[0]), None)
++    if not op_col:
++        return []
++    dur_col = next(
++        (c for c in ("Task Duration(us)", "Duration(us)", "Task Duration (us)") if c in rows[0]),
++        None,
++    )
++    if not dur_col:
++        return []
++    out: list[float] = []
++    for row in rows:
++        if _match_text(row.get(op_col, ""), op_pattern):
++            out.append(float(row[dur_col]))
++    return out
++
++
++def _parse_operator_details(path: str, op_pattern: str) -> list[float]:
++    rows = _read_csv(path)
++    out: list[float] = []
++    for row in rows:
++        name = row.get("Name") or ""
++        if not _match_text(name, op_pattern):
++            continue
++        for col in (
++            "Device Self Duration With AICore(us)",
++            "Device Self Duration(us)",
++            "Device Total Duration With AICore(us)",
++            "Device Total Duration(us)",
++        ):
++            if col in row and row[col]:
++                try:
++                    out.append(float(str(row[col]).strip()))
++                    break
++                except ValueError:
++                    continue
++    return out
++
++
++def _collect_op_types(csvs: dict[str, list[str]]) -> list[str]:
++    types: set[str] = set()
++    for path in csvs.get("kernel_details", []):
++        for row in _read_csv(path):
++            if row.get("Name"):
++                types.add(row["Name"])
++    for path in csvs.get("op_statistic", []):
++        for row in _read_csv(path):
++            if row.get("OP Type"):
++                types.add(row["OP Type"])
++    for path in csvs.get("operator_details", []):
++        for row in _read_csv(path):
++            if row.get("Name"):
++                types.add(row["Name"])
++    for path in csvs.get("op_summary", []):
++        for row in _read_csv(path):
++            for col in ("OP Type", "Op Type"):
++                if row.get(col):
++                    types.add(row[col])
++    return sorted(types)
++
++
++def run_with_msprof(
++    fn: Callable[[], None],
++    name: str,
++    out_dir: str,
++    skip_first: int = 5,
++    warmup: int = 2,
++    active: int = 10,
++    profiler_level: str = "Level1",
++    aic_metrics: str = "PipeUtilization",
++    record_shapes: bool = True,
++    with_stack: bool = False,
++) -> Path:
++    """Run fn (skip_first + warmup + active) times under msprof; return trace root."""
++    target = Path(out_dir) / name
++    target.mkdir(parents=True, exist_ok=True)
++
++    level = getattr(torch_npu.profiler.ProfilerLevel, profiler_level)
++    metrics = getattr(torch_npu.profiler.AiCMetrics, aic_metrics)
++    cfg = torch_npu.profiler._ExperimentalConfig(
++        profiler_level=level,
++        aic_metrics=metrics,
++    )
++    sched = torch_npu.profiler.schedule(
++        wait=0,
++        warmup=warmup,
++        active=active,
++        repeat=1,
++        skip_first=skip_first,
++    )
++
++    with torch_npu.profiler.profile(
++        activities=[
++            torch_npu.profiler.ProfilerActivity.CPU,
++            torch_npu.profiler.ProfilerActivity.NPU,
++        ],
++        schedule=sched,
++        experimental_config=cfg,
++        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(target)),
++        record_shapes=record_shapes,
++        with_stack=with_stack,
++    ) as prof:
++        for _ in range(skip_first + warmup + active):
++            fn()
++            prof.step()
++        torch_npu.npu.synchronize()
++
++    return target
++
++
++def list_op_types_in_trace(trace_dir: Path) -> list[str]:
++    """Debug: list all op type names seen in trace CSVs."""
++    return _collect_op_types(_find_profiler_csvs(Path(trace_dir)))
++
++
++def parse_op_summary(trace_dir: Path, op_pattern: str) -> dict:
++    """Parse profiler CSVs; fuzzy-match op name against op_pattern."""
++    trace_dir = Path(trace_dir)
++    csvs = _find_profiler_csvs(trace_dir)
++    durations: list[float] = []
++    source = ""
++
++    for path in csvs.get("op_summary", []):
++        d = _parse_op_summary(path, op_pattern)
++        if d:
++            durations = d
++            source = f"op_summary:{path}"
++            break
++
++    if not durations:
++        for path in csvs.get("kernel_details", []):
++            d = _parse_kernel_details(path, op_pattern)
++            if d:
++                durations = d
++                source = f"kernel_details:{path}"
++                break
++
++    if not durations:
++        for path in csvs.get("operator_details", []):
++            d = _parse_operator_details(path, op_pattern)
++            if d:
++                durations = d[-10:] if len(d) > 10 else d
++                source = f"operator_details:{path}"
++                break
++
++    if not durations:
++        avail = _collect_op_types(csvs)
++        types_dump = trace_dir / "op_types_seen.txt"
++        types_dump.write_text("\n".join(avail), encoding="utf-8")
++        raise ValueError(
++            f"no op match {op_pattern!r}; "
++            f"saw {len(avail)} unique op types, dumped to {types_dump}"
++        )
++
++    out = _stats(durations)
++    out["op_pattern"] = op_pattern
++    out["source_csv"] = source
++    return out
++
++
++def msprof_kwargs_from_cfg(cfg, msprof_out: str | None = None) -> dict:
++    """Build run_with_msprof kwargs from BenchConfig.msprof + optional CLI override."""
++    m = cfg.msprof
++    return {
++        "out_dir": msprof_out or m.get("out_dir", "./npu_results"),
++        "skip_first": int(m.get("skip_first", 5)),
++        "warmup": int(m.get("warmup", 2)),
++        "active": int(m.get("active", 10)),
++        "profiler_level": str(m.get("profiler_level", "Level1")),
++        "aic_metrics": str(m.get("aic_metrics", "PipeUtilization")),
++        "record_shapes": bool(m.get("record_shapes", True)),
++        "with_stack": bool(m.get("with_stack", False)),
++    }
+diff --git a/tools/attn_microbench/attn_bench/ops_runner.py b/tools/attn_microbench/attn_bench/ops_runner.py
+new file mode 100644
+index 0000000..de9e12f
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/ops_runner.py
+@@ -0,0 +1,95 @@
++from __future__ import annotations
++
++import torch
++
++from attn_bench.config import BenchConfig
++from attn_bench.metadata import KernelMetadata
++from attn_bench.synthetic import SyntheticTensors
++
++
++def _attn_common(t: SyntheticTensors, cfg: BenchConfig) -> dict:
++    return {
++        "q": t.q,
++        "ori_kv": t.ori_kv,
++        "ori_block_table": t.swa_page_table,
++        "sinks": t.sinks,
++        "softmax_scale": cfg.softmax_scale,
++        "cu_seqlens_q": t.cu_seqlens_q_pa,
++        "seqused_kv": t.seqused_kv,
++        "ori_mask_mode": 4,
++        "ori_win_left": cfg.sliding_window_size - 1,
++        "ori_win_right": 0,
++        "layout_q": "TND",
++        "layout_kv": "PA_ND",
++    }
++
++
++def run_swa_attn(t: SyntheticTensors, meta: KernelMetadata, cfg: BenchConfig) -> torch.Tensor:
++    out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
++        metadata=meta.c1a,
++        **_attn_common(t, cfg),
++    )
++    return out
++
++
++def run_hca_attn(t: SyntheticTensors, meta: KernelMetadata, cfg: BenchConfig) -> torch.Tensor:
++    out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
++        metadata=meta.c128a,
++        cmp_ratio=128,
++        cmp_mask_mode=3,
++        cmp_kv=t.cmp_kv_c128,
++        cmp_sparse_indices=None,
++        cmp_block_table=t.c128_page_table,
++        **_attn_common(t, cfg),
++    )
++    return out
++
++
++def run_csa_indexer(
++    t: SyntheticTensors, meta: KernelMetadata, cfg: BenchConfig
++) -> torch.Tensor:
++    q, q_scale = torch_npu_dynamic_quant(t.li_query)
++    topk, _ = torch.ops.custom.npu_quant_lightning_indexer(
++        query=q,
++        key=t.li_key,
++        key_dequant_scale=t.li_key_scale.squeeze(-2),
++        actual_seq_lengths_query=t.actual_seq_lengths_q,
++        actual_seq_lengths_key=t.seqused_kv,
++        block_table=t.c4_page_table,
++        layout_query="TND",
++        layout_key="PA_BSND",
++        weights=t.li_weights.to(torch.float16),
++        query_dequant_scale=q_scale.to(torch.float16),
++        cmp_ratio=4,
++        query_quant_mode=0,
++        key_quant_mode=0,
++        sparse_mode=3,
++        sparse_count=cfg.index_topk,
++        metadata=meta.li_quant,
++    )
++    return topk.view(-1, cfg.index_topk)
++
++
++def torch_npu_dynamic_quant(x: torch.Tensor):
++    import torch_npu
++
++    return torch_npu.npu_dynamic_quant(x)
++
++
++def run_csa_attn(
++    t: SyntheticTensors,
++    meta: KernelMetadata,
++    cfg: BenchConfig,
++    topk: torch.Tensor,
++) -> torch.Tensor:
++    topk_view = topk.view(-1, 1, cfg.index_topk)
++    out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
++        metadata=meta.c4a,
++        cmp_ratio=4,
++        cmp_mask_mode=3,
++        cmp_kv=t.cmp_kv_c4,
++        cmp_sparse_indices=topk_view,
++        cmp_block_table=t.c4_page_table,
++        **_attn_common(t, cfg),
++    )
++    return out
+diff --git a/tools/attn_microbench/attn_bench/page_table.py b/tools/attn_microbench/attn_bench/page_table.py
+new file mode 100644
+index 0000000..b823a50
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/page_table.py
+@@ -0,0 +1,112 @@
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++from typing import TYPE_CHECKING
++
++import torch
++
++if TYPE_CHECKING:
++    from attn_bench.config import BenchConfig
++
++
++@dataclass(frozen=True)
++class PageTableSpec:
++    seq_len: int
++    page_size: int
++    batch_size: int
++    swa_cols: int
++    c4_cols: int
++    c128_cols: int
++    swa_num_pages: int
++    c4_num_pages: int
++    c128_num_pages: int
++
++
++def compute_page_spec(
++    seq_len: int,
++    page_size: int,
++    batch_size: int = 1,
++    *,
++    c4_cols_override: int | None = None,
++) -> PageTableSpec:
++    """Synthetic decode page geometry aligned with ascend_backend init_forward_metadata."""
++    swa_cols = seq_len
++    c4_cols = c4_cols_override if c4_cols_override is not None else max(1, seq_len // 4)
++    c128_cols = max(1, seq_len // 128)
++
++    swa_num_pages = max(1, (2 * batch_size * page_size) // page_size)
++    c4_num_pages = max(1, math.ceil(c4_cols / page_size))
++    c128_num_pages = max(1, math.ceil(c128_cols / page_size))
++
++    return PageTableSpec(
++        seq_len=seq_len,
++        page_size=page_size,
++        batch_size=batch_size,
++        swa_cols=swa_cols,
++        c4_cols=c4_cols,
++        c128_cols=c128_cols,
++        swa_num_pages=swa_num_pages,
++        c4_num_pages=c4_num_pages,
++        c128_num_pages=c128_num_pages,
++    )
++
++
++def build_swa_page_table(spec: PageTableSpec, device: torch.device) -> torch.Tensor:
++    table = torch.zeros(
++        (spec.batch_size, spec.swa_cols), dtype=torch.int32, device=device
++    )
++    win = min(spec.page_size * spec.swa_num_pages, spec.seq_len)
++    start = spec.seq_len - win
++    rel = torch.arange(win, device=device, dtype=torch.int32)
++    table[0, start:] = (rel // spec.page_size) % spec.swa_num_pages
++    return table
++
++
++def _strided_page_table(
++    spec: PageTableSpec,
++    device: torch.device,
++    cols: int,
++    num_pages: int,
++    *,
++    unique_pages: bool,
++) -> torch.Tensor:
++    """Build strided block_table like ascend_backend (cache loc → page id).
++
++    Production: ``table[:, ::page_size] // page_size`` after filling cache locs.
++    """
++    pos = torch.arange(cols, device=device, dtype=torch.int32)
++    if unique_pages:
++        page_id = (pos // spec.page_size).clamp(max=num_pages - 1)
++    else:
++        page_id = (pos // spec.page_size) % num_pages
++    cache_loc = page_id * spec.page_size + (pos % spec.page_size)
++    if spec.page_size > 1:
++        table = cache_loc[:: spec.page_size] // spec.page_size
++    else:
++        table = cache_loc
++    return table.unsqueeze(0)
++
++
++def build_c4_page_table(
++    spec: PageTableSpec,
++    device: torch.device,
++    cfg: BenchConfig | None = None,
++) -> torch.Tensor:
++    """[B, c4_num_pages] int32 — strided physical page ids (ascend_backend decode)."""
++    unique = bool(cfg is not None and cfg.diag.get("page_table_unique_pages", False))
++    return _strided_page_table(
++        spec, device, spec.c4_cols, spec.c4_num_pages, unique_pages=unique
++    )
++
++
++def build_c128_page_table(
++    spec: PageTableSpec,
++    device: torch.device,
++    cfg: BenchConfig | None = None,
++) -> torch.Tensor:
++    """[B, c128_num_pages] int32 — strided physical page ids."""
++    unique = bool(cfg is not None and cfg.diag.get("page_table_unique_pages", False))
++    return _strided_page_table(
++        spec, device, spec.c128_cols, spec.c128_num_pages, unique_pages=unique
++    )
+diff --git a/tools/attn_microbench/attn_bench/reference_check.py b/tools/attn_microbench/attn_bench/reference_check.py
+new file mode 100644
+index 0000000..5cbbaed
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/reference_check.py
+@@ -0,0 +1,111 @@
++"""Small-case numeric checks (B4 layout + indexer topk sanity)."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from dataclasses import replace
++import math
++
++import torch
++
++from attn_bench.bench_common import prepare_npu
++from attn_bench.config import apply_overrides, load_config, repo_root
++from attn_bench.init_npu import setup_pythonpath
++from attn_bench.metadata import build_metadata
++from attn_bench.ops_runner import run_csa_attn, run_csa_indexer
++from attn_bench.page_table import compute_page_spec
++from attn_bench.synthetic import assert_shapes, build_synthetic, build_topk_random
++
++
++def _brute_indexer_topk(t, cfg, *, c4_cols: int) -> torch.Tensor:
++    """CPU reference: dequant int8 key, relu dot with query*weights, top-k (causal)."""
++    q = t.li_query[0].float().cpu()  # [H, D]
++    w = t.li_weights[0].float().cpu()  # [H]
++    scale = t.li_key_scale.squeeze(-2).float().cpu()  # [P, page_size, 1]
++    key = t.li_key.float().cpu() * scale  # [P, page_size, 1, D]
++    key_flat = key.reshape(-1, cfg.index_head_dim)[:c4_cols]  # [c4_cols, D]
++    scores = (q.unsqueeze(1) * key_flat.unsqueeze(0)).relu()  # [H, c4, D]
++    scores = (scores * w.view(-1, 1, 1)).sum(dim=(0, 2))  # [c4]
++    # causal: position 0 may attend to indices [0 .. c4_cols-1] all valid for decode
++    k = min(cfg.index_topk, c4_cols)
++    topk = scores.topk(k).indices.to(torch.int32)
++    if k < cfg.index_topk:
++        pad = torch.full((cfg.index_topk - k,), -1, dtype=torch.int32)
++        topk = torch.cat([topk, pad], dim=0)
++    return topk.unsqueeze(0)
++
++
++def _build_cmp_kv_variant(t, cfg, *, entries_per_page: int):
++    """B4: entries_per_page=128 (current) vs 32 (lcm domain)."""
++    spec = t.page_spec
++    num_pages = max(1, math.ceil(spec.c4_cols / entries_per_page))
++    dev = t.q.device
++    dtype = t.cmp_kv_c4.dtype
++    cmp_kv = torch.randn(
++        (num_pages, entries_per_page, cfg.num_heads_kv, cfg.head_dim),
++        dtype=dtype,
++        device=dev,
++    )
++    pos = torch.arange(spec.c4_cols, device=dev, dtype=torch.int32)
++    page_table = ((pos // entries_per_page) % num_pages).unsqueeze(0)
++    return cmp_kv, page_table, num_pages, entries_per_page
++
++
++def main(argv: list[str] | None = None) -> int:
++    p = argparse.ArgumentParser(description="Small-case reference / B4 layout check")
++    p.add_argument("--seq-len", type=int, default=512)
++    p.add_argument("--seed", type=int, default=42)
++    args = p.parse_args(argv)
++
++    setup_pythonpath(repo_root())
++    cfg = apply_overrides(load_config(), seq_len=args.seq_len, seed=args.seed, repeat=1, warmup=1)
++    t = build_synthetic(cfg, swa_no_sink=False)
++    assert_shapes(cfg, t)
++    prepare_npu(argparse.Namespace(dry_run=False))
++    meta = build_metadata(cfg, t)
++
++    report: dict = {"seq_len": cfg.seq_len, "c4_cols": t.page_spec.c4_cols, "checks": {}}
++
++    # Indexer topk overlap (approx — NPU quant path differs from fp32 brute)
++    npu_topk = run_csa_indexer(t, meta, cfg).cpu()
++    ref_topk = _brute_indexer_topk(t, cfg, c4_cols=t.page_spec.c4_cols)
++    overlap = (npu_topk == ref_topk).float().mean().item()
++    report["checks"]["indexer_topk_exact_match_ratio"] = overlap
++    report["checks"]["indexer_topk_note"] = (
++        "NPU uses int8+quant; low match expected; sudden 0.0 flags layout bug"
++    )
++
++    # B4: attn with entries_per_page 128 vs 32 (same c4_cols logical span)
++    gen = torch.Generator(device=t.q.device)
++    gen.manual_seed(cfg.seed)
++    topk = build_topk_random(cfg, t.page_spec.c4_cols, t.q.device, gen)
++
++    outs = {}
++    for label, epp in (("page128", 128), ("page32", 32)):
++        cmp_kv, c4_pt, n_pages, epp_used = _build_cmp_kv_variant(t, cfg, entries_per_page=epp)
++        t2 = replace(t, cmp_kv_c4=cmp_kv, c4_page_table=c4_pt)
++        try:
++            out = run_csa_attn(t2, meta, cfg, topk)
++            outs[label] = {
++                "cmp_kv_shape": list(cmp_kv.shape),
++                "c4_page_table_shape": list(c4_pt.shape),
++                "out_abs_max": float(out.abs().max()),
++                "out_has_nan": bool(torch.isnan(out).any()),
++            }
++        except Exception as exc:
++            outs[label] = {"error": str(exc)}
++
++    report["checks"]["b4_layout_attn"] = outs
++    report["checks"]["b4_note"] = (
++        "page128=current microbench; page32=lcm(4,128) domain entries/page. "
++        "Both run => kernel accepts both; compare server buffer shape for ground truth."
++    )
++
++    text = json.dumps(report, indent=2)
++    print(text)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

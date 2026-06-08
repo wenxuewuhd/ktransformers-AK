@@ -1,0 +1,454 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 11/13] feat(attn_microbench): add SWA/CSA/HCA decode profiling (part 5/5)
+
+diff --git a/tools/attn_microbench/scripts/dump_hook_startup.py b/tools/attn_microbench/scripts/dump_hook_startup.py
+new file mode 100644
+index 0000000..bf94963
+--- /dev/null
++++ b/tools/attn_microbench/scripts/dump_hook_startup.py
+@@ -0,0 +1,91 @@
++"""PYTHONSTARTUP: lazy-patch Indexer.forward_npu_dsv4_fusion when nsa_indexer loads."""
++from __future__ import annotations
++
++import builtins
++import json
++import os
++from pathlib import Path
++
++OUT = os.environ.get("ATTN_DUMP_INDEXER_PATH")
++if not OUT:
++    raise SystemExit(0)
++
++_out_path = Path(OUT)
++_dumped = False
++_orig_import = builtins.__import__
++
++
++def _encode(v):
++    import torch
++
++    if isinstance(v, torch.Tensor):
++        return {
++            "shape": list(v.shape),
++            "dtype": str(v.dtype),
++            "device": str(v.device),
++            "sample": v.flatten()[:8].tolist() if v.numel() else [],
++        }
++    return str(v)
++
++
++def _patch_module(mod) -> None:
++    global _dumped
++    cls = mod.Indexer
++    if getattr(cls.forward_npu_dsv4_fusion, "_attn_dump_patched", False):
++        return
++    orig = cls.forward_npu_dsv4_fusion
++
++    def wrapped(self, q, k, k_scale, weights, forward_batch):
++        global _dumped
++        if not _dumped:
++            import torch
++            import torch_npu
++
++            q_dq, q_scale = torch_npu.npu_dynamic_quant(q)
++            li_quant_metadata = forward_batch.attn_backend.forward_metadata.kernel_metadata[
++                "li_quant_metadata"
++            ]
++            kwargs = {
++                "query": q_dq,
++                "key": k,
++                "key_dequant_scale": k_scale.squeeze(-2),
++                "actual_seq_lengths_query": forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q,
++                "actual_seq_lengths_key": forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv,
++                "block_table": forward_batch.attn_backend.forward_metadata.c4_page_table,
++                "layout_query": "TND",
++                "layout_key": "PA_BSND",
++                "weights": weights.to(torch.float16),
++                "query_dequant_scale": q_scale.to(torch.float16),
++                "cmp_ratio": 4,
++                "query_quant_mode": 0,
++                "key_quant_mode": 0,
++                "sparse_mode": 3,
++                "sparse_count": self.index_topk,
++                "metadata": li_quant_metadata,
++            }
++            payload = {
++                "source": "production_forward_npu_dsv4_fusion",
++                "kwargs": {k: _encode(v) for k, v in kwargs.items()},
++            }
++            _out_path.parent.mkdir(parents=True, exist_ok=True)
++            _out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++            _dumped = True
++        return orig(self, q, k, k_scale, weights, forward_batch)
++
++    wrapped._attn_dump_patched = True  # type: ignore[attr-defined]
++    cls.forward_npu_dsv4_fusion = wrapped
++
++
++def _hook_import(name, globals=None, locals=None, fromlist=(), level=0):
++    mod = _orig_import(name, globals, locals, fromlist, level)
++    if name == "sglang.srt.layers.attention.nsa.nsa_indexer" or (
++        fromlist and "nsa_indexer" in fromlist and hasattr(mod, "Indexer")
++    ):
++        try:
++            _patch_module(mod)
++        except Exception:
++            pass
++    return mod
++
++
++builtins.__import__ = _hook_import
+diff --git a/tools/attn_microbench/scripts/dump_production_indexer_call.py b/tools/attn_microbench/scripts/dump_production_indexer_call.py
+new file mode 100755
+index 0000000..aea3ab8
+--- /dev/null
++++ b/tools/attn_microbench/scripts/dump_production_indexer_call.py
+@@ -0,0 +1,180 @@
++#!/usr/bin/env python3
++"""Monkey-patch dump nsa_indexer.forward_npu_dsv4_fusion kwargs from one SGLang decode.
++
++Does not modify nsa_indexer.py — uses PYTHONSTARTUP import hook in server subprocesses.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import time
++import urllib.error
++import urllib.request
++from pathlib import Path
++
++MICRO_ROOT = Path(__file__).resolve().parents[1]
++REPO_ROOT = MICRO_ROOT.parents[1]
++HOOK = MICRO_ROOT / "scripts" / "dump_hook_startup.py"
++DEFAULT_MODEL = "/workspace/models/DeepSeek-V4-Flash-W8A8"
++DEFAULT_KT = "/workspace/models/cache/dsv4_layer{layer_idx}.gguf"
++
++
++def _build_env(out_path: Path, port: int) -> dict:
++    env = os.environ.copy()
++    env["ATTN_DUMP_INDEXER_PATH"] = str(out_path.resolve())
++    env["PYTHONSTARTUP"] = str(HOOK.resolve())
++    env["REPO_ROOT"] = str(REPO_ROOT)
++    py_paths = [
++        str(REPO_ROOT / "third_party" / "sglang" / "python"),
++        str(REPO_ROOT / "kt-kernel" / "python"),
++    ]
++    env["PYTHONPATH"] = ":".join(py_paths + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
++    env.setdefault("ASCEND_RT_VISIBLE_DEVICES", env.get("NPU_DEVICE_ID", "0"))
++    env.setdefault("ASCEND_TOOLKIT_HOME", "/usr/local/Ascend/ascend-toolkit/latest")
++    env.setdefault("IS_DEEPSEEK_V4", "1")
++    env.setdefault("USE_FUSED_COMPRESSOR", "1")
++    env.setdefault("LI_KV_DTYPE_INT8", "1")
++    env.setdefault("USE_PA_DECODE", "1")
++    env.setdefault("USE_PA_PREFILL", "1")
++    env.setdefault("SGLANG_SET_CPU_AFFINITY", "1")
++    env.setdefault("TASK_QUEUE_ENABLE", "1")
++    env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
++    ld = env.get("LD_LIBRARY_PATH", "")
++    env["LD_LIBRARY_PATH"] = f"/usr/local/kml/lib:{ld}".rstrip(":")
++    return env
++
++
++def _wait_ready(port: int, timeout_s: int = 900) -> bool:
++    url = f"http://127.0.0.1:{port}/health"
++    t0 = time.time()
++    while time.time() - t0 < timeout_s:
++        try:
++            with urllib.request.urlopen(url, timeout=5) as resp:
++                if resp.status == 200:
++                    return True
++        except (urllib.error.URLError, TimeoutError):
++            time.sleep(5)
++    return False
++
++
++def _one_request(port: int) -> None:
++    payload = {
++        "text": "Hello",
++        "sampling_params": {"max_new_tokens": 1, "temperature": 0},
++    }
++    req = urllib.request.Request(
++        f"http://127.0.0.1:{port}/generate",
++        data=json.dumps(payload).encode(),
++        headers={"Content-Type": "application/json"},
++        method="POST",
++    )
++    with urllib.request.urlopen(req, timeout=600) as resp:
++        resp.read()
++
++
++def main() -> int:
++    p = argparse.ArgumentParser(description="Dump production indexer kwargs")
++    p.add_argument("out", type=str, help="Output JSON path")
++    p.add_argument("--model-path", default=os.environ.get("MODEL_PATH", DEFAULT_MODEL))
++    p.add_argument("--kt-weight-path", default=os.environ.get("KT_GGUF_TEMPLATE", DEFAULT_KT))
++    p.add_argument("--port", type=int, default=int(os.environ.get("PORT", "18091")))
++    p.add_argument("--timeout", type=int, default=900)
++    args = p.parse_args()
++
++    out_path = Path(args.out)
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    if out_path.exists():
++        out_path.unlink()
++
++    py = os.environ.get(
++        "PYTHON_BIN", "/usr/local/python3.11.14/bin/python3.11"
++    )
++    env = _build_env(out_path, args.port)
++    cmd = [
++        py,
++        "-m",
++        "sglang.launch_server",
++        "--model-path",
++        args.model_path,
++        "--device",
++        "npu",
++        "--tensor-parallel-size",
++        "1",
++        "--page-size",
++        "128",
++        "--attention-backend",
++        "ascend",
++        "--quantization",
++        "compressed-tensors",
++        "--disable-shared-experts-fusion",
++        "--dtype",
++        "bfloat16",
++        "--trust-remote-code",
++        "--mem-fraction-static",
++        "0.85",
++        "--disable-radix-cache",
++        "--max-prefill-tokens",
++        "4096",
++        "--context-length",
++        "8192",
++        "--skip-server-warmup",
++        "--kt-method",
++        "LLAMAFILE",
++        "--kt-num-gpu-experts",
++        "0",
++        "--kt-weight-path",
++        args.kt_weight_path,
++        "--kt-threadpool-count",
++        "8",
++        "--kt-cpuinfer",
++        "24",
++        "--max-running-requests",
++        "1",
++        "--chunked-prefill-size",
++        "2048",
++        "--host",
++        "127.0.0.1",
++        "--port",
++        str(args.port),
++        "--disable-cuda-graph",
++        "--log-level",
++        "error",
++    ]
++
++    print(f"[dump] launching server on port {args.port} ...", flush=True)
++    server_log = out_path.parent / "p1_3_server.log"
++    with open(server_log, "w", encoding="utf-8") as slog:
++        proc = subprocess.Popen(
++            cmd,
++            env=env,
++            cwd=str(REPO_ROOT),
++            stdout=slog,
++            stderr=subprocess.STDOUT,
++            text=True,
++        )
++    try:
++        if not _wait_ready(args.port, args.timeout):
++            print(f"[dump][ERROR] server health timeout; see {server_log}", flush=True)
++            return 2
++        print("[dump] server ready, sending one decode request ...", flush=True)
++        _one_request(args.port)
++        for _ in range(60):
++            if out_path.is_file() and out_path.stat().st_size > 0:
++                print(f"[dump] wrote {out_path}", flush=True)
++                return 0
++            time.sleep(2)
++        print("[dump][ERROR] hook did not write dump (patch may not have fired)", flush=True)
++        return 3
++    finally:
++        proc.terminate()
++        try:
++            proc.wait(timeout=30)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/attn_microbench/scripts/summarize_network_hw.py b/tools/attn_microbench/scripts/summarize_network_hw.py
+new file mode 100644
+index 0000000..9dc0e82
+--- /dev/null
++++ b/tools/attn_microbench/scripts/summarize_network_hw.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""Regenerate P1.7 network hardware estimate from msprof JSON artifacts."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++MICRO_ROOT = Path(__file__).resolve().parents[1]
++RESULTS = MICRO_ROOT / "results"
++
++# Main-stack layer counts (compress_ratios; L43 excluded — TBD)
++N_SWA = 2
++N_CSA = 20
++N_HCA = 20
++N_LAYERS = N_SWA + N_CSA + N_HCA  # 42
++
++
++def _load(path: Path) -> dict:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _hw_mean(data: dict, key: str = "attn_hw") -> tuple[float, float]:
++    block = data.get(key) or {}
++    return float(block.get("device_mean_us", 0)), float(block.get("device_std_us", 0))
++
++
++def main() -> int:
++    p = argparse.ArgumentParser(description="Summarize network attention hw from msprof JSON")
++    p.add_argument("--results-dir", type=Path, default=RESULTS)
++    p.add_argument("--out", type=Path, default=RESULTS / "network_hw_estimate.md")
++    args = p.parse_args()
++    rd = args.results_dir
++
++    swa = _load(rd / "swa_msprof.json")
++    hca = _load(rd / "hca_msprof.json")
++    swa_us, swa_std = _hw_mean(swa)
++    hca_us, hca_std = _hw_mean(hca)
++
++    seq_lens = [1024, 4096, 8192, 16384, 32768]
++    sweep_rows = []
++    for s in seq_lens:
++        path = rd / f"csa_msprof_seq_{s}.json"
++        if not path.is_file():
++            continue
++        d = _load(path)
++        i_us, i_std = _hw_mean(d, "indexer_hw")
++        a_us, a_std = _hw_mean(d, "attn_hw")
++        csa_layer = i_us + a_us
++        total = N_SWA * swa_us + N_CSA * csa_layer + N_HCA * hca_us
++        sweep_rows.append(
++            {
++                "seq_len": s,
++                "indexer_hw": (i_us, i_std),
++                "attn_hw": (a_us, a_std),
++                "csa_layer": csa_layer,
++                "network_hw_us": total,
++            }
++        )
++
++    base_total = sweep_rows[0]["network_hw_us"] if sweep_rows else 0
++
++    # Python Event @ 32k (optional)
++    py_32k = None
++    csa_py = rd / "seq_32768" / "csa.json"
++    swa_py = rd / "seq_32768" / "swa.json"
++    hca_py = rd / "seq_32768" / "hca.json"
++    if all(p.is_file() for p in (csa_py, swa_py, hca_py)):
++        csa = _load(csa_py)
++        swa_p = _load(swa_py)
++        hca_p = _load(hca_py)
++        py_32k = (
++            N_SWA * swa_p["attn_us"]["mean"]
++            + N_CSA * (csa["indexer_us"]["mean"] + csa["attn_us"]["mean"])
++            + N_HCA * hca_p["attn_us"]["mean"]
++        )
++
++    r32 = sweep_rows[-1] if sweep_rows else None
++    lines = [
++        "# Network Attention Hardware Estimate (auto-generated)",
++        "",
++        "> 由 `scripts/summarize_network_hw.py` 从 `results/*_msprof*.json` 生成。",
++        "> **完整复现 / 解析说明**：见 [`P1_7_analysis_guide.md`](./P1_7_analysis_guide.md)",
++        "> **重新生成**：`python scripts/summarize_network_hw.py --out results/network_hw_estimate.md`",
++        "> 层数：SWA×2 + CSA×20 + HCA×20 = 42（不含 L43）。",
++        "> **@32k CSA 用 seq sweep 的 `csa_msprof_seq_32768.json`**（与 `csa_msprof.json` 独立两次 run，差 ~5% 正常）。",
++        "",
++        "## 单层硬件 @ 32k（msprof kernel_details）",
++        "",
++        "| 层类型 | Indexer (µs) | Attn (µs) | 层合计 (µs) |",
++        "|--------|--------------|-----------|-------------|",
++    ]
++    if r32:
++        i, _ = r32["indexer_hw"]
++        a, _ = r32["attn_hw"]
++        lines.append(f"| SWA | — | {swa_us:.1f} ± {swa_std:.1f} | {swa_us:.1f} |")
++        lines.append(f"| CSA | {i:.1f} | {a:.1f} | {i + a:.1f} |")
++        lines.append(f"| HCA | — | {hca_us:.1f} ± {hca_std:.1f} | {hca_us:.1f} |")
++
++    if r32:
++        total = r32["network_hw_us"]
++        lines.extend(
++            [
++                "",
++                "## 整网 @ 32k",
++                "",
++                "```",
++                f"Total = {N_SWA}×SWA + {N_CSA}×CSA + {N_HCA}×HCA",
++                f"      = {N_SWA}×{swa_us:.1f} + {N_CSA}×{r32['csa_layer']:.1f} + {N_HCA}×{hca_us:.1f}",
++                f"      ≈ {total/1000:.2f} ms",
++                "```",
++                "",
++                "| 组成部分 | 耗时 | 占比 |",
++                "|----------|------|------|",
++            ]
++        )
++        parts = [
++            ("SWA×2", N_SWA * swa_us),
++            ("CSA indexer×20", N_CSA * r32["indexer_hw"][0]),
++            ("CSA attn×20", N_CSA * r32["attn_hw"][0]),
++            ("HCA attn×20", N_HCA * hca_us),
++        ]
++        for name, us in parts:
++            lines.append(f"| {name} | {us:.0f} µs | {us/total*100:.1f}% |")
++        lines.append(f"| **合计** | **{total:.0f} µs** | 100% |")
++
++    lines.extend(["", "## Seq sweep（CSA 可变，SWA/HCA 用 32k 常数）", ""])
++    lines.append("| seq_len | indexer_hw | attn_hw | CSA×20 | 整网 hw | vs 1024 |")
++    lines.append("|---------|------------|---------|--------|---------|---------|")
++    for row in sweep_rows:
++        i, is_ = row["indexer_hw"]
++        a, as_ = row["attn_hw"]
++        sc = row["network_hw_us"] / base_total if base_total else 1.0
++        lines.append(
++            f"| {row['seq_len']} | {i:.1f}±{is_:.1f} | {a:.1f}±{as_:.1f} | "
++            f"{N_CSA * row['csa_layer']:.0f} µs | {row['network_hw_us']/1000:.2f} ms | {sc:.2f}× |"
++        )
++
++    if py_32k and r32:
++        lines.extend(
++            [
++                "",
++                "## Python Event @ 32k（对比）",
++                "",
++                f"- 硬件：{r32['network_hw_us']/1000:.2f} ms",
++                f"- Python Event（repeat=1000）：{py_32k/1000:.2f} ms",
++                f"- Launch overhead：{(py_32k - r32['network_hw_us'])/py_32k*100:.1f}%",
++            ]
++        )
++
++    args.out.parent.mkdir(parents=True, exist_ok=True)
++    args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    print(f"[summarize] wrote {args.out}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+-- 
+2.34.1
+

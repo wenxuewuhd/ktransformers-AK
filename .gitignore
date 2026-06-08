@@ -35,3 +35,10 @@ model/DeepSeek-R1-GGUF/
 model/w8a8/
 # Local Ascend CANN/NNAL install under acsend/ (large; do not commit)
 acsend/Ascend/
+# Local / generated artifacts (per-container, not source)
+.claude/
+kernel_meta/
+fusion_result.json
+kt-kernel/kt_kernel
+# Reproduce patch series must be tracked despite global *.patch ignore (line 19)
+!tools/kt_dsv4_npu_patches/**/*.patch

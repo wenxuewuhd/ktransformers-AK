@@ -1,0 +1,730 @@
+From 29c082ed4901905d94dd43a316cd501e41998fa8 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Tue, 19 May 2026 05:02:39 +0000
+Subject: [PATCH 09/13] [feat]: NPU graph capture with ACL callback worker and
+ CPU MoE in graph
+
+Land ascend_callback_worker for aclrtLaunchCallback dispatch; async
+submit_with_cuda_stream on prefill, _launch_host_func on graph decode.
+Re-enable cuda-graph in p27 launch scripts. Submodule sglang: kt_ep_wrapper.
+F2 four-prompt regression passed (N=0 + N=32 hybrid, graph on).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+
+diff --git a/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md b/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
+index 929a21f..d3b8158 100644
+--- a/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
++++ b/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
+@@ -1718,14 +1718,15 @@ python3 -m py_compile python/sglang/srt/models/deepseek_v4.py   # OK
+      等 fp32 中间 buffer 改成 bf16；
+    - 改完后必须重跑 `tools/p27_cpu_moe_reference_check.py` 抽样验证
+      cosine ≥ 0.99。
+-2. **CUDA / NPU Graph capture 暂未支持**（当前 launch 强制 `--disable-cuda-graph`）。
+-   原因：KT bypass 模式让 CPU forward 同步跑在 Python 主线程，capture 阶段
+-   CPU 函数不会被录进 graph，replay 时 CPU 路径不再触发，cpu_output 永远是
+-   capture 时的快照 → 输出退化。
+-   解决方向：实现 ACL stream callback subscriber（参考
+-   `kt-kernel/cpu_backend/vendors/ascend_npu.h` 里的 TODO），把 CPU forward
+-   作为 NPU stream 上的 host callback launch，capture 时只录 launch / replay
+-   时仍 trigger callback。完成后才能开 graph，预期 decoding tput 显著提升。
++2. **CUDA / NPU Graph capture + KT CPU MoE**（任务 2，2026-05 落地）：
++   - `kt-kernel/cpu_backend/ascend_callback_worker.{h,cpp}`：`aclrtSubscribeReport` +
++     后台 `aclrtProcessReport` 线程；`cudaLaunchHostFunc` 前自动 subscribe stream。
++   - `experts_base.py`：NPU 默认走 `submit_with_cuda_stream`（`KT_FORCE_SYNC_SUBMIT=1` 可回退）。
++   - `kt_ep_wrapper.py`：graph capture 路径 `copy_inputs` + `torch_npu.npu._launch_host_func`
++     + `run_pinned_forward_sync`；`cuda_graph_runner` 已调用 `KTMoEWrapper.set_capture_batch_sizes`。
++   - `tools/p27_launch_ds4flash_npu*.sh` 已去掉 `--disable-cuda-graph`。
++   - **回归**：`ASCEND_RT_VISIBLE_DEVICES=<卡> bash tools/p27_launch_ds4flash_npu_num_expert_0.sh`
++     后跑 Z.8 四个 curl prompt；无 ERR 107027、输出语义连贯即通过。
+ 3. **aarch64 Q8_0 内核仍 NaN**（`tinyBLAS_Q0_ARM`）。若不修，BF16 GGUF 是单卡
+    场景唯一可用编码，磁盘占用 ~555 GiB。修了可以省 ~50% 容量到 ~280 GiB。
+ 4. **`gpu_experts_mask` "前 N 个" 是默认硬编码**。如果将来要做 EPLB / 热点
+diff --git a/kt-kernel/cpu_backend/ascend_callback_worker.cpp b/kt-kernel/cpu_backend/ascend_callback_worker.cpp
+new file mode 100644
+index 0000000..6f69d92
+--- /dev/null
++++ b/kt-kernel/cpu_backend/ascend_callback_worker.cpp
+@@ -0,0 +1,127 @@
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++
++#include "ascend_callback_worker.h"
++
++#include <atomic>
++#include <cstdio>
++#include <mutex>
++#include <set>
++#include <thread>
++#include <vector>
++
++namespace kt::ascend {
++
++namespace {
++
++constexpr int kProcessReportTimeoutMs = 100;
++
++std::mutex g_mu;
++std::set<aclrtStream> g_subscribed_streams;
++aclrtContext g_context = nullptr;
++std::thread g_worker;
++std::atomic<bool> g_stop{false};
++std::atomic<bool> g_started{false};
++uint64_t g_worker_thread_id = 0;
++
++void worker_main(aclrtContext ctx) {
++  if (ctx != nullptr) {
++    aclError err = aclrtSetCurrentContext(ctx);
++    if (err != ACL_SUCCESS) {
++      std::fprintf(stderr,
++                   "[kt-kernel] ascend_callback_worker: aclrtSetCurrentContext failed (%d)\n",
++                   static_cast<int>(err));
++    }
++  }
++
++  while (!g_stop.load(std::memory_order_acquire)) {
++    (void)aclrtProcessReport(kProcessReportTimeoutMs);
++  }
++}
++
++void start_worker_locked(aclrtContext ctx) {
++  if (g_started.load(std::memory_order_acquire)) {
++    return;
++  }
++  g_context = ctx;
++  g_stop.store(false, std::memory_order_release);
++  g_worker = std::thread([ctx]() { worker_main(ctx); });
++  g_worker_thread_id = static_cast<uint64_t>(g_worker.native_handle());
++  g_started.store(true, std::memory_order_release);
++
++  for (aclrtStream stream : g_subscribed_streams) {
++    aclError err = aclrtSubscribeReport(g_worker_thread_id, stream);
++    if (err != ACL_SUCCESS) {
++      std::fprintf(stderr,
++                   "[kt-kernel] ascend_callback_worker: aclrtSubscribeReport failed (%d)\n",
++                   static_cast<int>(err));
++    }
++  }
++}
++
++void subscribe_stream_locked(aclrtStream stream) {
++  if (stream == nullptr) {
++    return;
++  }
++  if (g_subscribed_streams.count(stream) != 0) {
++    return;
++  }
++  g_subscribed_streams.insert(stream);
++  if (g_started.load(std::memory_order_acquire)) {
++    aclError err = aclrtSubscribeReport(g_worker_thread_id, stream);
++    if (err != ACL_SUCCESS) {
++      std::fprintf(stderr,
++                   "[kt-kernel] ascend_callback_worker: aclrtSubscribeReport failed (%d)\n",
++                   static_cast<int>(err));
++    }
++  }
++}
++
++}  // namespace
++
++void ensure_callback_worker(aclrtContext ctx) {
++  std::lock_guard<std::mutex> lock(g_mu);
++  if (g_started.load(std::memory_order_acquire)) {
++    return;
++  }
++  aclrtContext use_ctx = ctx;
++  if (use_ctx == nullptr) {
++    aclError err = aclrtGetCurrentContext(&use_ctx);
++    if (err != ACL_SUCCESS || use_ctx == nullptr) {
++      std::fprintf(stderr,
++                   "[kt-kernel] ascend_callback_worker: no ACL context; call after torch.npu init\n");
++      return;
++    }
++  }
++  start_worker_locked(use_ctx);
++}
++
++void ensure_stream_subscribed(aclrtStream stream) {
++  std::lock_guard<std::mutex> lock(g_mu);
++  if (!g_started.load(std::memory_order_acquire)) {
++    aclrtContext ctx = nullptr;
++    (void)aclrtGetCurrentContext(&ctx);
++    start_worker_locked(ctx);
++  }
++  subscribe_stream_locked(stream);
++}
++
++void shutdown_callback_worker() {
++  std::lock_guard<std::mutex> lock(g_mu);
++  if (!g_started.load(std::memory_order_acquire)) {
++    return;
++  }
++  g_stop.store(true, std::memory_order_release);
++  if (g_worker.joinable()) {
++    g_worker.join();
++  }
++  for (aclrtStream stream : g_subscribed_streams) {
++    (void)aclrtUnSubscribeReport(g_worker_thread_id, stream);
++  }
++  g_subscribed_streams.clear();
++  g_started.store(false, std::memory_order_release);
++  g_worker_thread_id = 0;
++}
++
++}  // namespace kt::ascend
++
++#endif  // KTRANSFORMERS_USE_ASCEND_NPU
+diff --git a/kt-kernel/cpu_backend/ascend_callback_worker.h b/kt-kernel/cpu_backend/ascend_callback_worker.h
+new file mode 100644
+index 0000000..8719a48
+--- /dev/null
++++ b/kt-kernel/cpu_backend/ascend_callback_worker.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++// Ascend ACL stream callback subscriber for kt-kernel.
++//
++// CANN dispatches aclrtLaunchCallback tasks only on a host thread that has called
++// aclrtSubscribeReport(threadId, stream) and is running aclrtProcessReport() in a
++// loop.  This worker mirrors torch_npu's pattern (see NPUGraph.cpp / Graph.cpp).
++
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++
++#include <acl/acl_rt.h>
++
++#include <cstdint>
++
++namespace kt::ascend {
++
++// Start the global callback worker (idempotent).  Call after ACL/torch.npu init.
++// If ctx is null, uses aclrtGetCurrentContext().
++void ensure_callback_worker(aclrtContext ctx = nullptr);
++
++// Register ``stream`` with the worker so enqueued callbacks are dispatched.
++void ensure_stream_subscribed(aclrtStream stream);
++
++// Optional shutdown (process exit).
++void shutdown_callback_worker();
++
++}  // namespace kt::ascend
++
++#endif  // KTRANSFORMERS_USE_ASCEND_NPU
+diff --git a/kt-kernel/cpu_backend/vendors/ascend_npu.h b/kt-kernel/cpu_backend/vendors/ascend_npu.h
+index 0a203f9..0365a45 100644
+--- a/kt-kernel/cpu_backend/vendors/ascend_npu.h
++++ b/kt-kernel/cpu_backend/vendors/ascend_npu.h
+@@ -17,8 +17,9 @@
+ //     code waiting on the callback (e.g. CPUInfer::sync_with_cuda_stream) will
+ //     hang forever.
+ //   * The submit_with_cuda_stream / sync_with_cuda_stream path therefore
+-//     requires the host process to also spin up a callback worker (TODO Phase
+-//     3). The synchronous CPUInfer::submit() / sync() path works without it
++//     requires the host process to also spin up a callback worker (see
++//     cpu_backend/ascend_callback_worker.cpp). The synchronous CPUInfer::submit()
++//     / sync() path works without it
+ //     and is what the Phase 1 PoC uses.
+ // ============================================================================
+ 
+@@ -27,6 +28,10 @@
+ 
+ #include <cstdint>
+ 
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++#include "../ascend_callback_worker.h"
++#endif
++
+ // ---- types -----------------------------------------------------------------
+ using cudaStream_t = aclrtStream;
+ using cudaError_t  = aclError;
+@@ -44,6 +49,9 @@ inline constexpr cudaError_t cudaSuccess = ACL_SUCCESS;
+ // semantics. (ACL_CALLBACK_BLOCK can block the host if the device queue
+ // is full.) See header note above re: the required subscriber thread.
+ static inline cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* userData) {
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++  kt::ascend::ensure_stream_subscribed(stream);
++#endif
+   return aclrtLaunchCallback(fn, userData, ACL_CALLBACK_NO_BLOCK, stream);
+ }
+ 
+diff --git a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+index f22207f..1da5824 100644
+--- a/kt-kernel/ext_bindings.cpp
++++ b/kt-kernel/ext_bindings.cpp
+@@ -21,6 +21,9 @@
+ 
+ #include "cpu_backend/cpuinfer.h"
+ #include "cpu_backend/worker_pool.h"
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++#include "cpu_backend/ascend_callback_worker.h"
++#endif
+ #include "operators/common.hpp"
+ 
+ #if defined(USE_MOE_KERNEL)
+@@ -477,6 +480,21 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
+ }
+ 
+ PYBIND11_MODULE(kt_kernel_ext, m) {
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++  m.def(
++      "init_ascend_callback_worker",
++      []() { kt::ascend::ensure_callback_worker(nullptr); },
++      "Start ACL aclrtProcessReport worker for stream callbacks (Ascend NPU).");
++  m.def(
++      "subscribe_ascend_stream",
++      [](intptr_t stream_handle) {
++        kt::ascend::ensure_stream_subscribed(reinterpret_cast<aclrtStream>(stream_handle));
++      },
++      py::arg("stream_handle"),
++      "Subscribe an aclrtStream with the global callback worker.");
++  m.def("shutdown_ascend_callback_worker", &kt::ascend::shutdown_callback_worker,
++        "Stop the ACL callback worker thread.");
++#endif
+   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
+   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
+       .def(py::init<>())
+diff --git a/kt-kernel/python/experts_base.py b/kt-kernel/python/experts_base.py
+index 877547f..d81dda8 100644
+--- a/kt-kernel/python/experts_base.py
++++ b/kt-kernel/python/experts_base.py
+@@ -33,36 +33,41 @@ from kt_kernel import kt_kernel_ext
+ # likewise schedules its sync_ via the same callback queue and silently
+ # completes without actually syncing anything.
+ #
+-# Until a callback worker is implemented, we route NPU traffic through the
+-# synchronous `CPUInfer::submit()` / `CPUInfer::sync()` API: these execute
+-# the task body directly on the calling Python thread, so there is no
+-# dependency on a callback worker. The trade-off is loss of CPU/NPU overlap
+-# (forward is fully serialized), but correctness > overlap.
++# When the ACL callback worker is active (ascend_callback_worker.cpp, started
++# via ``init_ascend_callback_worker``), ``submit_with_cuda_stream`` callbacks
++# are dispatched and CPU/NPU overlap works.  Set ``KT_FORCE_SYNC_SUBMIT=1`` to
++# force the legacy synchronous path for debugging.
+ # -----------------------------------------------------------------------------
+ 
+ 
+ def _should_bypass_stream_callback(device: torch.device) -> bool:
+     """Return True iff we must use the synchronous submit/sync path."""
+-    if device.type == "npu":
+-        return True
+     if os.environ.get("KT_FORCE_SYNC_SUBMIT", "") == "1":
+         return True
+     return False
+ 
+ 
++def _ensure_ascend_callback_worker() -> None:
++    """Start kt-kernel ACL callback worker (idempotent)."""
++    if not hasattr(kt_kernel_ext, "init_ascend_callback_worker"):
++        return
++    if getattr(_ensure_ascend_callback_worker, "_done", False):
++        return
++    kt_kernel_ext.init_ascend_callback_worker()
++    _ensure_ascend_callback_worker._done = True  # type: ignore[attr-defined]
++    if hasattr(kt_kernel_ext, "shutdown_ascend_callback_worker"):
++        import atexit
++
++        atexit.register(kt_kernel_ext.shutdown_ascend_callback_worker)
++
++
+ def _wait_device(device: torch.device) -> None:
+     """Block until pending async copies on `device`'s current stream finish.
+ 
+     NOTE on graph capture: torch.{cuda,npu}.synchronize() raises during cuda /
+-    NPU graph capture (NPU returns ERR 107027 "stream is captured"). Bypass
+-    mode runs the CPU forward on the Python main thread, which is **not**
+-    captured into the graph anyway, so the sync would only be needed at
+-    *capture time*; once the graph is replayed, the CPU function never runs.
+-    In other words, bypass mode is fundamentally incompatible with cuda-graph
+-    capture (TODO Phase 3 — implement ACL callback subscriber to unblock the
+-    async path). Until then we just skip the sync during capture so that the
+-    capture step itself doesn't crash; the caller is expected to use
+-    ``--disable-cuda-graph`` for actually correct end-to-end runs.
++    NPU graph capture (NPU returns ERR 107027 "stream is captured"). Skip sync
++    while capturing; graph MoE uses ``_launch_host_func`` + pinned buffers
++    (see ``kt_ep_wrapper``).
+     """
+     if device.type == "npu":
+         try:
+@@ -236,6 +241,11 @@ class _MoEBase:
+             CPUInfer singleton instance
+         """
+         if cls._cpu_infer_instance is None:
++            try:
++                if torch.npu.is_available():  # type: ignore[attr-defined]
++                    _ensure_ascend_callback_worker()
++            except Exception:
++                pass
+             worker_config = kt_kernel_ext.WorkerPoolConfig()
+ 
+             if numa_nodes is not None:
+@@ -430,24 +440,14 @@ class BaseMoEWrapper(_MoEBase, ABC):
+ 
+         return immediate_ids, deferred_ids
+ 
+-    def submit_forward(
++    def _prepare_forward_cpu_buffers(
+         self,
+         hidden_states: torch.Tensor,
+         topk_ids: torch.Tensor,
+         topk_weights: torch.Tensor,
+-        cuda_stream,
+-    ):
+-        """
+-        Submit forward inference task to CPU (non-blocking).
+-
+-        Args:
+-            hidden_states: Input hidden states [batch_size, hidden_size]
+-            topk_ids: Top-k expert IDs [batch_size, num_experts_per_tok]
+-            topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
+-            cuda_stream: CUDA stream for synchronization
+-        """
++    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], tuple, int, int]:
++        """D2H copy into pinned CPU buffers; return deferred ids and buffer handles."""
+         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+-        batch_size = flat_hidden_states.shape[0]
+ 
+         (
+             input_tensor_cpu,
+@@ -461,16 +461,14 @@ class BaseMoEWrapper(_MoEBase, ABC):
+ 
+         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+         next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
+-
+         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+ 
+         topk_ids_long = topk_ids.to(torch.long)
+-        immediate_ids: torch.Tensor
+-        deferred_ids: Optional[torch.Tensor]
+         if self.max_deferred_experts_per_token > 0:
+             protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+-
+-            immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
++            immediate_ids, deferred_ids = self.select_deferred_experts(
++                topk_ids_long, topk_weights, protected_k
++            )
+         else:
+             immediate_ids = topk_ids_long
+             deferred_ids = None
+@@ -478,12 +476,180 @@ class BaseMoEWrapper(_MoEBase, ABC):
+         input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
+         weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
+         immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
++        if deferred_ids is not None:
++            deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
++
++        buffers = (
++            input_tensor_cpu,
++            immediate_experts_ids_cpu,
++            deferred_experts_ids_cpu,
++            weights_cpu,
++            output_cpu,
++            bsz_tensor_cpu,
++            _output_gpu,
++        )
++        return immediate_ids, deferred_ids, buffers, current_slot, next_slot
++
++    def copy_inputs_to_cpu_buffers(
++        self,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        topk_weights: torch.Tensor,
++    ) -> None:
++        """Copy MoE inputs to pinned CPU buffers (for NPU graph host callbacks)."""
++        self._prepare_forward_cpu_buffers(hidden_states, topk_ids, topk_weights)
++
++    def forward_on_pinned_buffers(
++        self,
++        hidden_states: torch.Tensor,
++        cuda_stream,
++    ) -> None:
++        """Run CPU MoE on buffers already filled (sync or stream callback)."""
++        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
++        (
++            input_tensor_cpu,
++            immediate_experts_ids_cpu,
++            deferred_experts_ids_cpu,
++            weights_cpu,
++            output_cpu,
++            bsz_tensor_cpu,
++            _output_gpu,
++        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
++
++        current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
++        next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
++        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
++
++        bypass = _should_bypass_stream_callback(hidden_states.device)
++        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
++        immediate_task = self.moe.forward_task(
++            bsz_slot_tensor.data_ptr(),
++            immediate_experts_ids_cpu[current_slot].size(-1),
++            immediate_experts_ids_cpu[current_slot].data_ptr(),
++            weights_cpu[current_slot].data_ptr(),
++            input_tensor_cpu[current_slot].data_ptr(),
++            output_cpu[current_slot].data_ptr(),
++            incremental,
++        )
++        if bypass:
++            self.cpu_infer.submit(immediate_task)
++        else:
++            if hidden_states.device.type == "npu" and hasattr(
++                kt_kernel_ext, "subscribe_ascend_stream"
++            ):
++                kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
++            self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
++
++        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
++        has_deferred = (
++            self.max_deferred_experts_per_token > 0
++            and (deferred_experts_ids_cpu[current_slot] >= 0).any().item()
++        )
++        if has_deferred:
++            deferred_task = self.moe.forward_task(
++                bsz_slot_tensor.data_ptr(),
++                deferred_experts_ids_cpu[current_slot].size(-1),
++                deferred_experts_ids_cpu[current_slot].data_ptr(),
++                weights_cpu[current_slot].data_ptr(),
++                input_tensor_cpu[current_slot].data_ptr(),
++                output_cpu[next_slot].data_ptr(),
++                False,
++            )
++            if bypass:
++                self.cpu_infer.submit(deferred_task)
++            else:
++                self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
++            BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
++
++    def run_pinned_forward_sync(
++        self,
++        hidden_states: torch.Tensor,
++        cuda_stream,
++    ) -> None:
++        """Submit + sync CPU MoE on pre-filled buffers (NPU graph host callback).
++
++        Called from ``aclrtLaunchCallback`` / ``_launch_host_func``; must not enqueue
++        nested stream callbacks.
++        """
++        del cuda_stream  # unused — sync path only
++        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
++        (
++            input_tensor_cpu,
++            immediate_experts_ids_cpu,
++            deferred_experts_ids_cpu,
++            weights_cpu,
++            output_cpu,
++            bsz_tensor_cpu,
++            _output_gpu,
++        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
++
++        current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
++        next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
++        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
++
++        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
++        immediate_task = self.moe.forward_task(
++            bsz_slot_tensor.data_ptr(),
++            immediate_experts_ids_cpu[current_slot].size(-1),
++            immediate_experts_ids_cpu[current_slot].data_ptr(),
++            weights_cpu[current_slot].data_ptr(),
++            input_tensor_cpu[current_slot].data_ptr(),
++            output_cpu[current_slot].data_ptr(),
++            incremental,
++        )
++        self.cpu_infer.submit(immediate_task)
++        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
++        has_deferred = (
++            self.max_deferred_experts_per_token > 0
++            and (deferred_experts_ids_cpu[current_slot] >= 0).any().item()
++        )
++        if has_deferred:
++            deferred_task = self.moe.forward_task(
++                bsz_slot_tensor.data_ptr(),
++                deferred_experts_ids_cpu[current_slot].size(-1),
++                deferred_experts_ids_cpu[current_slot].data_ptr(),
++                weights_cpu[current_slot].data_ptr(),
++                input_tensor_cpu[current_slot].data_ptr(),
++                output_cpu[next_slot].data_ptr(),
++                False,
++            )
++            self.cpu_infer.submit(deferred_task)
++            BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
++        allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
++        self.cpu_infer.sync(allow_pending)
++
++    def submit_forward(
++        self,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        topk_weights: torch.Tensor,
++        cuda_stream,
++    ):
++        """
++        Submit forward inference task to CPU (non-blocking).
++
++        Args:
++            hidden_states: Input hidden states [batch_size, hidden_size]
++            topk_ids: Top-k expert IDs [batch_size, num_experts_per_tok]
++            topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
++            cuda_stream: CUDA stream for synchronization
++        """
++        _immediate_ids, deferred_ids, _buffers, current_slot, next_slot = (
++            self._prepare_forward_cpu_buffers(hidden_states, topk_ids, topk_weights)
++        )
++        (
++            input_tensor_cpu,
++            immediate_experts_ids_cpu,
++            deferred_experts_ids_cpu,
++            weights_cpu,
++            output_cpu,
++            bsz_tensor_cpu,
++            _output_gpu,
++        ) = _buffers
++        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+ 
+         bypass = _should_bypass_stream_callback(hidden_states.device)
+         if bypass:
+-            # CPU task is about to run on this thread; D2H copies above are
+-            # non_blocking on the device's current stream and must finish first
+-            # or workers will read stale (or zero) input.
+             _wait_device(hidden_states.device)
+ 
+         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+@@ -499,11 +665,14 @@ class BaseMoEWrapper(_MoEBase, ABC):
+         if bypass:
+             self.cpu_infer.submit(immediate_task)
+         else:
++            if hidden_states.device.type == "npu" and hasattr(
++                kt_kernel_ext, "subscribe_ascend_stream"
++            ):
++                kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
+             self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
+ 
+         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+         if deferred_ids is not None:
+-            deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
+             if bypass:
+                 _wait_device(hidden_states.device)
+             deferred_task = self.moe.forward_task(
+@@ -518,9 +687,29 @@ class BaseMoEWrapper(_MoEBase, ABC):
+             if bypass:
+                 self.cpu_infer.submit(deferred_task)
+             else:
++                if hidden_states.device.type == "npu" and hasattr(
++                    kt_kernel_ext, "subscribe_ascend_stream"
++                ):
++                    kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
+                 self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
+             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
+ 
++    def copy_forward_output_to_device(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Copy pinned CPU output to the device tensor (CPU work already finished)."""
++        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
++        (
++            _input_tensor_cpu,
++            _immediate_experts_ids_cpu,
++            _deferred_experts_ids_cpu,
++            _weights_cpu,
++            output_cpu,
++            _bsz_tensor_cpu,
++            output_gpu,
++        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
++        current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
++        output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
++        return output_gpu[current_slot]
++
+     def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
+         """
+         Synchronize and retrieve forward inference results.
+@@ -549,6 +738,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
+         if bypass:
+             self.cpu_infer.sync(allow_pending)
+         else:
++            if hidden_states.device.type == "npu" and hasattr(
++                kt_kernel_ext, "subscribe_ascend_stream"
++            ):
++                kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
+             self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+ 
+         if os.environ.get("KT_DEBUG_MOE_OUT", "") == "1":
+@@ -571,8 +764,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
+                 flush=True,
+             )
+ 
+-        output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+-        return output_gpu[current_slot]
++        return self.copy_forward_output_to_device(hidden_states)
+ 
+     def forward(
+         self,
+diff --git a/third_party/sglang b/third_party/sglang
+index c99920a..db577d2 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit c99920aeedec5ba39b43978557524b3be01ca10c
++Subproject commit db577d2e82439876e7b7a93fc11ea7dd2a5a747f
+diff --git a/tools/p27_launch_ds4flash_npu.sh b/tools/p27_launch_ds4flash_npu.sh
+index d5e4680..32b3174 100755
+--- a/tools/p27_launch_ds4flash_npu.sh
++++ b/tools/p27_launch_ds4flash_npu.sh
+@@ -27,7 +27,7 @@
+ set -euo pipefail
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+-export PYTHONPATH="${REPO}/third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
++export PYTHONPATH="${REPO}/third_party/sglang/python:${REPO}/kt-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
+ 
+ # ---------- 选定 Python 解释器 ----------
+ # 现象：本镜像默认 PATH 里 ``python3`` 指 ``/usr/bin/python3``（系统 python，没装
+@@ -146,7 +146,6 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
+   --dtype bfloat16 \
+   --trust-remote-code \
+   --mem-fraction-static 0.85 \
+-  --disable-cuda-graph \
+   --disable-radix-cache \
+   --max-prefill-tokens 65535 \
+   --context-length 65536 \
+@@ -162,8 +161,5 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
+   --host 0.0.0.0 \
+   --port "$PORT" \
+   ${EXTRA_FLAGS}
+-# 关 cuda-graph 原因：kt-kernel NPU bypass 模式 (kt-kernel/python/experts_base.py
+-# `_should_bypass_stream_callback`) 把 CPU forward 同步跑在 Python 主线程；graph
+-# capture 阶段 CPU 函数不会被录进 graph，replay 时 Python 主线程不再被触发，
+-# cpu_output 永远是 capture 时的快照 → 输出错误。Phase 3 把 ACL callback
+-# subscriber 实现后再可启用 cuda-graph（见 ascend_npu.h TODO）。
++# cuda-graph 已启用：kt-kernel ACL callback worker + kt_ep_wrapper NPU graph
++# host callback。调试：KT_FORCE_SYNC_SUBMIT=1；回退：EXTRA_FLAGS="--disable-cuda-graph"
+diff --git a/tools/p27_launch_ds4flash_npu_num_expert_0.sh b/tools/p27_launch_ds4flash_npu_num_expert_0.sh
+index 02fe7f4..e7f1fbd 100755
+--- a/tools/p27_launch_ds4flash_npu_num_expert_0.sh
++++ b/tools/p27_launch_ds4flash_npu_num_expert_0.sh
+@@ -27,7 +27,7 @@
+ set -euo pipefail
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+-export PYTHONPATH="${REPO}/third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
++export PYTHONPATH="${REPO}/third_party/sglang/python:${REPO}/kt-kernel/python${PYTHONPATH:+:$PYTHONPATH}"
+ 
+ # ---------- 选定 Python 解释器 ----------
+ # 现象：本镜像默认 PATH 里 ``python3`` 指 ``/usr/bin/python3``（系统 python，没装
+@@ -146,7 +146,6 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
+   --dtype bfloat16 \
+   --trust-remote-code \
+   --mem-fraction-static 0.85 \
+-  --disable-cuda-graph \
+   --disable-radix-cache \
+   --max-prefill-tokens 65535 \
+   --context-length 65536 \
+@@ -162,8 +161,6 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
+   --host 0.0.0.0 \
+   --port "$PORT" \
+   ${EXTRA_FLAGS}
+-# 关 cuda-graph 原因：kt-kernel NPU bypass 模式 (kt-kernel/python/experts_base.py
+-# `_should_bypass_stream_callback`) 把 CPU forward 同步跑在 Python 主线程；graph
+-# capture 阶段 CPU 函数不会被录进 graph，replay 时 Python 主线程不再被触发，
+-# cpu_output 永远是 capture 时的快照 → 输出错误。Phase 3 把 ACL callback
+-# subscriber 实现后再可启用 cuda-graph（见 ascend_npu.h TODO）。
++# cuda-graph 已启用：kt-kernel ACL callback worker + kt_ep_wrapper NPU graph
++# host callback（见 kt-kernel/cpu_backend/ascend_callback_worker.*）。
++# 调试同步路径：KT_FORCE_SYNC_SUBMIT=1；回退无 graph：EXTRA_FLAGS="--disable-cuda-graph"
+-- 
+2.34.1
+

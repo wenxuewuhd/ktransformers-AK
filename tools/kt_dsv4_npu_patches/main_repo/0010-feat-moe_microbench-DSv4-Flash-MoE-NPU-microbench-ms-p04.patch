@@ -1,0 +1,1217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 10/13] =?UTF-8?q?feat(moe=5Fmicrobench):=20=E6=96=B0?= (part 4/4)
+
+diff --git a/tools/moe_microbench/results/routed_full_msprof.json b/tools/moe_microbench/results/routed_full_msprof.json
+new file mode 100644
+index 0000000..bdf46fd
+--- /dev/null
++++ b/tools/moe_microbench/results/routed_full_msprof.json
+@@ -0,0 +1,87 @@
++{
++  "kind": "routed_full",
++  "mode": "msprof_hardware_only",
++  "device_mean_us": 202.00885,
++  "pipeline_device_mean_us": 16.09638333333334,
++  "segments_hw": {
++    "act_quant_hw": {
++      "kind": "act_quant",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "DynamicQuant",
++      "device_mean_us": 2.892,
++      "device_std_us": 0.3705347487078641,
++      "device_p50_us": 2.78,
++      "device_p95_us": 3.493999999999999,
++      "device_p99_us": 3.8828,
++      "device_max_us": 3.98,
++      "device_min_us": 2.62,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/routed_act_quant/05d710313bd1_834852_20260526082850942_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/routed_act_quant"
++    },
++    "gemm_up_hw": {
++      "kind": "gemm_up",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 108.1884,
++      "device_std_us": 0.9216550547791701,
++      "device_p50_us": 108.013,
++      "device_p95_us": 109.78845,
++      "device_p99_us": 109.97528999999999,
++      "device_max_us": 110.02199999999999,
++      "device_min_us": 107.042,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/routed_gemm_up/05d710313bd1_834852_20260526082855518_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/routed_gemm_up"
++    },
++    "silu_hw": {
++      "kind": "silu_mul",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "Silu+Mul+DynamicQuant",
++      "device_mean_us": 6.841050000000001,
++      "device_std_us": 0.0,
++      "device_p50_us": 6.841050000000001,
++      "device_p95_us": 6.841050000000001,
++      "device_p99_us": 6.841050000000001,
++      "device_max_us": 6.841050000000001,
++      "device_min_us": 6.841050000000001,
++      "matched_rows": 50,
++      "source_csv": null,
++      "trace_dir": "npu_results/routed_silu"
++    },
++    "gemm_down_hw": {
++      "kind": "gemm_down",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 84.0874,
++      "device_std_us": 0.7250350612211819,
++      "device_p50_us": 83.821,
++      "device_p95_us": 85.2269,
++      "device_p99_us": 85.41338,
++      "device_max_us": 85.46000000000001,
++      "device_min_us": 83.321,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/routed_gemm_down/05d710313bd1_834852_20260526082904853_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/routed_gemm_down"
++    },
++    "pipeline_hw": {
++      "kind": "routed_full_pipeline",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantMatmul",
++      "device_mean_us": 16.09638333333334,
++      "device_std_us": 2.1283235115278463,
++      "device_p50_us": 15.8505,
++      "device_p95_us": 18.94405,
++      "device_p99_us": 19.346610000000002,
++      "device_max_us": 19.421,
++      "device_min_us": 13.001,
++      "matched_rows": 120,
++      "source_csv": "kernel_details:npu_results/routed_full_pipeline/05d710313bd1_834852_20260526082909600_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/routed_full_pipeline"
++    }
++  },
++  "cfg": {
++    "N": 6,
++    "E_act": 6
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/routed_full_msprof_n1.json b/tools/moe_microbench/results/routed_full_msprof_n1.json
+new file mode 100644
+index 0000000..6473212
+--- /dev/null
++++ b/tools/moe_microbench/results/routed_full_msprof_n1.json
+@@ -0,0 +1,87 @@
++{
++  "kind": "routed_full",
++  "mode": "msprof_hardware_only",
++  "device_mean_us": 37.2005,
++  "pipeline_device_mean_us": 14.37715,
++  "segments_hw": {
++    "act_quant_hw": {
++      "kind": "act_quant",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "DynamicQuant",
++      "device_mean_us": 3.7300999999999993,
++      "device_std_us": 0.2197773646215643,
++      "device_p50_us": 3.7,
++      "device_p95_us": 4.12,
++      "device_p99_us": 4.12,
++      "device_max_us": 4.12,
++      "device_min_us": 3.42,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_1/routed_act_quant/05d710313bd1_843023_20260526083138721_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_1/routed_act_quant"
++    },
++    "gemm_up_hw": {
++      "kind": "gemm_up",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 16.3022,
++      "device_std_us": 0.205415091947987,
++      "device_p50_us": 16.22,
++      "device_p95_us": 16.63155,
++      "device_p99_us": 16.63911,
++      "device_max_us": 16.641,
++      "device_min_us": 16.0,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_1/routed_gemm_up/05d710313bd1_843023_20260526083143277_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_1/routed_gemm_up"
++    },
++    "silu_hw": {
++      "kind": "silu_mul",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "Silu+Mul+DynamicQuant",
++      "device_mean_us": 4.9282,
++      "device_std_us": 0.0,
++      "device_p50_us": 4.9282,
++      "device_p95_us": 4.9282,
++      "device_p99_us": 4.9282,
++      "device_max_us": 4.9282,
++      "device_min_us": 4.9282,
++      "matched_rows": 30,
++      "source_csv": null,
++      "trace_dir": "npu_results/n_active_1/routed_silu"
++    },
++    "gemm_down_hw": {
++      "kind": "gemm_down",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 12.24,
++      "device_std_us": 0.11764352935882189,
++      "device_p50_us": 12.25,
++      "device_p95_us": 12.42,
++      "device_p99_us": 12.42,
++      "device_max_us": 12.42,
++      "device_min_us": 12.02,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_1/routed_gemm_down/05d710313bd1_843023_20260526083153490_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_1/routed_gemm_down"
++    },
++    "pipeline_hw": {
++      "kind": "routed_full_pipeline",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantMatmul",
++      "device_mean_us": 14.37715,
++      "device_std_us": 2.0028844268953714,
++      "device_p50_us": 14.4805,
++      "device_p95_us": 16.583,
++      "device_p99_us": 16.6286,
++      "device_max_us": 16.64,
++      "device_min_us": 12.14,
++      "matched_rows": 20,
++      "source_csv": "kernel_details:npu_results/n_active_1/routed_full_pipeline/05d710313bd1_843023_20260526083158092_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_1/routed_full_pipeline"
++    }
++  },
++  "cfg": {
++    "N": 1,
++    "E_act": 1
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/routed_full_msprof_n2.json b/tools/moe_microbench/results/routed_full_msprof_n2.json
+new file mode 100644
+index 0000000..7818ae2
+--- /dev/null
++++ b/tools/moe_microbench/results/routed_full_msprof_n2.json
+@@ -0,0 +1,87 @@
++{
++  "kind": "routed_full",
++  "mode": "msprof_hardware_only",
++  "device_mean_us": 70.73065000000001,
++  "pipeline_device_mean_us": 15.174775000000006,
++  "segments_hw": {
++    "act_quant_hw": {
++      "kind": "act_quant",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "DynamicQuant",
++      "device_mean_us": 3.8480000000000003,
++      "device_std_us": 0.20083824337013098,
++      "device_p50_us": 3.77,
++      "device_p95_us": 4.164999999999999,
++      "device_p99_us": 4.273,
++      "device_max_us": 4.3,
++      "device_min_us": 3.66,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_2/routed_act_quant/05d710313bd1_846287_20260526083303261_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_2/routed_act_quant"
++    },
++    "gemm_up_hw": {
++      "kind": "gemm_up",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 34.168600000000005,
++      "device_std_us": 0.28081103966902826,
++      "device_p50_us": 34.04,
++      "device_p95_us": 34.56255,
++      "device_p99_us": 34.577310000000004,
++      "device_max_us": 34.581,
++      "device_min_us": 33.821,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_2/routed_gemm_up/05d710313bd1_846287_20260526083307810_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_2/routed_gemm_up"
++    },
++    "silu_hw": {
++      "kind": "silu_mul",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "Silu+Mul+DynamicQuant",
++      "device_mean_us": 6.57115,
++      "device_std_us": 0.0,
++      "device_p50_us": 6.57115,
++      "device_p95_us": 6.57115,
++      "device_p99_us": 6.57115,
++      "device_max_us": 6.57115,
++      "device_min_us": 6.57115,
++      "matched_rows": 50,
++      "source_csv": null,
++      "trace_dir": "npu_results/n_active_2/routed_silu"
++    },
++    "gemm_down_hw": {
++      "kind": "gemm_down",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 26.142900000000004,
++      "device_std_us": 0.1388693270668505,
++      "device_p50_us": 26.091,
++      "device_p95_us": 26.38,
++      "device_p99_us": 26.444799999999997,
++      "device_max_us": 26.461,
++      "device_min_us": 25.98,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_2/routed_gemm_down/05d710313bd1_846287_20260526083316951_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_2/routed_gemm_down"
++    },
++    "pipeline_hw": {
++      "kind": "routed_full_pipeline",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantMatmul",
++      "device_mean_us": 15.174775000000006,
++      "device_std_us": 2.062309378918449,
++      "device_p50_us": 15.130500000000001,
++      "device_p95_us": 17.482,
++      "device_p99_us": 17.5688,
++      "device_max_us": 17.6,
++      "device_min_us": 12.84,
++      "matched_rows": 40,
++      "source_csv": "kernel_details:npu_results/n_active_2/routed_full_pipeline/05d710313bd1_846287_20260526083321576_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_2/routed_full_pipeline"
++    }
++  },
++  "cfg": {
++    "N": 2,
++    "E_act": 2
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/routed_full_msprof_n3.json b/tools/moe_microbench/results/routed_full_msprof_n3.json
+new file mode 100644
+index 0000000..fd13600
+--- /dev/null
++++ b/tools/moe_microbench/results/routed_full_msprof_n3.json
+@@ -0,0 +1,87 @@
++{
++  "kind": "routed_full",
++  "mode": "msprof_hardware_only",
++  "device_mean_us": 100.6194,
++  "pipeline_device_mean_us": 15.117016666666673,
++  "segments_hw": {
++    "act_quant_hw": {
++      "kind": "act_quant",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "DynamicQuant",
++      "device_mean_us": 3.7040000000000006,
++      "device_std_us": 0.6194061672279346,
++      "device_p50_us": 3.92,
++      "device_p95_us": 4.38,
++      "device_p99_us": 4.38,
++      "device_max_us": 4.38,
++      "device_min_us": 2.4,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_3/routed_act_quant/05d710313bd1_849525_20260526083425173_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_3/routed_act_quant"
++    },
++    "gemm_up_hw": {
++      "kind": "gemm_up",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 51.1228,
++      "device_std_us": 0.2300373013230692,
++      "device_p50_us": 51.101000000000006,
++      "device_p95_us": 51.436099999999996,
++      "device_p99_us": 51.47282,
++      "device_max_us": 51.482,
++      "device_min_us": 50.739999999999995,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_3/routed_gemm_up/05d710313bd1_849525_20260526083429727_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_3/routed_gemm_up"
++    },
++    "silu_hw": {
++      "kind": "silu_mul",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "Silu+Mul+DynamicQuant",
++      "device_mean_us": 6.597999999999999,
++      "device_std_us": 0.0,
++      "device_p50_us": 6.597999999999999,
++      "device_p95_us": 6.597999999999999,
++      "device_p99_us": 6.597999999999999,
++      "device_max_us": 6.597999999999999,
++      "device_min_us": 6.597999999999999,
++      "matched_rows": 50,
++      "source_csv": null,
++      "trace_dir": "npu_results/n_active_3/routed_silu"
++    },
++    "gemm_down_hw": {
++      "kind": "gemm_down",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 39.1946,
++      "device_std_us": 0.38850436290986495,
++      "device_p50_us": 39.170500000000004,
++      "device_p95_us": 39.765,
++      "device_p99_us": 39.793800000000005,
++      "device_max_us": 39.801,
++      "device_min_us": 38.56,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_3/routed_gemm_down/05d710313bd1_849525_20260526083438977_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_3/routed_gemm_down"
++    },
++    "pipeline_hw": {
++      "kind": "routed_full_pipeline",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantMatmul",
++      "device_mean_us": 15.117016666666673,
++      "device_std_us": 2.0257895867345708,
++      "device_p50_us": 15.1705,
++      "device_p95_us": 17.36195,
++      "device_p99_us": 17.456400000000002,
++      "device_max_us": 17.48,
++      "device_min_us": 12.7,
++      "matched_rows": 60,
++      "source_csv": "kernel_details:npu_results/n_active_3/routed_full_pipeline/05d710313bd1_849525_20260526083443642_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_3/routed_full_pipeline"
++    }
++  },
++  "cfg": {
++    "N": 3,
++    "E_act": 3
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/routed_full_msprof_n4.json b/tools/moe_microbench/results/routed_full_msprof_n4.json
+new file mode 100644
+index 0000000..6f38d1a
+--- /dev/null
++++ b/tools/moe_microbench/results/routed_full_msprof_n4.json
+@@ -0,0 +1,87 @@
++{
++  "kind": "routed_full",
++  "mode": "msprof_hardware_only",
++  "device_mean_us": 132.125,
++  "pipeline_device_mean_us": 15.299462500000004,
++  "segments_hw": {
++    "act_quant_hw": {
++      "kind": "act_quant",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "DynamicQuant",
++      "device_mean_us": 3.3120999999999996,
++      "device_std_us": 0.7864030073696311,
++      "device_p50_us": 3.2305,
++      "device_p95_us": 4.222,
++      "device_p99_us": 4.236400000000001,
++      "device_max_us": 4.24,
++      "device_min_us": 2.42,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_4/routed_act_quant/05d710313bd1_852792_20260526083549084_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_4/routed_act_quant"
++    },
++    "gemm_up_hw": {
++      "kind": "gemm_up",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 68.90559999999999,
++      "device_std_us": 0.36581339505272154,
++      "device_p50_us": 68.92150000000001,
++      "device_p95_us": 69.43299999999999,
++      "device_p99_us": 69.5842,
++      "device_max_us": 69.622,
++      "device_min_us": 68.40100000000001,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_4/routed_gemm_up/05d710313bd1_852792_20260526083553650_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_4/routed_gemm_up"
++    },
++    "silu_hw": {
++      "kind": "silu_mul",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "Silu+Mul+DynamicQuant",
++      "device_mean_us": 6.9201999999999995,
++      "device_std_us": 0.0,
++      "device_p50_us": 6.9201999999999995,
++      "device_p95_us": 6.9201999999999995,
++      "device_p99_us": 6.9201999999999995,
++      "device_max_us": 6.9201999999999995,
++      "device_min_us": 6.9201999999999995,
++      "matched_rows": 50,
++      "source_csv": null,
++      "trace_dir": "npu_results/n_active_4/routed_silu"
++    },
++    "gemm_down_hw": {
++      "kind": "gemm_down",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 52.9871,
++      "device_std_us": 0.30992174818815044,
++      "device_p50_us": 52.971999999999994,
++      "device_p95_us": 53.45645,
++      "device_p99_us": 53.57129,
++      "device_max_us": 53.599999999999994,
++      "device_min_us": 52.482,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_4/routed_gemm_down/05d710313bd1_852792_20260526083602869_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_4/routed_gemm_down"
++    },
++    "pipeline_hw": {
++      "kind": "routed_full_pipeline",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantMatmul",
++      "device_mean_us": 15.299462500000004,
++      "device_std_us": 2.021458365535573,
++      "device_p50_us": 15.419999999999998,
++      "device_p95_us": 17.641000000000002,
++      "device_p99_us": 17.72441,
++      "device_max_us": 17.741,
++      "device_min_us": 12.78,
++      "matched_rows": 80,
++      "source_csv": "kernel_details:npu_results/n_active_4/routed_full_pipeline/05d710313bd1_852792_20260526083607572_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_4/routed_full_pipeline"
++    }
++  },
++  "cfg": {
++    "N": 4,
++    "E_act": 4
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/routed_full_msprof_n5.json b/tools/moe_microbench/results/routed_full_msprof_n5.json
+new file mode 100644
+index 0000000..ceca6e5
+--- /dev/null
++++ b/tools/moe_microbench/results/routed_full_msprof_n5.json
+@@ -0,0 +1,87 @@
++{
++  "kind": "routed_full",
++  "mode": "msprof_hardware_only",
++  "device_mean_us": 163.10414999999998,
++  "pipeline_device_mean_us": 15.327440000000008,
++  "segments_hw": {
++    "act_quant_hw": {
++      "kind": "act_quant",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "DynamicQuant",
++      "device_mean_us": 3.0140000000000002,
++      "device_std_us": 0.7555157179040023,
++      "device_p50_us": 2.66,
++      "device_p95_us": 4.526,
++      "device_p99_us": 4.5692,
++      "device_max_us": 4.58,
++      "device_min_us": 2.54,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_5/routed_act_quant/05d710313bd1_856029_20260526083712687_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_5/routed_act_quant"
++    },
++    "gemm_up_hw": {
++      "kind": "gemm_up",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 87.01809999999999,
++      "device_std_us": 0.7956291158573796,
++      "device_p50_us": 86.95150000000001,
++      "device_p95_us": 88.41345,
++      "device_p99_us": 88.56428999999999,
++      "device_max_us": 88.60199999999999,
++      "device_min_us": 86.00200000000001,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_5/routed_gemm_up/05d710313bd1_856029_20260526083717254_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_5/routed_gemm_up"
++    },
++    "silu_hw": {
++      "kind": "silu_mul",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "Silu+Mul+DynamicQuant",
++      "device_mean_us": 6.5043500000000005,
++      "device_std_us": 0.0,
++      "device_p50_us": 6.5043500000000005,
++      "device_p95_us": 6.5043500000000005,
++      "device_p99_us": 6.5043500000000005,
++      "device_max_us": 6.5043500000000005,
++      "device_min_us": 6.5043500000000005,
++      "matched_rows": 50,
++      "source_csv": null,
++      "trace_dir": "npu_results/n_active_5/routed_silu"
++    },
++    "gemm_down_hw": {
++      "kind": "gemm_down",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 66.56769999999999,
++      "device_std_us": 0.36889620491406594,
++      "device_p50_us": 66.5125,
++      "device_p95_us": 67.2211,
++      "device_p99_us": 67.28662,
++      "device_max_us": 67.303,
++      "device_min_us": 66.14,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_5/routed_gemm_down/05d710313bd1_856029_20260526083726539_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_5/routed_gemm_down"
++    },
++    "pipeline_hw": {
++      "kind": "routed_full_pipeline",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantMatmul",
++      "device_mean_us": 15.327440000000008,
++      "device_std_us": 2.131881442857459,
++      "device_p50_us": 14.8605,
++      "device_p95_us": 17.98695,
++      "device_p99_us": 18.18041,
++      "device_max_us": 18.221,
++      "device_min_us": 11.92,
++      "matched_rows": 100,
++      "source_csv": "kernel_details:npu_results/n_active_5/routed_full_pipeline/05d710313bd1_856029_20260526083731263_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_5/routed_full_pipeline"
++    }
++  },
++  "cfg": {
++    "N": 5,
++    "E_act": 5
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/routed_full_msprof_n6.json b/tools/moe_microbench/results/routed_full_msprof_n6.json
+new file mode 100644
+index 0000000..426bfd1
+--- /dev/null
++++ b/tools/moe_microbench/results/routed_full_msprof_n6.json
+@@ -0,0 +1,87 @@
++{
++  "kind": "routed_full",
++  "mode": "msprof_hardware_only",
++  "device_mean_us": 192.99214999999998,
++  "pipeline_device_mean_us": 15.287375,
++  "segments_hw": {
++    "act_quant_hw": {
++      "kind": "act_quant",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "DynamicQuant",
++      "device_mean_us": 2.84,
++      "device_std_us": 0.36276714294434104,
++      "device_p50_us": 2.71,
++      "device_p95_us": 3.4589999999999987,
++      "device_p99_us": 3.8118,
++      "device_max_us": 3.9,
++      "device_min_us": 2.6,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_6/routed_act_quant/05d710313bd1_859284_20260526083835040_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_6/routed_act_quant"
++    },
++    "gemm_up_hw": {
++      "kind": "gemm_up",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 103.74629999999999,
++      "device_std_us": 0.7732857233907768,
++      "device_p50_us": 103.452,
++      "device_p95_us": 105.0382,
++      "device_p99_us": 105.29884,
++      "device_max_us": 105.36399999999999,
++      "device_min_us": 102.94200000000001,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_6/routed_gemm_up/05d710313bd1_859284_20260526083839588_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_6/routed_gemm_up"
++    },
++    "silu_hw": {
++      "kind": "silu_mul",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "Silu+Mul+DynamicQuant",
++      "device_mean_us": 6.812150000000001,
++      "device_std_us": 0.0,
++      "device_p50_us": 6.812150000000001,
++      "device_p95_us": 6.812150000000001,
++      "device_p99_us": 6.812150000000001,
++      "device_max_us": 6.812150000000001,
++      "device_min_us": 6.812150000000001,
++      "matched_rows": 50,
++      "source_csv": null,
++      "trace_dir": "npu_results/n_active_6/routed_silu"
++    },
++    "gemm_down_hw": {
++      "kind": "gemm_down",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantBatchMatmul",
++      "device_mean_us": 79.5937,
++      "device_std_us": 0.7925400999318583,
++      "device_p50_us": 79.2515,
++      "device_p95_us": 80.576,
++      "device_p99_us": 80.612,
++      "device_max_us": 80.621,
++      "device_min_us": 78.503,
++      "matched_rows": 10,
++      "source_csv": "kernel_details:npu_results/n_active_6/routed_gemm_down/05d710313bd1_859284_20260526083848802_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_6/routed_gemm_down"
++    },
++    "pipeline_hw": {
++      "kind": "routed_full_pipeline",
++      "mode": "msprof_hardware_only",
++      "op_pattern": "QuantMatmul",
++      "device_mean_us": 15.287375,
++      "device_std_us": 2.173620171750728,
++      "device_p50_us": 15.271,
++      "device_p95_us": 18.304,
++      "device_p99_us": 18.572589999999998,
++      "device_max_us": 18.661,
++      "device_min_us": 11.98,
++      "matched_rows": 120,
++      "source_csv": "kernel_details:npu_results/n_active_6/routed_full_pipeline/05d710313bd1_859284_20260526083853520_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
++      "trace_dir": "npu_results/n_active_6/routed_full_pipeline"
++    }
++  },
++  "cfg": {
++    "N": 6,
++    "E_act": 6
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/sanity_act_quant_post.json b/tools/moe_microbench/results/sanity_act_quant_post.json
+new file mode 100644
+index 0000000..d47d72b
+--- /dev/null
++++ b/tools/moe_microbench/results/sanity_act_quant_post.json
+@@ -0,0 +1,27 @@
++{
++  "x_int8": {
++    "kind": "x_int8",
++    "shape": [
++      6,
++      4096
++    ],
++    "dtype": "torch.float32",
++    "nan_count": 0,
++    "has_nan": false,
++    "mean": -0.4720459282398224,
++    "std": 34.97970199584961,
++    "abs_max": 127.0
++  },
++  "x_scale": {
++    "kind": "x_scale",
++    "shape": [
++      6
++    ],
++    "dtype": "torch.float32",
++    "nan_count": 0,
++    "has_nan": false,
++    "mean": 0.028850886970758438,
++    "std": 0.0020553991198539734,
++    "abs_max": 0.03038877807557583
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/sanity_act_quant_pre.json b/tools/moe_microbench/results/sanity_act_quant_pre.json
+new file mode 100644
+index 0000000..42bc1dd
+--- /dev/null
++++ b/tools/moe_microbench/results/sanity_act_quant_pre.json
+@@ -0,0 +1,27 @@
++{
++  "x_int8": {
++    "kind": "x_int8",
++    "shape": [
++      1,
++      4096
++    ],
++    "dtype": "torch.float32",
++    "nan_count": 0,
++    "has_nan": false,
++    "mean": -1.4462890625,
++    "std": 38.23793029785156,
++    "abs_max": 127.0
++  },
++  "x_scale": {
++    "kind": "x_scale",
++    "shape": [
++      1
++    ],
++    "dtype": "torch.float32",
++    "nan_count": 0,
++    "has_nan": false,
++    "mean": 0.026082677766680717,
++    "std": NaN,
++    "abs_max": 0.026082677766680717
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/sanity_gemm_down.json b/tools/moe_microbench/results/sanity_gemm_down.json
+new file mode 100644
+index 0000000..aeb15f7
+--- /dev/null
++++ b/tools/moe_microbench/results/sanity_gemm_down.json
+@@ -0,0 +1,13 @@
++{
++  "kind": "gemm_down",
++  "shape": [
++    6,
++    4096
++  ],
++  "dtype": "torch.bfloat16",
++  "nan_count": 0,
++  "has_nan": false,
++  "mean": 842.40283203125,
++  "std": 131678.3125,
++  "abs_max": 569344.0
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/sanity_gemm_up.json b/tools/moe_microbench/results/sanity_gemm_up.json
+new file mode 100644
+index 0000000..ce29eaa
+--- /dev/null
++++ b/tools/moe_microbench/results/sanity_gemm_up.json
+@@ -0,0 +1,13 @@
++{
++  "kind": "gemm_up",
++  "shape": [
++    6,
++    4096
++  ],
++  "dtype": "torch.bfloat16",
++  "nan_count": 0,
++  "has_nan": false,
++  "mean": 0.19251422584056854,
++  "std": 63.946319580078125,
++  "abs_max": 290.0
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/sanity_routed_full.json b/tools/moe_microbench/results/sanity_routed_full.json
+new file mode 100644
+index 0000000..1ef942f
+--- /dev/null
++++ b/tools/moe_microbench/results/sanity_routed_full.json
+@@ -0,0 +1,13 @@
++{
++  "kind": "routed_full",
++  "shape": [
++    6,
++    4096
++  ],
++  "dtype": "torch.bfloat16",
++  "nan_count": 0,
++  "has_nan": false,
++  "mean": 842.40283203125,
++  "std": 131678.3125,
++  "abs_max": 569344.0
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/sanity_shared_expert.json b/tools/moe_microbench/results/sanity_shared_expert.json
+new file mode 100644
+index 0000000..f014116
+--- /dev/null
++++ b/tools/moe_microbench/results/sanity_shared_expert.json
+@@ -0,0 +1,13 @@
++{
++  "kind": "shared_expert",
++  "shape": [
++    1,
++    4096
++  ],
++  "dtype": "torch.bfloat16",
++  "nan_count": 0,
++  "has_nan": false,
++  "mean": -3049.9541015625,
++  "std": 122165.0390625,
++  "abs_max": 548864.0
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/sanity_silu_mul_unfused.json b/tools/moe_microbench/results/sanity_silu_mul_unfused.json
+new file mode 100644
+index 0000000..15c5e02
+--- /dev/null
++++ b/tools/moe_microbench/results/sanity_silu_mul_unfused.json
+@@ -0,0 +1,13 @@
++{
++  "kind": "silu_mul_unfused",
++  "shape": [
++    6,
++    2048
++  ],
++  "dtype": "torch.bfloat16",
++  "nan_count": 0,
++  "has_nan": false,
++  "mean": -17.51801109313965,
++  "std": 2912.1611328125,
++  "abs_max": 50176.0
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/shared_expert.json b/tools/moe_microbench/results/shared_expert.json
+new file mode 100644
+index 0000000..2e58758
+--- /dev/null
++++ b/tools/moe_microbench/results/shared_expert.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "shared_expert",
++  "cfg": {
++    "num_tokens": 1,
++    "H": 4096,
++    "S": 2048
++  },
++  "timing": {
++    "device_mean_us": 978.6453950405121,
++    "device_p50_us": 967.2199785709381,
++    "device_p95_us": 1020.9579467773438,
++    "device_p99_us": 1054.7347748279578,
++    "device_max_us": 1182.919979095459,
++    "device_std_us": 33.367391711388784,
++    "host_mean_us": 1131.985979154706,
++    "n": 100,
++    "dispatch_overhead_us": 153.34058411419392
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/shared_expert_msprof.json b/tools/moe_microbench/results/shared_expert_msprof.json
+new file mode 100644
+index 0000000..e3b4566
+--- /dev/null
++++ b/tools/moe_microbench/results/shared_expert_msprof.json
+@@ -0,0 +1,21 @@
++{
++  "kind": "shared_expert",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "QuantBatchMatmul+QuantMatmul+DynamicQuant+Silu+Mul",
++  "device_mean_us": 46.51045,
++  "device_std_us": 0.0,
++  "device_p50_us": 46.51045,
++  "device_p95_us": 46.51045,
++  "device_p99_us": 46.51045,
++  "device_max_us": 46.51045,
++  "device_min_us": 46.51045,
++  "matched_rows": 100,
++  "source_csv": null,
++  "trace_dir": "npu_results/shared_expert",
++  "cfg": {
++    "N": 6,
++    "n_active_experts": 6,
++    "H": 4096,
++    "I": 2048
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/silu_mul.json b/tools/moe_microbench/results/silu_mul.json
+new file mode 100644
+index 0000000..71b4a44
+--- /dev/null
++++ b/tools/moe_microbench/results/silu_mul.json
+@@ -0,0 +1,18 @@
++{
++  "kind": "silu_mul_unfused",
++  "cfg": {
++    "N": 6,
++    "mode": "unfused"
++  },
++  "timing": {
++    "device_mean_us": 355.1188001036644,
++    "device_p50_us": 347.9599952697754,
++    "device_p95_us": 403.2550036907196,
++    "device_p99_us": 427.97579109668794,
++    "device_max_us": 550.320029258728,
++    "device_std_us": 27.27238117407509,
++    "host_mean_us": 504.1737575083971,
++    "n": 100,
++    "dispatch_overhead_us": 149.0549574047327
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/silu_mul_fused.json b/tools/moe_microbench/results/silu_mul_fused.json
+new file mode 100644
+index 0000000..9f271d7
+--- /dev/null
++++ b/tools/moe_microbench/results/silu_mul_fused.json
+@@ -0,0 +1,18 @@
++{
++  "kind": "silu_mul_unfused",
++  "cfg": {
++    "N": 6,
++    "mode": "unfused"
++  },
++  "timing": {
++    "device_mean_us": 349.9864003062248,
++    "device_p50_us": 347.7800041437149,
++    "device_p95_us": 368.42298805713654,
++    "device_p99_us": 406.55201166868295,
++    "device_max_us": 568.120002746582,
++    "device_std_us": 25.303907666074263,
++    "host_mean_us": 502.3354012519121,
++    "n": 100,
++    "dispatch_overhead_us": 152.3490009456873
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/silu_mul_msprof.json b/tools/moe_microbench/results/silu_mul_msprof.json
+new file mode 100644
+index 0000000..0deaf6c
+--- /dev/null
++++ b/tools/moe_microbench/results/silu_mul_msprof.json
+@@ -0,0 +1,21 @@
++{
++  "kind": "silu_mul_unfused",
++  "mode": "msprof_hardware_only",
++  "op_pattern": "Silu+Mul+DynamicQuant",
++  "device_mean_us": 6.714100000000002,
++  "device_std_us": 0.0,
++  "device_p50_us": 6.714100000000002,
++  "device_p95_us": 6.714100000000002,
++  "device_p99_us": 6.714100000000002,
++  "device_max_us": 6.714100000000002,
++  "device_min_us": 6.714100000000002,
++  "matched_rows": 50,
++  "source_csv": null,
++  "trace_dir": "npu_results/silu_mul_unfused",
++  "cfg": {
++    "N": 6,
++    "n_active_experts": 6,
++    "H": 4096,
++    "I": 2048
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/silu_mul_unfused.json b/tools/moe_microbench/results/silu_mul_unfused.json
+new file mode 100644
+index 0000000..9f271d7
+--- /dev/null
++++ b/tools/moe_microbench/results/silu_mul_unfused.json
+@@ -0,0 +1,18 @@
++{
++  "kind": "silu_mul_unfused",
++  "cfg": {
++    "N": 6,
++    "mode": "unfused"
++  },
++  "timing": {
++    "device_mean_us": 349.9864003062248,
++    "device_p50_us": 347.7800041437149,
++    "device_p95_us": 368.42298805713654,
++    "device_p99_us": 406.55201166868295,
++    "device_max_us": 568.120002746582,
++    "device_std_us": 25.303907666074263,
++    "host_mean_us": 502.3354012519121,
++    "n": 100,
++    "dispatch_overhead_us": 152.3490009456873
++  }
++}
+\ No newline at end of file
+diff --git a/tools/moe_microbench/results/summary_decode.md b/tools/moe_microbench/results/summary_decode.md
+new file mode 100644
+index 0000000..52e2327
+--- /dev/null
++++ b/tools/moe_microbench/results/summary_decode.md
+@@ -0,0 +1,52 @@
++# NPU MoE Microbench Summary
++
++> 仅 NPU 段，不含 gating / dispatch / combine / CPU MoE。  
++> **分析结论与复现**：[`ANALYSIS_AND_REPRODUCTION.md`](./ANALYSIS_AND_REPRODUCTION.md) · D5 launch 拆解：[`msprof_vs_python_comparison.md`](./msprof_vs_python_comparison.md)
++
++| segment | dev_mean_us | p99 | host_mean_us | dispatch_overhead_us | lb_peak | util_peak | lb_eff | util_eff |
++|---------|-------------|-----|--------------|----------------------|---------|-----------|--------|----------|
++| act_quant_post | 166.41 | 206.30 | 300.24 | 133.83 | (n/a) | (n/a) | (n/a) | (n/a) |
++| act_quant_pre | 186.41 | 204.28 | 313.08 | 126.66 | (n/a) | (n/a) | (n/a) | (n/a) |
++| gemm_up | 4274.02 | 4587.58 | 4438.25 | 164.24 | 62.91 | 67.93 | 83.89 | 50.95 |
++| silu_mul_unfused | 349.99 | 406.55 | 502.34 | 152.35 | (n/a) | (n/a) | (n/a) | (n/a) |
++| gemm_down | 4184.89 | 4374.79 | 4350.63 | 165.74 | 31.46 | 133.03 | 41.94 | 99.78 |
++| routed_full | 9142.27 | 9266.39 | 9311.31 | 169.04 | 94.37 | 96.87 | 125.83 | 72.66 |
++| shared_expert | 978.65 | 1054.73 | 1131.99 | 153.34 | 15.73 | 62.22 | 20.97 | 46.67 |
++
++- routed_full_compute_only_us: **9104.782190322876**
++- routed_full_post_dispatch_us: **9142.269401550293**
++
++### Grouped vs Loop (S2)
++
++| target | grouped_us | loop_us | grouped_dispatch | loop_dispatch |
++|--------|------------|---------|------------------|---------------|
++| up | 4508.39 | 2070.56 | 185.35 | 143.42 |
++| down | 4459.61 | 2038.41 | 155.90 | 148.33 |
++
++### n_active sweep (A5)
++
++| n_active | tpe | N | gemm_up_us | gemm_down_us | routed_full_us | util_eff |
++|---------:|----:|--:|-----------:|-------------:|---------------:|---------:|
++| 1 | 1 | 1 | 4506.95 | 4113.66 | 8472.43 | 404.00 |
++| 2 | 1 | 2 | 4229.11 | 4243.94 | 9651.29 | 230.10 |
++| 3 | 1 | 3 | 4594.62 | 4347.69 | 9299.77 | 147.82 |
++| 4 | 1 | 4 | 4625.39 | 4237.99 | 8507.60 | 101.42 |
++| 5 | 1 | 5 | 4413.86 | 4150.83 | 8663.74 | 82.62 |
++| 6 | 1 | 6 | 4392.78 | 4450.59 | 8981.26 | 71.38 |
++
++> act_quant(pre) 不随 n_active 变化（固定 [num_tokens, H]）。
++
++> ⚠ **shared_expert ‖ routed_full 并行** (A8)：端到端 ≈ max(shared, routed)，不能相加。
++> ⚠ **util_vs_achievable > 0.75** 算打满 (N4)；表中 util_eff 列即 util_vs_achievable。
++> ⚠ **act_quant pre vs post** (N5)：post 是上限；pre ≈ post / n_active。
++
++### HBM 带宽实测 (N4)
++- hbm_peak_tb_s = 1.6
++- hbm_effective_tb_s = 1.2
++
++### FP4 vs W8 roofline (N8)
++| path | routed weight | @peak 1.6TB/s | @eff 1.0TB/s |
++|------|---------------|--------------|--------------|
++| W8 (本计划, n_active=6) | 144 MB | 90 μs | 144 μs |
++| FP4 (论文估计) | ~76 MB | ~48 μs | ~76 μs |
++| gap | ~1.9× HBM traffic | | |
+diff --git a/tools/moe_microbench/run_all.sh b/tools/moe_microbench/run_all.sh
+new file mode 100755
+index 0000000..f5fca9a
+--- /dev/null
++++ b/tools/moe_microbench/run_all.sh
+@@ -0,0 +1,85 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=/dev/null
++source "${ROOT}/env.sh"
++
++OUT_DIR="${OUT_DIR:-${ROOT}/results}"
++mkdir -p "${OUT_DIR}"
++
++EXTRA=()
++[[ -n "${NUM_TOKENS:-}" ]] && EXTRA+=(--num-tokens "${NUM_TOKENS}")
++[[ -n "${TOP_K:-}" ]] && EXTRA+=(--top-k "${TOP_K}")
++[[ -n "${N_ACTIVE:-}" ]] && EXTRA+=(--n-active-experts "${N_ACTIVE}")
++[[ -n "${TOKENS_PER_EXPERT:-}" ]] && EXTRA+=(--tokens-per-expert "${TOKENS_PER_EXPERT}")
++[[ -n "${WARMUP:-}" ]] && EXTRA+=(--warmup "${WARMUP}")
++[[ -n "${REPEAT:-}" ]] && EXTRA+=(--repeat "${REPEAT}")
++[[ "${QUICK:-0}" == "1" ]] && EXTRA+=(--quick-mode)
++
++if [[ "${PROFILE:-0}" == "1" ]]; then
++  PROFILE_DIR="${OUT_DIR}/profile"
++  EXTRA+=(--profile-dir "${PROFILE_DIR}")
++fi
++
++if [[ "${DRY_RUN:-0}" == "1" ]]; then
++  for K in act_quant gemm_up silu_mul gemm_down routed_full shared_expert grouped_vs_loop; do
++    echo "--- dry-run: $K ---"
++    "${PYTHON_BIN}" -m "moe_bench.bench_${K}" --dry-run "${EXTRA[@]:-}"
++  done
++  exit 0
++fi
++
++run_bench() {
++  local kind="$1"
++  local outdir="${2:-${OUT_DIR}}"
++  echo "--- run: ${kind} -> ${outdir} ---"
++  "${PYTHON_BIN}" -m "moe_bench.bench_${kind}" --out "${outdir}/${kind}.json" "${EXTRA[@]:-}"
++}
++
++if [[ -n "${SWEEP_N_ACTIVE:-}" ]]; then
++  for NA in ${SWEEP_N_ACTIVE}; do
++    SD="${OUT_DIR}/n_active_${NA}"
++    mkdir -p "${SD}"
++    N_ACTIVE="${NA}" run_bench gemm_up "${SD}"
++    N_ACTIVE="${NA}" run_bench gemm_down "${SD}"
++    N_ACTIVE="${NA}" run_bench routed_full "${SD}"
++  done
++fi
++
++run_bench act_quant
++run_bench gemm_up
++echo "--- run: silu_mul_unfused ---"
++"${PYTHON_BIN}" -m moe_bench.bench_silu_mul --no-fused --out "${OUT_DIR}/silu_mul_unfused.json" "${EXTRA[@]:-}"
++echo "--- run: silu_mul (auto/fused probe) ---"
++if "${PYTHON_BIN}" -m moe_bench.bench_silu_mul --fused --out "${OUT_DIR}/silu_mul_fused.json" "${EXTRA[@]:-}" 2>/dev/null; then
++  :
++else
++  cp "${OUT_DIR}/silu_mul_unfused.json" "${OUT_DIR}/silu_mul_fused.json" 2>/dev/null || true
++fi
++run_bench gemm_down
++run_bench routed_full
++run_bench shared_expert
++run_bench grouped_vs_loop
++
++REPORT_INPUTS=(
++  "${OUT_DIR}/act_quant.json"
++  "${OUT_DIR}/gemm_up.json"
++  "${OUT_DIR}/silu_mul_unfused.json"
++  "${OUT_DIR}/silu_mul_fused.json"
++  "${OUT_DIR}/gemm_down.json"
++  "${OUT_DIR}/routed_full.json"
++  "${OUT_DIR}/shared_expert.json"
++  "${OUT_DIR}/grouped_vs_loop.json"
++)
++
++SWEEP_ARG=()
++if [[ -n "${SWEEP_N_ACTIVE:-}" ]]; then
++  SWEEP_ARG=(--sweep-dir "${OUT_DIR}")
++fi
++
++"${PYTHON_BIN}" -m moe_bench.report \
++  --inputs "${REPORT_INPUTS[@]}" \
++  "${SWEEP_ARG[@]}" \
++  --out "${OUT_DIR}/summary_decode.md"
++
++echo "[moe_microbench] done -> ${OUT_DIR}/summary_decode.md"
+diff --git a/tools/moe_microbench/run_msprof.sh b/tools/moe_microbench/run_msprof.sh
+new file mode 100755
+index 0000000..99d48f0
+--- /dev/null
++++ b/tools/moe_microbench/run_msprof.sh
+@@ -0,0 +1,73 @@
++#!/usr/bin/env bash
++# D5: msprof 硬件层测量 + comparison 报告（不替换 Event 路径）
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=/dev/null
++source "${ROOT}/env.sh"
++
++OUT_DIR="${OUT_DIR:-${ROOT}/results}"
++MSPROF_OUT="${MSPROF_OUT:-${ROOT}/npu_results}"
++mkdir -p "${OUT_DIR}" "${MSPROF_OUT}"
++
++EXTRA=()
++[[ -n "${N_ACTIVE:-}" ]] && EXTRA+=(--n-active-experts "${N_ACTIVE}")
++[[ "${QUICK:-0}" == "1" ]] && EXTRA+=(--quick-mode)
++MSPROF_EXTRA=(--msprof --msprof-out "${MSPROF_OUT}")
++
++run_msprof_bench() {
++  local seg="$1"
++  local out="${OUT_DIR}/${seg}_msprof.json"
++  echo "--- msprof: ${seg} -> ${out} ---"
++  "${PYTHON_BIN}" -m "moe_bench.bench_${seg}" "${MSPROF_EXTRA[@]}" --out "${out}" "${EXTRA[@]:-}"
++}
++
++# D5.2: 8 段正式 msprof
++for seg in act_quant gemm_up silu_mul gemm_down routed_full shared_expert; do
++  run_msprof_bench "${seg}"
++done
++
++echo "--- msprof: silu_mul fused (optional) ---"
++"${PYTHON_BIN}" -m moe_bench.bench_silu_mul "${MSPROF_EXTRA[@]}" --fused --out "${OUT_DIR}/silu_mul_fused_msprof.json" "${EXTRA[@]:-}" 2>/dev/null || \
++  echo "[skip] fused silu kernel unavailable"
++
++"${PYTHON_BIN}" -m moe_bench.bench_grouped_vs_loop "${MSPROF_EXTRA[@]}" --out "${OUT_DIR}/grouped_vs_loop_msprof.json" "${EXTRA[@]:-}"
++
++# D5.5 optional sweep
++if [[ -n "${SWEEP_N_ACTIVE:-}" ]]; then
++  for N in ${SWEEP_N_ACTIVE}; do
++    for seg in gemm_up gemm_down routed_full; do
++      echo "--- msprof sweep n_active=${N} ${seg} ---"
++      N_ACTIVE="${N}" "${PYTHON_BIN}" -m "moe_bench.bench_${seg}" \
++        --msprof --msprof-out "${MSPROF_OUT}/n_active_${N}" \
++        --out "${OUT_DIR}/${seg}_msprof_n${N}.json" "${EXTRA[@]:-}"
++    done
++  done
++  "${PYTHON_BIN}" -m moe_bench.report --mode msprof-n-active-sweep \
++    --inputs ${OUT_DIR}/*_msprof_n*.json \
++    --out "${OUT_DIR}/msprof_n_active_sweep.md"
++fi
++
++# D5.3-D5.4: comparison report
++EVENT_JSONS=(
++  "${OUT_DIR}/act_quant.json"
++  "${OUT_DIR}/gemm_up.json"
++  "${OUT_DIR}/silu_mul_unfused.json"
++  "${OUT_DIR}/gemm_down.json"
++  "${OUT_DIR}/routed_full.json"
++  "${OUT_DIR}/shared_expert.json"
++  "${OUT_DIR}/grouped_vs_loop.json"
++)
++
++"${PYTHON_BIN}" -m moe_bench.report --mode comparison \
++  --msprof-jsons \
++    "${OUT_DIR}/act_quant_msprof.json" \
++    "${OUT_DIR}/gemm_up_msprof.json" \
++    "${OUT_DIR}/silu_mul_msprof.json" \
++    "${OUT_DIR}/gemm_down_msprof.json" \
++    "${OUT_DIR}/routed_full_msprof.json" \
++    "${OUT_DIR}/shared_expert_msprof.json" \
++    "${OUT_DIR}/grouped_vs_loop_msprof.json" \
++  --event-jsons "${EVENT_JSONS[@]}" \
++  --out "${OUT_DIR}/msprof_vs_python_comparison.md"
++
++echo "[moe_microbench] D5 done -> ${OUT_DIR}/msprof_vs_python_comparison.md"
+-- 
+2.34.1
+

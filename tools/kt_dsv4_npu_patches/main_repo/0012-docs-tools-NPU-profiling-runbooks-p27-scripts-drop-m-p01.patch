@@ -1,0 +1,966 @@
+From 2fadd64cc5029d713a9ff39e0207a6397259c094 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Sat, 30 May 2026 02:05:40 +0000
+Subject: [PATCH 12/13] docs(tools): NPU profiling runbooks, p27 scripts, drop
+ model weights, Q8 GEMM fix Remove bundled model/w8a8 weights; add decode
+ profiling runbook and p27 launch workload scripts. Include kt-kernel Q8_0
+ GEMM fix and bump sglang for NPU profiler hooks and SparseAttnSharedkv T=1
+ squeeze guard.
+
+
+diff --git a/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md b/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
+old mode 100644
+new mode 100755
+index d3b8158..9752099
+--- a/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
++++ b/doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md
+@@ -27,15 +27,23 @@
+ 
+ **目标**：让 DeepSeek-V4-Flash（671B MoE，256 routed experts/层）在**单卡 Atlas 910B (64 GB HBM) + 鲲鹏 920 (1.5 TB DRAM, 192 cores, 8 NUMA)** 上跑起来，方式是把约 16/256 个"热"expert 留 NPU，剩 240/256 走 CPU 端 `kt-kernel`（llamafile GGUF Q8_0 backend, NEON SDOT）。
+ 
+-**当前进度**（2026-05-13）：
+-- ✅ Phase 0 完成：`kt_kernel_ext.cpython-311-aarch64-linux-gnu.so` 在 K920+CANN 上编出来、import 通、`CPUInfer/MOEConfig/MOE` 全 OK。
+-- ✅ Phase 1.1 + 1.2 完成：W8A8→GGUF Q8_0 转换器 + Llamafile MoE 单层冒烟，43 层 GGUF 已经预生成至 `/workspace/models/cache/`。
+-- ✅ Phase 2-B + P2.2 + P2.3 完成：`third_party/sglang` 已切到 baseline **`iforgetmyname/sglang@dsv4_release`**，KT 在 baseline 上 backport 了 `kt_accel.py` 与 `kt_ep_wrapper.py` 三处 NPU-friendly 改动；详见 `Phase0_Phase1_变更记录与复现手册.md §8 / §9`。
+-- ✅ **P2.7 wiring 打通**：单卡 NPU + KT(LLAMAFILE) + DSv4-Flash W8A8 服务可以起、能接 `/generate` 并返回 200 OK，e2e_latency ≈ 2.3s。
+-- ⏳ **当前阻塞**：生成内容是退化 token（"  !  !  !  !  …" 全是空格 / `!`），属于**数值问题**而非 wiring 问题。诊断与对照实验计划见 §6.11。
+-- ⏳ 之后：Phase 3 CPU↔NPU 异步 overlap（性能）、Phase 4 KML 精度回归（可选）。
++**当前进度**（2026-05-19，以 git 为准）：
++- ✅ Phase 0 / 1 / 2（F1–F3）：BF16 GGUF 43 层、N=0 与 N=32 hybrid e2e、layout + `chunked_prefill_size` 等见附录 Z。
++- ✅ **任务 2（NPU Graph + KT CPU MoE）**：ACL callback worker + `kt_ep_wrapper` host callback；launch **默认开启** cuda-graph；卡 2 上 Graph capture ~7–11s、F2 四 prompt 通过（N=0 / N=32）。详 **附录 Z.14**。
++- ⏳ **任务 3（Q8_0）进行中**：aarch64 `tinyBLAS_Q0_ARM` 仍 NaN；BF16 为 regression 基线。详 Z.5 / Z.12。
++- ⏳ **后续**：mxfp4 原生权重、Graph 性能调参（`TASK_QUEUE_ENABLE`、多 `cuda_graph_bs`）、EPLB 动态 mask 等。详 Z.12。
+ 
+-**关键约束**：K920 是 ARMv8.2-A + NEON SDOT，**没有 SVE / BF16 / I8MM**。kt-kernel 自带的 `Int8_KERNEL_MOE`/`Int4_KERNEL_MOE` 是纯 SVE 汇编写的，在 K920 上跑不通，所以 CPU 这条腿先走 **llamafile GGUF Q8_0**（NEON SDOT 路径），Phase 4 再考虑用 KML libkblas 的 `cblas_gemm_s8s8s32` 替换核心 GEMM 做精度回归。
++**Commits（任务 2 参考）**：主仓 `29c082e`；子模块 `third_party/sglang` `db577d2e8`（`kt_ep_wrapper` graph 路径）。
++
++**部署前编译 kt-kernel（NPU callback 必选）**：
++
++```bash
++cd kt-kernel
++export CPUINFER_USE_ASCEND_NPU=1
++python setup.py build_ext --inplace
++```
++
++**关键约束**：K920 无 SVE/i8mm；CPU offload 当前生产路径为 **BF16 GGUF**（~555 GiB）。Q8_0 修通后可降到 ~280 GiB。MOE_INT8/KML 在 K920 不可用。
+ 
+ ---
+ 
+@@ -1073,33 +1081,33 @@ ${PYTHON_BIN} $REPO/tools/phase12_llamafile_moe_smoke.py \
+ 
+ **目标**：让 CPU expert 计算和 NPU expert 计算真正并行，性能提升预期 1.5-2x。
+ 
+-### 7.1 关键工作
++### 7.0 已完成（任务 2，2026-05）—— Graph 下 CPU MoE 正确性
+ 
+-1. **落地 CANN callback 子线程**：
+-   - 在主进程启动时，spawn 一个 `_npu_callback_worker` 线程
+-   - 该线程调用 `aclrtSubscribeReport(threadId, stream)` 注册关心的 stream
+-   - 然后死循环调用 `aclrtProcessReport(timeout_ms=100)` 消费 callback queue
+-   - C++ 侧暴露 `kt_kernel_ext.CPUInfer.subscribe_npu_callback(stream_handle)` Python API
++下列项已在 **附录 Z.14** 落地并 e2e 验证，与 §7.1 原「callback 子线程」为同一基础设施：
+ 
+-2. **`submit_with_cuda_stream` 真生效**：
+-   - 当前 Phase 0 的桩位已经把 `cudaLaunchHostFunc → aclrtLaunchCallback` 调用通了
+-   - 没有 subscriber 时它会卡（callback 永不 fire），有了 subscriber 才会触发
+-   - 改 `kt_ep_wrapper.py` 里 NPU 路径的 `submit/sync_with_cuda_stream` 调用，传入正确的 stream handle
++| 项 | 状态 |
++|----|------|
++| `ascend_callback_worker.{h,cpp}` + `init_ascend_callback_worker` | ✅ |
++| `cudaLaunchHostFunc` 前自动 `subscribe` stream | ✅ |
++| `experts_base.py`：NPU 默认 **不** bypass；`submit_with_cuda_stream` + pin buffer API | ✅ |
++| `kt_ep_wrapper.py`：decode graph 用 `_launch_host_func` + `run_pinned_forward_sync` | ✅ |
++| Prefill：仍 async `submit_forward` / `sync_forward`（日志 `Prefill npu graph: False`） | ✅ |
++| Launch 去掉 `--disable-cuda-graph`；`PYTHONPATH` 含 `kt-kernel/python` | ✅ |
+ 
+-3. **Stream 顺序**：
+-   - NPU 计算 stream → record event A
+-   - CPU 计算用 `submit_with_cuda_stream(stream)` 排在 event A 之后
+-   - 最终 sync 在主 stream 上
++**尚未完成（仍属 Phase 3 性能目标）**：decode 时 CPU/NPU **时间线重叠** 的系统性 profiling、shared-expert 双 stream 与 SGLang 调度对齐、`TASK_QUEUE_ENABLE=0` 对照等（见 Z.12）。
+ 
+-4. **Perf profile**：用 `npu-smi profile` 或 sglang 自带 profiler 看 timeline，确认 CPU/NPU bar 重叠
++### 7.1 剩余关键工作（性能向）
+ 
+-### 7.2 风险
++1. **Prefill / Decode 路径统一策略**：`KT_FORCE_SYNC_SUBMIT=1` 与 graph 路径的 perf 对比。
++2. **Stream 顺序与 overlap**：NPU main stream + CPU callback 与 shared experts 并行（参考旧 `ascend_experts.py` 双 stream）。
++3. **Perf profile**：`npu-smi` / sglang profiler，确认 replay 时 CPU bar 与 NPU bar 重叠比例。
++4. **多 `cuda_graph_bs`**：当前验证以 bs=1 为主；扩展 batch 档位需补 pin buffer 与 capture 回归。
+ 
+-- ACL callback 必须 spawn 在 **non-aclrt 线程**（不能是 stream owner 线程），否则死锁
+-- `aclrtProcessReport` timeout 设置不当会浪费 CPU 周期
+-- pybind11 的 GIL 在 callback 里要正确释放
++### 7.2 风险（仍适用）
+ 
+-预估代码量：~500-1000 行 C++ + Python。
++- ACL callback worker 须在 **独立线程** `aclrtProcessReport`，不可与 stream owner 同线程死锁。
++- Graph capture 期间勿对 capturing stream 调 `torch.npu.synchronize`（已用 `_wait_device` 跳过）。
++- 部署环境必须 **重编** `kt_kernel_ext`（`CPUINFER_USE_ASCEND_NPU=1`），否则无 `init_ascend_callback_worker`。
+ 
+ ---
+ 
+@@ -1298,7 +1306,10 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/cann-8.5.0/lib64:/usr/local/kml/lib:$LD
+ | `tools/phase12_llamafile_moe_smoke.py` | 1.2 | `KTMoEWrapper(LLAMAFILE)` 单层 forward 冒烟（含 `--second-gguf` Phase 2-B 覆盖） |
+ | `tools/kt_accel_stream_smoke.py` | 2.2 | 仅测 `kt_accel` stream/event/sync 抽象，不依赖权重 |
+ | `tools/run_p22_smoke_checks.sh` | 2.2 | P2.2 三段冒烟（kt_accel + import kt_ep_wrapper + phase12） |
+-| `tools/p27_launch_ds4flash_npu.sh` | 2.7 | 单卡 NPU + KT(LLAMAFILE) sglang serve 拉起；含 `PYTHON_BIN` 探测、CANN env、与基线 8 卡参数对齐 |
++| `tools/p27_launch_ds4flash_npu.sh` | 2.7 + Z.14 | 单卡 NPU + KT；**默认开启 cuda-graph**；`PYTHONPATH` 含 `kt-kernel/python` |
++| `tools/p27_launch_ds4flash_npu_num_expert_0.sh` | F2 + Z.14 | 同上，`--kt-num-gpu-experts 0` |
++| `kt-kernel/cpu_backend/ascend_callback_worker.{h,cpp}` | Z.14 | ACL `SubscribeReport` + `ProcessReport` 后台线程 |
++| `kt-kernel/python/experts_base.py` | Z.14 | callback worker 初始化；pin buffer；`run_pinned_forward_sync` |
+ | `tools/p27_curl_generate.sh` | 2.7 | 对已起服务发 `/generate` 冒烟 |
+ | `third_party/sglang/python/sglang/srt/utils/kt_accel.py` | 2.2 + 2.9 | CUDA↔NPU stream/event/同步抽象（baseline 没有，自 archive backport） |
+ | `third_party/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py` | 2.2 + 2.3 + 2.9 | KT EP wrapper：per-layer 模板、`KTMoEWrapper` 签名适配本机 wheel、stream → `kt_accel`、`mask_cpu_expert_routing` 替代 `mask_cpu_expert_ids` |
+@@ -1313,7 +1324,7 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/cann-8.5.0/lib64:/usr/local/kml/lib:$LD
+ |---|---|---|
+ | `tools/p27_dump_tensors.py`（建议） | 2.11 | 加载同 model + 同 prompt forward 1 token，dump embedding / 中间层 attn_out / lm_head 输入 hidden 等关键张量，便于与 8 卡基线对账 |
+ | `tools/p27_curl_generate.sh` 扩展 | 2.11 | 加 `temperature 0 / top_p 1.0 / seed` 参数，保证生成可复现 |
+-| Phase 3 callback subscriber | 3 | `aclrtSubscribeReport` + `aclrtProcessReport` 后台线程（详 §7） |
++| Phase 3 overlap / perf | 3 | callback 已落地（Z.14）；剩余 timeline overlap、多 graph_bs（详 §7.1、Z.12） |
+ | Phase 4 KML W8A8 backend | 4 | `cblas_gemm_s8s8s32` 替代 Q8_0（详 §8） |
+ 
+ ---
+@@ -1525,11 +1536,17 @@ static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
+ `llamafile_sgemm` 里抛 `"llamafile not supported"`（aarch64 无 SVE 时
+ BF16×BF16 走不通）。Z.2 + Z.4 两个 fix 必须叠加，缺一不可。
+ 
+-### Z.5 已确认仍未解决
+-
+-- **Q8_0 在 aarch64（K920 Cortex-A76，无 SVE / 无 i8mm）全 NaN**：与 GGUF
+-  layout 正交，是 `third_party/llamafile/iqk_mul_mat_arm.inc` `tinyBLAS_Q0_ARM`
+-  内核本身的 bug。Phase 3 之前要么修 ARM Q8_0 内核，要么全模型走 BF16。
++### Z.5 Q8_0 aarch64（K920）NaN — 已修 ✅（2026-05-19）
++
++- **根因**：`iqk_mul_mat_arm82` 与 `tinyBLAS_Q0_ARM` 在 K920（dotprod、无 SVE/i8mm）
++  上对 Q8_0×Q8_0 均产出 NaN；与 GGUF layout 正交（BF16 同 layout cosine≈1）。
++- **修复（两层）**：
++  1. `third_party/llamafile/tinyblas_cpu_sgemm.inc`：无 `__ARM_FEATURE_MATMUL_INT8`
++     时不走 `iqk_mul_mat`。
++  2. `kt-kernel/operators/llamafile/moe.hpp`：`kt_llamafile_sgemm` 在 aarch64 无 SVE
++     上对 Q8_0×Q8_0 回退 `ggml_vec_dot_q8_0_q8_0`（与 llama.cpp 一致）。
++- **验证**：`KT_FORCE_SYNC_SUBMIT=1` + `p27_cpu_moe_reference_check.py` layer 3
++  `dsv4_layer3_q8_0.gguf`，cosine ≥ 0.99。
+ - **MOE_INT8 backend 在 K920 不可编**：KML `prefillgemm` 用 SVE/i8mm 内联
+   汇编（`usdot`, `ptrue`, `ld1b`），K920 不支持。已撤回 KML 修改尝试。
+ 
+@@ -1705,34 +1722,27 @@ python3 -m py_compile python/sglang/srt/models/deepseek_v4.py   # OK
+ **防再次踩坑**：编辑 `third_party/sglang/` 子树后务必跑 `git diff` 看一眼，
+ 最好在 IDE 工作区设置里关掉这棵子树的 format on save / auto-indent。
+ 
+-### Z.12 后续工作（仅记录，本次未动）
+-
+-按优先级：
+-
+-1. **CPU MoE 计算仍走 fp32 累加**（BF16 → fp32 → mul → fp32 → bf16 输出）。
+-   目前精度 OK（cosine 0.999996），但单 token throughput 受限于 fp32 SIMD
+-   宽度。后续可以评估：
+-   - 用 NEON BF16 软实现 `vdot`（K920 无 SVE2、无 BFDOT 指令，需要纯软实现，
+-     收益要 benchmark）；
+-   - 把 `kt-kernel/operators/llamafile/moe.hpp` 里 `m_local_intermediate_fp32_`
+-     等 fp32 中间 buffer 改成 bf16；
+-   - 改完后必须重跑 `tools/p27_cpu_moe_reference_check.py` 抽样验证
+-     cosine ≥ 0.99。
+-2. **CUDA / NPU Graph capture + KT CPU MoE**（任务 2，2026-05 落地）：
+-   - `kt-kernel/cpu_backend/ascend_callback_worker.{h,cpp}`：`aclrtSubscribeReport` +
+-     后台 `aclrtProcessReport` 线程；`cudaLaunchHostFunc` 前自动 subscribe stream。
+-   - `experts_base.py`：NPU 默认走 `submit_with_cuda_stream`（`KT_FORCE_SYNC_SUBMIT=1` 可回退）。
+-   - `kt_ep_wrapper.py`：graph capture 路径 `copy_inputs` + `torch_npu.npu._launch_host_func`
+-     + `run_pinned_forward_sync`；`cuda_graph_runner` 已调用 `KTMoEWrapper.set_capture_batch_sizes`。
+-   - `tools/p27_launch_ds4flash_npu*.sh` 已去掉 `--disable-cuda-graph`。
+-   - **回归**：`ASCEND_RT_VISIBLE_DEVICES=<卡> bash tools/p27_launch_ds4flash_npu_num_expert_0.sh`
+-     后跑 Z.8 四个 curl prompt；无 ERR 107027、输出语义连贯即通过。
+-3. **aarch64 Q8_0 内核仍 NaN**（`tinyBLAS_Q0_ARM`）。若不修，BF16 GGUF 是单卡
+-   场景唯一可用编码，磁盘占用 ~555 GiB。修了可以省 ~50% 容量到 ~280 GiB。
+-4. **`gpu_experts_mask` "前 N 个" 是默认硬编码**。如果将来要做 EPLB / 热点
+-   expert 优先 HBM，需要 KT EP wrapper 支持从 sglang scheduler 接收动态 mask。
+-
+-### Z.13 关键命令汇总（F1 + F2 + F3 复现）
++### Z.12 后续工作计划（2026-05-19）
++
++| 优先级 | 任务 | 状态 | 说明 |
++|--------|------|------|------|
++| P0 | **任务 3：Q8_0 GGUF** | ⏳ 进行中 | 修 `tinyBLAS_Q0_ARM` NaN → 单层 B+ → 43 层 → e2e；磁盘 ~280 GiB |
++| P1 | **Graph 性能** | 待办 | `TASK_QUEUE_ENABLE=0` 对照；多 `cuda_graph_bs`；decode ~3 tok/s 基线再优化 |
++| P1 | **Phase 3 overlap** | 部分完成 | callback 已有（Z.14）；补 CPU/NPU timeline 重叠与 shared-expert 双 stream |
++| P2 | **mxfp4 原生权重** | 待权重 | NPU MoE 换 mxfp4；重算 `kt-num-gpu-experts` / HBM；CPU 仍可保留 Q8_0/BF16 GGUF |
++| P3 | CPU fp32 中间优化 | 低 | K920 无 BFDOT，收益不确定；**低于 Q8_0** |
++| P3 | EPLB 动态 `gpu_experts_mask` | 低 | 当前硬编码「前 N 个 expert 上 NPU」 |
++| — | MOE_INT8 / KML | 不做 | K920 无 SVE/i8mm |
++
++**调试环境变量（保留）**：
++
++| 变量 | 作用 |
++|------|------|
++| `KT_FORCE_SYNC_SUBMIT=1` | 强制 prefill/非 graph 走同步 `submit/sync` |
++| `EXTRA_FLAGS="--disable-cuda-graph"` | 回退无 graph eager |
++| `KT_DEBUG_HYBRID_MOE=1` | N=32 时打印 hybrid 路由 |
++
++### Z.13 关键命令汇总（F1 + F2 + F3 + Graph 复现）
+ 
+ ```bash
+ # F1：全模型 BF16 GGUF（在 repo 根 / 任意目录，~30-60 分钟）
+@@ -1750,8 +1760,55 @@ for i in 1 2 3 4; do ...curl... done   # 见 Z.8 / Z.10
+ 
+ # F3：N=32 hybrid offload server（前台）
+ ASCEND_RT_VISIBLE_DEVICES=2 bash tools/p27_launch_ds4flash_npu.sh
++
++# 任务 2：Graph on（默认，无需 EXTRA_FLAGS）
++# 部署前编译 kt-kernel：
++cd kt-kernel && CPUINFER_USE_ASCEND_NPU=1 python setup.py build_ext --inplace
++cd ..
++ASCEND_RT_VISIBLE_DEVICES=2 bash tools/p27_launch_ds4flash_npu_num_expert_0.sh
++# 期望：Graph capture ~7–11s；日志 Decode npu graph: True；无 ERR 107027
++# 另开终端跑 Z.8 四个 curl prompt
+ ```
+ 
++### Z.14 任务 2：NPU Graph Capture + KT CPU MoE（已完成 ✅）
++
++**目标**：单卡 Ascend NPU + K920 CPU MoE（LLAMAFILE / **BF16 GGUF**），开启 SGLang decode **NPUGraph** 时 CPU expert 仍被触发且输出正确。
++
++**Commits**：主仓 `ktransformers-AK` `29c082e`；子模块 `third_party/sglang` `db577d2e8`（`kt_ep_wrapper.py` graph 路径）。
++
++#### Z.14.1 实现要点
++
++| 组件 | 改动摘要 |
++|------|----------|
++| **kt-kernel** | 新增 `cpu_backend/ascend_callback_worker.{h,cpp}`：`aclrtSubscribeReport` + 独立线程 `aclrtProcessReport`；`ascend_npu.h` 在 `cudaLaunchHostFunc` 前对 stream 自动 subscribe；`ext_bindings.cpp` 暴露 `init_ascend_callback_worker` / `shutdown_ascend_callback_worker` |
++| **experts_base.py** | 关闭 NPU 默认 bypass（`KT_FORCE_SYNC_SUBMIT=1` 可强制回退）；恢复 `submit_with_cuda_stream`；pin buffer 辅助 API；`run_pinned_forward_sync`；修复 7 元组 unpack、deferred submit 遗漏 |
++| **kt_ep_wrapper.py**（sglang 子模块） | **Graph decode**：`copy_inputs` + `torch_npu.npu._launch_host_func` → `run_pinned_forward_sync`；**Prefill**：仍 `submit_forward` / `sync_forward` 异步路径 |
++| **launch 脚本** | 去掉 `--disable-cuda-graph`；`export PYTHONPATH=.../sglang/python:.../kt-kernel/python` |
++
++#### Z.14.2 验证结果（`ASCEND_RT_VISIBLE_DEVICES=2`，graph on）
++
++| 项 | 结果 |
++|----|------|
++| Graph capture | ~7–11 s，bs=1，无 ERR 107027 |
++| N=0 全 CPU offload | F2 四个 curl prompt 通过 |
++| N=32 hybrid | 同上 + `KT_DEBUG_HYBRID_MOE=1` 可查路由 |
++| 日志特征 | `Prefill npu graph: False`，`Decode npu graph: True` |
++| Decode 吞吐（参考） | ~3 tok/s（单并发，未做进一步调参） |
++
++#### Z.14.3 本任务明确未做
++
++- Q8_0 ARM 内核（→ 任务 3）
++- `TASK_QUEUE_ENABLE=0` 与 launch 默认 `=1` 的对照
++- 多档 `--cuda-graph-bs` / 大于 1 的 batch graph
++- 与 8 卡基线 token-level 逐 token 对账
++
++#### Z.14.4 部署检查清单
++
++1. `cd kt-kernel && CPUINFER_USE_ASCEND_NPU=1 python setup.py build_ext --inplace`
++2. `python -c "import kt_kernel_ext; kt_kernel_ext.init_ascend_callback_worker"`（或 import `kt_kernel` 触发 `experts_base` 自动 init）
++3. `CHUNKED_PREFILL_SIZE` 保持 **2048**（勿 -1）
++4. 回退测试：`EXTRA_FLAGS="--disable-cuda-graph"` 或 `KT_FORCE_SYNC_SUBMIT=1`
++
+ ---
+ 
+ **文档结束**。如有疑问，参考 git log（项目 root `/workspace/code/ktransformer/ktransformers-AK/`），或运行 `git diff` 看 Phase 0 实际改动。
+diff --git a/doc/zh/DeepSeek-V4-Flash_NPU_decode_profiling_runbook.md b/doc/zh/DeepSeek-V4-Flash_NPU_decode_profiling_runbook.md
+new file mode 100644
+index 0000000..a8c026b
+--- /dev/null
++++ b/doc/zh/DeepSeek-V4-Flash_NPU_decode_profiling_runbook.md
+@@ -0,0 +1,125 @@
++# DeepSeek-V4-Flash NPU Decode Profiling Runbook
++
++> 容器重启 / 代码恢复后按此文档拉起服务并复现 seq32k profiling。  
++> 原始 msprof 数据：`tools/npu_results_dbg/seq32k_decode32/`、`seq200_decode/`。
++
++---
++
++## 0. 前置
++
++```bash
++export REPO=/workspace/code/ktransformer/ktransformers-AK
++cd "$REPO"
++apt-get update && apt-get install -y libhwloc15   # 新容器一次
++bash tools/p27_e2e_preflight.sh                   # 必须 PASS
++npu-smi info                                      # 选空闲卡
++```
++
++补丁检查（恢复后应 >0）：
++
++```bash
++grep -c SGLANG_NPU_PROFILE_ENABLE third_party/sglang/python/sglang/srt/environ.py
++grep -c "if q.dim() == 4" third_party/sglang/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
++grep -c kt_llamafile_sgemm kt-kernel/operators/llamafile/moe.hpp
++```
++
++---
++
++## 1. 日常推理（Graph，无 profiling）
++
++```bash
++SGLANG_NPU_PROFILE_ENABLE=0 \
++PORT=8001 ASCEND_RT_VISIBLE_DEVICES=7 \
++./tools/p27_launch_ds4flash_npu_num_expert_0.sh
++```
++
++另开终端：
++
++```bash
++PORT=8001 bash tools/p27_curl_f2_prompts.sh
++```
++
++---
++
++## 2. seq32k decode #32 profiling（推荐）
++
++**终端 1 — 起服务**
++
++```bash
++SGLANG_NPU_PROFILE_ENABLE=1 \
++SGLANG_NPU_PROFILE_DECODE_TOKEN=32 \
++SGLANG_NPU_PROFILE_DIR=./tools/npu_results_dbg/seq32k_decode32 \
++SGLANG_NPU_PROFILE_LEVEL=0 \
++SGLANG_NPU_PROFILE_ANALYSE=0 \
++CHUNKED_PREFILL_SIZE=32768 \
++PORT=8001 ASCEND_RT_VISIBLE_DEVICES=2 \
++./tools/p27_launch_ds4flash_npu_longcontext.sh
++```
++
++**终端 2 — 发 workload**
++
++```bash
++PORT=8001 PROMPT_LEN=32768 MAX_NEW=64 bash tools/p27_curl_long_prompt_sweep.sh
++```
++
++约束：
++
++- `MAX_NEW >= SGLANG_NPU_PROFILE_DECODE_TOKEN`（否则 profile 不触发）
++- `CHUNKED_PREFILL_SIZE=32768` 使 32k prefill 单 chunk（避免 compressor 跨 chunk bug）
++- profiling 会强制 eager（`SGLANG_NPU_PROFILE_DISABLE_GRAPH=1`），输出可能退化，仅用于 trace
++
++**离线解析**（不要在进程内 `ANALYSE=1`）：
++
++```bash
++PYBIN=/usr/local/python3.11.14/bin/python3.11
++"$PYBIN" - <<'PY'
++from torch_npu.profiler.profiler import analyse
++analyse("tools/npu_results_dbg/seq32k_decode32/<host>_<pid>_..._ascend_pt")
++PY
++```
++
++产物：`ASCEND_PROFILER_OUTPUT/{kernel_details.csv,operator_details.csv,trace_view.json}`。
++
++---
++
++## 3. token200 profiling（短 prompt）
++
++```bash
++SGLANG_NPU_PROFILE_ENABLE=1 \
++SGLANG_NPU_PROFILE_DECODE_TOKEN=200 \
++SGLANG_NPU_PROFILE_DIR=./tools/npu_results_dbg/seq200_decode \
++PORT=8001 ASCEND_RT_VISIBLE_DEVICES=7 \
++./tools/p27_launch_ds4flash_npu_num_expert_0.sh
++```
++
++终端 2：用 `tools/p27_long_context_decode_test.sh` 或多次 decode 攒 KV 到 200（见 Handoff）。
++
++---
++
++## 4. 关键结论（seq32k decode #32）
++
++| 指标 | 值 |
++|------|-----|
++| Stage 墙钟 | ~318 ms |
++| NPU Computing | ~28.5 ms (8.9%) |
++| SparseAttnSharedkv | ~1.36 ms（43 层，几乎不随 32k KV 增长） |
++| MatMul/GEMM (NPU busy) | ~12.5 ms（**不含** CPU MoE group matmul） |
++| MoE routed experts | CPU KT GGUF（`--kt-num-gpu-experts 0`） |
++
++Graph + msprof 生产路径：`tools/p27_msprof_graph_baseline_exec.sh`。
++
++---
++
++## 5. 常见故障
++
++| 现象 | 处理 |
++|------|------|
++| `Argument list too long` | 用 `p27_curl_long_prompt_sweep.sh`（JSON 写文件） |
++| `loc.numel()=1024 vs cache.shape[0]=513` | 加大 `CHUNKED_PREFILL_SIZE` 到 32768 |
++| `head num(0)` / SparseAttn tiling failed | 确认 `ascend_backend.py` squeeze 补丁 |
++| `[KT] kt_kernel not available` | `bash tools/p27_e2e_preflight.sh`；launch 须 source `p27_ensure_kt_kernel.sh` |
++| profiler 后服务挂 / SIGBUS | 保持 `SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER=1` |
++
++---
++
++*2026-05-29 恢复版；完整分析报告需从 msprof 数据重新生成。*
+diff --git "a/doc/zh/DeepSeek-V4-Flash_\345\237\272\347\272\277\345\257\271\351\275\220\344\277\256\346\224\271\346\270\205\345\215\225.md" "b/doc/zh/DeepSeek-V4-Flash_\345\237\272\347\272\277\345\257\271\351\275\220\344\277\256\346\224\271\346\270\205\345\215\225.md"
+deleted file mode 100644
+index 2871d1b..0000000
+--- "a/doc/zh/DeepSeek-V4-Flash_\345\237\272\347\272\277\345\257\271\351\275\220\344\277\256\346\224\271\346\270\205\345\215\225.md"
++++ /dev/null
+@@ -1,313 +0,0 @@
+-# DeepSeek-V4-Flash 单卡 NPU + KT 基线对齐修改清单
+-
+-> 状态：草案 v1（计划用，未实施）
+-> 日期：2026-05-13
+-> 范围：让本仓库 `third_party/sglang` 单卡 NPU + KT(LLAMAFILE) 路径稳定起服务，并为 MoE CPU offload 后续工作打好底盘。本文档不直接动代码，仅作改动落地的指南。
+-
+----
+-
+-## 0. 背景与基线选择
+-
+-本仓库内有两份 sglang，路径与来源完全不同：
+-
+-| | 基线 `/sgl-workspace/sglang` | 当前 fork `third_party/sglang` |
+-|---|---|---|
+-| 远端 | `https://github.com/iforgetmyname/sglang`（sgl-project 的 NPU dsv4_release 分支） | `https://github.com/kvcache-ai/sglang`（ktransformers 团队 fork） |
+-| 当前分支 / HEAD | `dsv4_release` / `298193eb3` (`fix load weight; add vars`) | 工作目录在 `6db949a56` (`feat(kt): per-layer kt_weight_path template ...`) 之上有未提交改动 |
+-| 8 卡脚本 | `tools/test_code/sglang_script/launch_ds4flash_sglang.sh`（已验证跑通） | `tools/p27_launch_ds4flash_npu.sh`（单卡，KT，目前卡在 load_weights） |
+-
+-> 决定：**以基线为参考，做定向同步**；不要整体替换，避免丢失 P2.x 已沉淀的 KT/NPU 改动。
+-
+----
+-
+-## 1. 当前能直接定位到的「启动卡点」与基线对照
+-
+-| 报错 | fork 现状 | 基线做法 | 结论 |
+-|---|---|---|---|
+-| `DeepSeekV4Config.__init__() got an unexpected keyword argument 'n_activated_experts'` 等 | `configs/deepseek_v4.py` 自定义 dataclass，字段集合不齐 | **不存在 `configs/deepseek_v4.py`**，统一通过 `_load_deepseek_v4_model` 把 `model_type` 改写成 `deepseek_v3`，让 transformers 自带 `DeepseekV3Config` 解析 | fork 思路偏离主线，应同步基线 |
+-| `KeyError: 'model.layers.32.mlp.shared_experts.gate_up_proj.weight_scale'` | `remap_weight_name_to_dpsk_hf_format` 把 mlp 路径强行 `.scale → .weight_scale_inv` | 内联式 `name = name.replace(".scale", ".weight_scale")`，**保持 `weight_scale`，不强转 `_inv`** | 同步基线 |
+-| `tilelang` import 失败 → `DeepseekV4ForCausalLM` 未注册 | 顶层引用 `layers/deepseek_v4_rope.py` 里 tilelang | **没有 `deepseek_v4_rope.py`**，rope 走 `layers/rotary_embedding/factory.py` + `IS_DEEPSEEK_V4=1` | 同步基线 |
+-| `--quantization fp8 / w8a8_int8` 与磁盘 `compressed-tensors / int-quantized` 矛盾 | 默认 `QUANTIZATION=fp8`，外加 `SGLANG_APPLY_CONFIG_BACKUP=auto` 注入 backup | `--quantization compressed-tensors --disable-shared-experts-fusion`，**不用 backup** | 同步基线 |
+-
+----
+-
+-## 2. 两份 sglang 关键差异（结构性）
+-
+-| 维度 | 基线 | fork |
+-|---|---|---|
+-| `configs/deepseek_v4.py` | **不存在** | 自定义 dataclass `DeepSeekV4Config` |
+-| `models/deepseek_v4.py` | 3803 行，`load_weights` 内联约 200 行 | 2143 行，抽出 `remap_weight_name_to_dpsk_hf_format`，多 `SGLANG_DSV4_MODE / 2604 / FP4_EXPERTS / _FP8_WO_A_GEMM` 分支 |
+-| `layers/deepseek_v4_rope.py` | **不存在** | 存在，含 `tilelang` 引用问题 |
+-| `layers/moe/kt_ep_wrapper.py` | **393 行薄壳**，封装现有 GPU MoE 方法 + `kt_kernel.KTMoEWrapper` | **2940 行**，自带 cpu_buffers / shm / 多 dtype / NPU stream 适配 |
+-| Config backup 机制 | **无**（无 `SGLANG_APPLY_CONFIG_BACKUP`） | 有 `_load_deepseek_temp_model` + `config_backup_{small,large}.json` |
+-| `IS_DEEPSEEK_V4=1` 钩子 | `mem_cache/common.py` / `mem_cache/memory_pool.py` / `disaggregation/decode.py` / `layers/rotary_embedding/factory.py` 多处 dsv4 专用分支 | **完全没有引用** |
+-| `SGLANG_DSV4_MODE / 2604 / FP4_EXPERTS` | 无 | 多处分支，默认值 `SGLANG_DSV4_MODE="2604"` / `SGLANG_DSV4_2604_SUBMODE="2604B"` / `SGLANG_DSV4_FP4_EXPERTS=True` |
+-| `--kt-*` 参数 | 已存在于 `server_args.py` | 已存在 |
+-| 启动量化 | `--quantization compressed-tensors` | 之前默认 `fp8`，调整中 |
+-| 融合 kernel env | `USE_FUSED_HC_PRE/POST_ASCENDC=1`、`USE_PA_DECODE=1`、`USE_PA_PREFILL=1`、`USE_FUSED_COMPRESSOR=1`、`LI_KV_DTYPE_INT8=1`、`USE_NPU_MOE_GATING_TOP_K=1`、`USE_FUSED_TRANSPOSE_BATCHMATMUL=1`、`USE_ROPE_PARTIAL_IN_PLACE_ASCENDC=1` 等一大批 | 未在 launch 脚本中 export |
+-
+----
+-
+-## 3. 优先级定义
+-
+-- **A 必改**：当前 fork 不改起不来，或改了能让单卡 W8A8 直接跑通。
+-- **B 建议同步基线**：基线写法更干净、与官方 W8A8 checkpoint 对齐，做 KT MoE CPU offload 也更顺。
+-- **C 保留 fork**：P2.x 已沉淀且与"启 W8A8 + KT"直接相关的改动，不要回退。
+-- **D 暂不动**：fork 内实验路径，触动成本高，先做隔离 / 默认禁用。
+-
+----
+-
+-## 4. 修改清单详项
+-
+-### 4.1 Config 解析
+-
+-#### 4.1.1 `third_party/sglang/python/sglang/srt/configs/deepseek_v4.py`（A）
+-- **现状**：自定义 dataclass `DeepSeekV4Config`，屡踩 `n_activated_experts` / `head_dim` / `sliding_window_size` / `model_type` 等字段。
+-- **基线做法**：根本没有这个文件。
+-- **建议改法**：
+-  - 方案 A1（推荐）：**整文件删除或缩为空壳**，把 `_CONFIG_REGISTRY` 中 `DeepSeekV4Config` 摘掉（见 4.1.2）。
+-  - 方案 A2（保留兼容）：保留为普通 `PretrainedConfig` 子类 + `__init__(self, **kwargs)`，只做别名规范化（`n_activated_experts→num_experts_per_tok`、`head_dim→v_head_dim`、`sliding_window_size→window_size`），其余靠 `super().__init__(**kwargs)` 兜底。
+-- **推荐**：A1。
+-
+-#### 4.1.2 `third_party/sglang/python/sglang/srt/utils/hf_transformers_utils.py`（A）
+-- **现状**：
+-  - 顶部 `from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config` 与 `_CONFIG_REGISTRY` 注册
+-  - `_load_deepseek_temp_model(...)` 走 packaged backup config
+-  - `get_config()` 内 `elif envs.SGLANG_APPLY_CONFIG_BACKUP.get() != "none":` 强行走 backup
+-- **基线做法**：`get_config()` 主路径直接 `AutoConfig.from_pretrained(...)`，捕获 `ValueError("deepseek_v4")` 后跑 `_load_deepseek_v4_model`，里面把 `config.json` 拷贝一份并 `model_type="deepseek_v3"` 再交给 `AutoConfig`。
+-- **建议改法**：
+-  1. 删除 fork 中 `DeepSeekV4Config` import 与 `_CONFIG_REGISTRY` 注册。
+-  2. 引入 `_load_deepseek_v4_model(model_path, ...)`：拷贝 `config.json` 到 tmp，置 `architectures=["DeepseekV4ForCausalLM"]` + `model_type="deepseek_v3"`，再 `AutoConfig.from_pretrained`。
+-  3. `get_config()` 调整：先 `AutoConfig.from_pretrained(...)`；`except ValueError as e:` 若 `"deepseek_v4" in str(e)` 则回退 `_load_deepseek_v4_model`；删除/不再使用 backup 分支。
+-  4. 保留 `_load_deepseek_v32_model`、mistral_large_3 等不变。
+-- **依赖**：`models/deepseek_v4.py` 必须把 `config.xxx` 读取改成 `getattr(config, "xxx", default)`，参 4.2。
+-
+-#### 4.1.3 `SGLANG_APPLY_CONFIG_BACKUP` 整套（A→B）
+-- **涉及**：`environ.py:168`、`utils/hf_transformers_utils.py` backup 分支、`configs/config_backup_{small,large}.json`、`configs/model_config.py` 中相关读取。
+-- **建议改法**：
+-  - `environ.py` 中默认值由 `"auto"` 改为 `"none"`。
+-  - `hf_transformers_utils.get_config` 中 backup 分支注释/删除。
+-  - `configs/model_config.py::_maybe_auto_set_dsv4_fp4_experts` 中"按磁盘 `quantization_config` 自动关 `SGLANG_DSV4_FP4_EXPERTS`"逻辑保留（对 W8A8 仍有用），仅清理对 backup 的依赖。
+-  - `config_backup_*.json` 不立即删除，先归档到 `archive/`，便于回滚。
+-
+----
+-
+-### 4.2 模型文件 `models/deepseek_v4.py`
+-
+-#### 4.2.1 入口与配置类型（A）
+-- 与 4.1 同步：把类型注解 `config: DeepSeekV4Config` 改为 `config: PretrainedConfig`（或 transformers 内置 DSv3Config）。
+-- 全文件扫一遍 `config.xxx`：对 `index_head_dim / index_n_heads / index_topk / o_lora_rank / o_groups / compress_ratios / hc_mult / hc_sinkhorn_iters / hc_eps / n_hash_layers / num_nextn_predict_layers / swiglu_limit / window_size` 等字段，改成 `getattr(config, "...", default)`，避免在 DSv3Config 上断言存在。
+-
+-#### 4.2.2 `load_weights` & `remap_weight_name_to_dpsk_hf_format`（A）
+-- **现状**：抽出函数对 mlp 路径 `.scale → .weight_scale_inv`，多 `SGLANG_DSV4_MODE` / `MOE_BIT_WISE_EQUAL_MODE` / `ATTN_BIT_WISE_EQUAL_MODE` / `COMPRESSOR_PART` 分支。
+-- **基线做法**（内联简化版，要点）：
+-  - `name = "model." + name`
+-  - `name.replace("ffn", "mlp")`、`"gate.bias" → "gate.e_score_correction_bias"`
+-  - `if ".scale" in name: name = name.replace(".scale", ".weight_scale")`（**保留 `weight_scale`**）
+-  - experts: `w1/w2/w3 → gate_proj/down_proj/up_proj`
+-  - `.attn. → .self_attn.`、`.attn_norm. → .input_layernorm.`、`.mlp_norm. → .post_attention_layernorm.`
+-  - `embed.weight → embed_tokens.weight`、`model.head. → lm_head.`
+-  - 之后用 `stacked_params_mapping` + `expert_params_mapping` + `cached_a_proj/cached_eh_proj` 等分类处理
+-- **建议改法**：用基线 `load_weights` 整段替换 fork 现有实现；删除 `remap_weight_name_to_dpsk_hf_format`、`MOE_BIT_WISE_EQUAL_MODE / ATTN_BIT_WISE_EQUAL_MODE / COMPRESSOR_PART` 等私有分支。保留 KT MoE 接入位点（即 `self.mlp = deepseek_v2.DeepseekV2MoE(...)` 那一段）。
+-- **依赖**：`params_dict` 中实际注册的是 `weight_scale`（compressed-tensors int8 W8A8）；KT 接入位点不依赖 `weight_scale_inv` 命名。
+-
+-#### 4.2.3 `SGLANG_DSV4_MODE` / `_FP8_WO_A_GEMM` / `_dequant_fp8_wo_a`（D）
+-- 默认环境下走 2601 / 简化路径；**不删代码**，但分支用环境量短路（默认 False/disabled）。
+-- 后续若不再做 2604 / FP4 实验，再整体清理。
+-
+-#### 4.2.4 attn_sink / hc_attn / hc_ffn / 融合 kernel hooks（A）
+-- 不替换实现，但在 launch 脚本中 export 基线那批 `USE_FUSED_*_ASCENDC=1` / `USE_PA_*=1` 等 env（见 4.6）。
+-
+-#### 4.2.5 RoPE 子模块（A）
+-- 现状：`from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton`、`precompute_freqs_cis`。
+-- 改法：
+-  - 删除 `third_party/sglang/python/sglang/srt/layers/deepseek_v4_rope.py`。
+-  - `models/deepseek_v4.py` 改用 `layers/rotary_embedding/factory.py` 的 `get_rope(...)`；具体 API 与调用方式以基线 `models/deepseek_v4.py` 内的写法为准（基线该文件 import 行与 MQA 构造均使用 factory）。
+-  - launch 脚本 export `IS_DEEPSEEK_V4=1`，配合 factory 内 `is_dsv4` 分支。
+-- 依赖：4.5 节 `IS_DEEPSEEK_V4` 钩子 patch。
+-
+----
+-
+-### 4.3 模型文件 `models/deepseek_v2.py`（B，短期不动）
+-- fork 3376 行 / 基线 2397 行；差异较多。
+-- 短期建议：**保留 fork 现版本**；4.2 改完后跑通单卡，再回头逐段比对，挑出"KT/NPU 必要" diff 单独合并。
+-
+----
+-
+-### 4.4 `layers/deepseek_v4_rope.py`（A，删除）
+-- 仅被 `models/deepseek_v4.py` 两处 import。删除后必须同步改 4.2.5。
+-
+----
+-
+-### 4.5 `IS_DEEPSEEK_V4=1` 钩子代码（B）
+-基线在以下 4 个文件里有 dsv4 专用分支，fork 同名文件目前**全部没有**这些分支：
+-
+-| 文件 | 基线增量内容 | 优先级 |
+-|---|---|---|
+-| `mem_cache/common.py` | dsv4 sliding-window + c4/c128 sparse kv 的 `alloc_paged_token_slots_extend` 分支（`LastLoc`） | A |
+-| `mem_cache/memory_pool.py` | `req_to_token_swa / req_to_token_c4 / req_to_token_c128 / req_to_token_c4_state / req_to_token_c128_state` 池及 `get_all_locs_by_req / get_all_locs_by_kv_lens` 的 dsv4 分支 | A |
+-| `disaggregation/decode.py` | dsv4 in disaggregation | C（单卡用不到） |
+-| `layers/rotary_embedding/factory.py` | `is_dsv4 = get_bool_env_var("IS_DEEPSEEK_V4")` 分支 | A（配合 4.2.5） |
+-
+-- 改法：把基线相应分支 patch 到 fork 同名文件；非 dsv4 路径行为不变（基线写法都包在 `if get_bool_env_var("IS_DEEPSEEK_V4"):` 之内）。
+-- `environ.py` 可选追加 `IS_DEEPSEEK_V4 = EnvBool(False)`，或继续用 `get_bool_env_var` 风格。
+-
+----
+-
+-### 4.6 启动脚本 `tools/p27_launch_ds4flash_npu.sh`（A）
+-
+-参照基线 `launch_ds4flash_sglang.sh` 做以下对齐：
+-
+-| 调整 | 基线 / 推荐值（单卡同义） | fork 现状 | 优先级 |
+-|---|---|---|---|
+-| `--quantization` | `compressed-tensors` | 在 `fp8 / w8a8_int8` 之间切 | A |
+-| `--disable-shared-experts-fusion` | 带 | 未带 | A |
+-| `SGLANG_APPLY_CONFIG_BACKUP` | 不存在 | 默认 `auto`，脚本里 `export none` | A |
+-| `IS_DEEPSEEK_V4=1` | 带 | 未带（但 fork 当前未接入相应代码，参 4.5） | A |
+-| ASCEND 融合 kernel env | `USE_FUSED_COMPRESSOR=1` / `LI_KV_DTYPE_INT8=1` / `USE_PA_DECODE=1` / `USE_PA_PREFILL=1` / `USE_FUSED_HC_POST_ASCENDC=1` / `USE_FUSED_HC_PRE_ASCENDC=1` / `USE_NPU_MOE_GATING_TOP_K=1` / `USE_FUSED_TRANSPOSE_BATCHMATMUL=1` / `USE_ROPE_PARTIAL_IN_PLACE_ASCENDC=1` / `ASCEND_USE_FIA=1` 等 | 未 export | A（影响精度/性能，但不影响启动） |
+-| `STREAMS_PER_DEVICE=32` / `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` / `TASK_QUEUE_ENABLE=1` / `SGLANG_SET_CPU_AFFINITY=1` | 带 | 未带 | A |
+-| `--page-size 128` | 显式 | 隐式（NPU 默认即 128） | C |
+-| `--chunked-prefill-size` | `-1`（关闭 chunked prefill） | `4096` | B |
+-| `--mem-fraction-static 0.75` | 带 | 未带 | A |
+-| `--watchdog-timeout 18000` | 带 | 未带 | C |
+-| `--dtype bfloat16` | 带 | 未带 | A |
+-| `--trust-remote-code` | 带 | 未带 | A |
+-| MTP / DeepEP / DP-attention / DP-LM head | 8 卡带；单卡不需要 | 单卡禁用 | C |
+-| KT 参数：`--kt-method LLAMAFILE --kt-num-gpu-experts 16 --kt-weight-path ... --kt-threadpool-count 8 --kt-cpuinfer 24` | 基线 `server_args.py` 已支持 | 脚本已带 | C |
+-
+----
+-
+-### 4.7 KT MoE 入口 `layers/moe/kt_ep_wrapper.py`（B，最关键）
+-
+-- **现状**：fork 2940 行；基线 393 行。两边已是不同实现。
+-- **基线极简版要点**：
+-  - `KTConfig` dataclass：`layer_idx / num_gpu_experts / cpuinfer_threads / threadpool_count / weight_path / chunked_prefill_size / method / num_layers / max_deferred_experts_per_token`。
+-  - `KTEPWrapperMethod(FusedMoEMethodBase)`：包一层 GPU 量化方法，CPU 侧由 `kt_kernel.KTMoEWrapper` 黑盒处理。
+-  - `create_weights` 中只为 GPU 端创建 `num_gpu_experts` 份权重；CPU 端 `KTMoEWrapper.load_weights(physical_to_logical_map_cpu)`。
+-  - `submit/sync` 用 `torch.cuda.current_stream(x.device).cuda_stream`（torch_npu 兼容）；
+-  - 没有 cpu_buffers / shm / 多 dtype / 多 stream 队列。
+-- **建议改法（两步）**：
+-  1. 用基线 393 行整段替换 fork 当前 `kt_ep_wrapper.py`，作为"干净基底"。
+-  2. 把 fork 中真正解决 NPU 适配的 patch 抽出，重新打到该基底上：
+-     - 设备无关 Stream/Event 抽象（NPU 上 `cuda_stream` → `kt_current_stream_handle`）。
+-     - alt_streams / 多 stream 入口（与 `models/deepseek_v4.py` 内 alt_streams 一致）。
+-     - `resolve_kt_weight_path_for_layer`：`{}` / `{layer_idx}` per-layer 模板解析。
+-     - `--kt-max-deferred-experts-per-token` 最后一层置 0 的逻辑（基线已带）。
+-- **CPU offload 设计提示**：MoE CPU offload 的核心数据流在 `kt_kernel`（外部 wheel）C++ 侧；`kt_ep_wrapper.py` 仅负责"传地址/topk + 同步"。fork 现版 cpu_buffers/shm 那一套大概率是早期 Python 侧自管 CPU mirror 的实验产物，对 NPU 单卡不必要。
+-- **回滚保险**：合并前在 `third_party/sglang` 创建分支 `dsv4_release-sync` 与备份分支 `kvcache-ai-archive`。
+-
+----
+-
+-### 4.8 `configs/model_config.py`（C/D）
+-- `_quantization_config_as_dict / _hf_layout_looks_like_int_compressed_tensors / _maybe_auto_set_dsv4_fp4_experts` 等 fork 增量功能保留。
+-- 清理函数体内对 backup config 的依赖（与 4.1.3 同步）。
+-
+----
+-
+-### 4.9 P2.x 已沉淀且保留的项（C）
+-
+-| 文件 | 内容 | 处理 |
+-|---|---|---|
+-| `tools/p27_launch_ds4flash_npu.sh` | `KT_GGUF_TEMPLATE` 单引号、`NPU_DEVICE_ID` / `ASCEND_RT_VISIBLE_DEVICES` / PYTHONPATH 等 | 保留，按 4.6 调整 quant / env |
+-| `tools/p27_curl_generate.sh` | curl 冒烟 | 保留 |
+-| `tools/phase12_llamafile_moe_smoke.py` | 多 GGUF / per-layer 模板 | 保留 |
+-| `third_party/sglang/.../layers/moe/kt_ep_wrapper.py` 内 NPU stream/event 抽象、`stream_handle` 字段 | 现 2940 行中的部分 | 提炼后 patch 到基线 393 行版（见 4.7） |
+-| `third_party/sglang/.../layers/moe/kt_ep_wrapper.py` 中 `resolve_kt_weight_path_for_layer` 模板解析 | per-layer 模板 | 保留并 patch 进基线版 |
+-| `doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md` / `doc/zh/Phase0_Phase1_变更记录与复现手册.md` | handoff / Phase 文档 | 保留，建议在二者中追加"对基线的取舍"小节 |
+-
+----
+-
+-## 5. 风险与开关
+-
+-- **DSv3 vs DSv4 字段兼容**：基线 `_load_deepseek_v4_model` 把 `model_type` 改成 `deepseek_v3`，`DeepseekV3Config` 不带 `index_head_dim / index_n_heads / index_topk / o_lora_rank / o_groups / compress_ratios / hc_mult / hc_sinkhorn_iters / hc_eps / n_hash_layers / num_nextn_predict_layers / swiglu_limit` 等，但 transformers `PretrainedConfig` 会把任意 kwargs `setattr` 进去——前提是模型代码以 `getattr(config, "xxx", default)` 风格读取。**需要扫一遍 `models/deepseek_v4.py` 所有 `config.xxx` 引用**。
+-- **`transformers==5.3.0`**：基线脚本未 pin 版本即可跑通；fork 之前的报错（`model_type / n_activated_experts`）本质是 dataclass 与 HF 父类构造方式不兼容，对齐基线"伪装 v3"思路后，5.x 也能直接走。
+-- **`kt_kernel` 版本**：基线 `kt_ep_wrapper.py` 直接 `from kt_kernel import KTMoEWrapper, generate_gpu_experts_masks`；fork 当前也是。需要确认 wheel 一致。
+-- **`SGLANG_DSV4_MODE / FP4_EXPERTS / _FP8_WO_A_GEMM` 实验路径**：先视为黑盒，在默认环境下短路；不立即删除代码。
+-- **分支保险**：建议合入前在 `third_party/sglang` 拉 `dsv4_release-sync` 分支，原 fork 分支留作回退。
+-
+----
+-
+-## 6. 落地节奏
+-
+-### 第 1 批：启动卡死根因（按本清单的 A）
+-1. 删 `configs/deepseek_v4.py`（或缩成空壳），同步 `_CONFIG_REGISTRY`。
+-2. `utils/hf_transformers_utils.py`：加 `_load_deepseek_v4_model`，捕获 `ValueError("deepseek_v4")` 回退；摘掉 `DeepSeekV4Config` 注册；砍/降级 `SGLANG_APPLY_CONFIG_BACKUP` 主分支。
+-3. `models/deepseek_v4.py`：把 `load_weights` & `remap_*` 替成基线的"内联"版；保留 attn_sink / hc_attn / KT MoE 接入点；把 `config.xxx` 改 `getattr`。
+-4. 删 `layers/deepseek_v4_rope.py`，模型改走 `rotary_embedding/factory.py`。
+-5. `tools/p27_launch_ds4flash_npu.sh`：quant 改 `compressed-tensors`；export `IS_DEEPSEEK_V4=1` + 基线那批 ASCEND 融合 kernel env；加 `--disable-shared-experts-fusion --dtype bfloat16 --trust-remote-code --mem-fraction-static 0.75`。
+-
+-### 第 2 批：KV / RoPE 行为对齐（B+A）
+-1. 把基线 `mem_cache/common.py`、`mem_cache/memory_pool.py`、`layers/rotary_embedding/factory.py` 的 `IS_DEEPSEEK_V4` 分支 patch 到 fork 同名文件。
+-2. 视情况加 `IS_DEEPSEEK_V4 = EnvBool(False)`（可选）。
+-
+-### 第 3 批：KT MoE CPU offload 重构（B 核心）
+-1. 用基线 `kt_ep_wrapper.py` 393 行替换 fork 版本。
+-2. 把 fork 里 NPU stream/event 抽象、per-layer 模板解析等 patch 上去。
+-3. 评估是否仍需要 fork 的 `cpu_buffers/shm`——大概率不需要，能省 1000+ 行。
+-
+-### 第 4 批：实验路径下线（D）
+-1. `SGLANG_DSV4_MODE / FP4_EXPERTS / _FP8_WO_A_GEMM` 默认值置否；模型代码中相关分支用 `if False:` 整体短路。
+-2. `config_backup_*.json` 归档至 `archive/`。
+-
+-### 第 5 批：文档与 smoke
+-1. 更新 `Phase0_Phase1_变更记录与复现手册.md` / `DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md`。
+-2. 跑 `p27_launch_ds4flash_npu.sh` + `p27_curl_generate.sh` 端到端冒烟。
+-
+----
+-
+-## 7. 备查：基线 launch 脚本关键点
+-
+-```bash
+-# /workspace/code/test_code/sglang_script/launch_ds4flash_sglang.sh 节选
+-export TASK_QUEUE_ENABLE=1
+-export STREAMS_PER_DEVICE=32
+-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+-export PYTHONPATH=${PWD}/python:$PYTHONPATH
+-
+-# Fused Kernels
+-export USE_FUSED_COMPRESSOR=1
+-export LI_KV_DTYPE_INT8=1
+-export USE_PA_DECODE=1
+-export USE_PA_PREFILL=1
+-export USE_FUSED_HC_POST_ASCENDC=1
+-export USE_FUSED_HC_PRE_ASCENDC=1
+-export USE_NPU_MOE_GATING_TOP_K=1
+-export USE_FUSED_TRANSPOSE_BATCHMATMUL=1
+-export USE_ROPE_PARTIAL_IN_PLACE_ASCENDC=1
+-export ASCEND_USE_FIA=1
+-export IS_DEEPSEEK_V4=1
+-
+-QUANT_MODE=compressed-tensors
+-python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
+-    --page-size 128 --tp-size 8 --trust-remote-code \
+-    --attention-backend ascend --device npu \
+-    --watchdog-timeout 18000 --host 0.0.0.0 --port 30000 \
+-    --mem-fraction-static 0.75 --cuda-graph-bs 1 \
+-    --disable-radix-cache --chunked-prefill-size -1 \
+-    --max-prefill-tokens 65535 --context-length 65536 \
+-    --max-running-requests 8 --dtype bfloat16 \
+-    --dp-size 8 --enable-dp-attention --enable-dp-lm-head \
+-    --quantization ${QUANT_MODE} --disable-shared-experts-fusion \
+-    --skip-server-warmup \
+-    --moe-a2a-backend deepep --deepep-mode auto \
+-    --speculative-algorithm NEXTN --speculative-num-steps 2 \
+-    --speculative-eagle-topk 1 --speculative-num-draft-tokens 3
+-```
+-
+-> 单卡 P2.7 等价的最小子集（仅作示意，不在本文档执行）：
+-> - 删 `--tp-size 8 --dp-size 8 --enable-dp-attention --enable-dp-lm-head`
+-> - 删 `--moe-a2a-backend deepep --deepep-mode auto`
+-> - 删 `--speculative-algorithm NEXTN ...`
+-> - `--max-running-requests` 改为 1
+-> - 加 `--kt-method LLAMAFILE --kt-num-gpu-experts 16 --kt-weight-path ${KT_GGUF_TEMPLATE} --kt-threadpool-count 8 --kt-cpuinfer 24`
+-
+----
+-
+-## 8. 相关文档
+-
+-- `doc/zh/DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md`
+-- `doc/zh/Phase0_Phase1_变更记录与复现手册.md`
+-- `doc/zh/DeepSeek-V4-Flash-K920-Single-NPU-Spec.md`
+-- 基线脚本：`/workspace/code/test_code/sglang_script/launch_ds4flash_sglang.sh`
+-- 基线 sglang：`/sgl-workspace/sglang`（`dsv4_release` @ `298193eb3`）
+-- 当前 fork sglang：`third_party/sglang`（`kvcache-ai/sglang` @ `6db949a56` + 未提交改动）
+diff --git "a/doc/zh/P27_\345\256\271\345\231\250\351\207\215\345\220\257\345\220\216\345\244\215\347\216\260\346\211\213\345\206\214.md" "b/doc/zh/P27_\345\256\271\345\231\250\351\207\215\345\220\257\345\220\216\345\244\215\347\216\260\346\211\213\345\206\214.md"
+new file mode 100755
+index 0000000..9f3c50a
+--- /dev/null
++++ "b/doc/zh/P27_\345\256\271\345\231\250\351\207\215\345\220\257\345\220\216\345\244\215\347\216\260\346\211\213\345\206\214.md"
+@@ -0,0 +1,252 @@
++# P2.7 容器重启后复现手册
++
++> **适用**：DeepSeek-V4-Flash 单卡 NPU + KT（`num_expert_0` / graph decode）  
++> **仓库**：`/workspace/code/ktransformer/ktransformers-AK`  
++> **关联**：[Phase0_Phase1_变更记录与复现手册](./Phase0_Phase1_变更记录与复现手册.md) §0 / §2.4 / §11 | [Handoff](./DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md) 附录 Z.8 / Z.14
++
++---
++
++## 1. 重启后什么还在、什么会丢
++
++| 项 | 容器重启后 | 说明 |
++|----|------------|------|
++| 代码仓库 `/workspace/code/...` | ✅ 一般在 | 持久卷上的 checkout |
++| 模型 W8A8 `/workspace/models/DeepSeek-V4-Flash-W8A8` | ✅ 一般在 | 同上 |
++| GGUF ` /workspace/models/cache/dsv4_layer{0..42}.gguf` | ✅ 一般在 | 同上 |
++| `kt-kernel/python/kt_kernel_ext*.so` | ✅ 一般在 | 已编好的扩展，**不必每次重编** |
++| `pip install -e kt-kernel` 注册 | ❌ 会丢 | editable 装在容器内 site-packages |
++| 系统包 `libhwloc15` 等 | ❌ 可能丢 | 新容器需重装 |
++| CANN / torch_npu | ✅ 一般在 | 镜像内自带；launch 脚本会 `source set_env.sh` |
++
++**典型踩坑**：只加了 `PYTHONPATH=kt-kernel/python`，没有 `import kt_kernel` → 日志出现 `[KT] kt_kernel not available` → MoE 全走 NPU → **NPU OOM**。
++
++---
++
++## 2. 快速 checklist（推荐顺序）
++
++```bash
++export REPO=/workspace/code/ktransformer/ktransformers-AK
++export PYBIN=/usr/local/python3.11.14/bin/python3.11
++cd "$REPO"
++```
++
++### ① 系统依赖（每个新容器一次）
++
++```bash
++apt-get update && apt-get install -y libhwloc15
++```
++
++- **运行时**只需 `libhwloc15`（加载已有 `.so`）。
++- **仅当要重新编译** `kt-kernel` 时才需要：`apt-get install -y libhwloc-dev pkg-config`。
++
++### ② 预检（必须通过）
++
++```bash
++bash tools/p27_e2e_preflight.sh
++```
++
++期望输出末尾：
++
++```text
++[preflight] OK: all 43 GGUF files present ...
++[preflight] kt_kernel_ext:
++   .../kt-kernel/kt_kernel/kt_kernel_ext.cpython-311-aarch64-linux-gnu.so
++[preflight] OK: kt_kernel_ext 在仓库 kt-kernel 包内
++[preflight] PASS
++```
++
++### ③ 选手写 NPU 卡
++
++```bash
++npu-smi info
++# 选 HBM 占用低的物理卡，例如 7：
++export ASCEND_RT_VISIBLE_DEVICES=7
++```
++
++### ④ Graph 模式启动（验证准确性 / 日常推理）
++
++```bash
++SGLANG_NPU_PROFILE_ENABLE=0 \
++PORT=8001 \
++ASCEND_RT_VISIBLE_DEVICES=7 \
++./tools/p27_launch_ds4flash_npu_num_expert_0.sh
++```
++
++日志中应出现 **`Decode npu graph: True`**，且 **不应** 出现 `[KT] kt_kernel not available`。
++
++### ⑤ F2 冒烟
++
++```bash
++PORT=8001 bash tools/p27_curl_f2_prompts.sh
++```
++
++判据：无 `! ! !` / `( ) 1) 2) 3)...` 式退化；中英文能续写合理内容（base 模型不考核指令遵循）。详见 Handoff **Z.8**。
++
++---
++
++## 3. `kt_kernel` 无需 pip 的加载方式
++
++launch / preflight 脚本已内置 `tools/p27_ensure_kt_kernel.sh`：
++
++- 自动创建 `kt-kernel/kt_kernel` → `python` 的 symlink（`setup.py` 里包名 `kt_kernel` 映射到 `python/` 目录）
++- 设置 `PYTHONPATH=$REPO/third_party/sglang/python:$REPO/kt-kernel`
++
++**preflight PASS 即可直接 launch，通常不需要 `pip install -e`。**
++
++> **注意**：`PYTHONPATH` 必须是 `$REPO/kt-kernel`（父目录），**不能**只写 `$REPO/kt-kernel/python`。若 launch 脚本被改回旧写法，会出现 **`ImportError: kt_kernel is not installed`**，而 `p27_e2e_preflight.sh` 仍可能 PASS（preflight 已走 `p27_ensure_kt_kernel`）。
++
++手动自检：
++
++```bash
++source tools/p27_ensure_kt_kernel.sh
++p27_ensure_kt_kernel "$REPO"
++export LD_LIBRARY_PATH="/usr/local/kml/lib:${LD_LIBRARY_PATH:-}"
++
++"$PYBIN" -c "
++from kt_kernel import kt_kernel_ext, generate_gpu_experts_masks
++print('OK', kt_kernel_ext.__file__)
++"
++```
++
++---
++
++## 4. 何时才需要 `pip install -e` 或重编 C++
++
++| 场景 | 是否需要 |
++|------|----------|
++| 容器重启，preflight PASS | **否**，直接 launch |
++| `kt_kernel_ext*.so` 文件不存在 | **是**，按 §5 重编 |
++| 修改了 `kt-kernel/` 下 C++ 源码 | **是**，重编并 `cp` 到 `kt-kernel/python/` |
++| 仅想 pip 注册（可选） | 需先装 **`libhwloc-dev`**（不是只有 `libhwloc15`） |
++
++### 4.1 可选：pip editable（网络 / 编译环境 OK 时）
++
++```bash
++apt-get install -y libhwloc-dev pkg-config   # 编译用，与 libhwloc15 不同
++
++cd "$REPO/kt-kernel"
++CPUINFER_USE_ASCEND_NPU=1 "$PYBIN" -m pip install -e . --no-deps --no-build-isolation
++```
++
++常见失败：
++
++| 报错 | 原因 | 处理 |
++|------|------|------|
++| `Connection to repo.huaweicloud.com timed out` | pip 源超时 | 跳过 pip，用 §3 symlink 方案 |
++| `None of the required 'hwloc' found` | 缺 `libhwloc-dev` | `apt-get install libhwloc-dev pkg-config` |
++| `libhwloc.so.15: cannot open shared object file` | 缺运行时库 | `apt-get install libhwloc15` |
++
++### 4.2 重编 C++（`.so` 丢失或改过代码）
++
++见 [Phase0 手册 §2.4](./Phase0_Phase1_变更记录与复现手册.md)：
++
++```bash
++mkdir -p /tmp/kt_kernel_build && cd /tmp/kt_kernel_build
++cmake "$REPO/kt-kernel" \
++  -DKTRANSFORMERS_USE_ASCEND_NPU=ON \
++  -DLLAMA_NATIVE=OFF \
++  -DLLAMA_ARM_DOTPROD=ON -DLLAMA_ARM_FP16=ON \
++  -DLLAMA_ARM_SVE=OFF -DLLAMA_ARM_BF16=OFF -DLLAMA_ARM_I8MM=OFF \
++  -DKTRANSFORMERS_CPU_USE_KML=OFF -DKTRANSFORMERS_CPU_MOE_KERNEL=OFF \
++  -DPYTHON_EXECUTABLE="$PYBIN" \
++  -DCMAKE_BUILD_TYPE=Release
++cmake --build . --parallel "$(nproc)"
++cp -f /tmp/kt_kernel_build/kt_kernel_ext*.so "$REPO/kt-kernel/python/"
++bash "$REPO/tools/p27_e2e_preflight.sh"
++```
++
++---
++
++## 5. 常见报错对照
++
++| 日志 / 报错 | 根因 | 处理 |
++|-------------|------|------|
++| `ImportError: kt_kernel is not installed` | launch 脚本 `PYTHONPATH=kt-kernel/python`（旧写法） | 确认 launch 已 `source p27_ensure_kt_kernel.sh`；见 §3 |
++| `[KT] kt_kernel not available; cannot build GPU expert masks` | 同上 | 同上 |
++| `NPU out of memory ... Tried to allocate 4.00 GiB`（加载 MoE 权重时） | KT 未挂上，256 expert 全上 NPU | 同上 |
++| `AttributeError: 'ServerArgs' object has no attribute 'get_hf_config'` | 旧 KT 代码 API 不匹配 | 已修：用 `get_model_config().hf_config`；拉最新代码 |
++| `libhwloc.so.15: cannot open shared object file` | 缺运行时 hwloc | `apt-get install -y libhwloc15` |
++| eager profiling 输出 `( ) 1) 2) 3)...` 退化 | `SGLANG_NPU_PROFILE_ENABLE=1` 强制全程 eager | 验证准确性用 **Graph + PROFILE_ENABLE=0**；profiling 见 [优化路线图](./DeepSeek-V4-Flash_NPU_KT_Profiling_优化路线图.md) msprof 路径 |
++| preflight WARN「.so 不在 python/ 下」 | symlink 后路径在 `kt_kernel/` | 已更新 preflight；见 `kt-kernel/kt_kernel/*.so` 即正常 |
++
++---
++
++## 6. Profiling / token200 / seq32k（可选）
++
++完整 runbook（含 seq32k decode #32）：[DeepSeek-V4-Flash_NPU_decode_profiling_runbook.md](./DeepSeek-V4-Flash_NPU_decode_profiling_runbook.md)
++
++**Inline profiler**（会全程 eager，输出可能退化，仅适合 trace 分析）：
++
++```bash
++SGLANG_NPU_PROFILE_ENABLE=1 \
++SGLANG_NPU_PROFILE_DECODE_TOKEN=200 \
++SGLANG_NPU_PROFILE_LEVEL=0 \
++SGLANG_NPU_PROFILE_ANALYSE=0 \
++SGLANG_NPU_PROFILE_DISABLE_GRAPH=1 \
++SGLANG_NPU_PROFILE_DIR=./tools/npu_results_dbg/token200 \
++ASCEND_RT_VISIBLE_DEVICES=7 \
++./tools/p27_launch_ds4flash_npu_num_expert_0.sh
++```
++
++采完后离线解析（**不要**在线 `ANALYSE=1`）：
++
++```bash
++cd "$REPO"
++"$PYBIN" - <<'PY'
++from torch_npu.profiler.profiler import analyse
++analyse('tools/npu_results_dbg/token200/<host>_<pid>_..._ascend_pt')
++PY
++```
++
++产物：`.../ASCEND_PROFILER_OUTPUT/{trace_view.json,kernel_details.csv,operator_details.csv,step_trace_time.csv}`。
++
++**seq32k（32768 prefill + decode #32）**：
++
++```bash
++# 终端 1
++SGLANG_NPU_PROFILE_ENABLE=1 \
++SGLANG_NPU_PROFILE_DECODE_TOKEN=32 \
++SGLANG_NPU_PROFILE_DIR=./tools/npu_results_dbg/seq32k_decode32 \
++CHUNKED_PREFILL_SIZE=32768 \
++PORT=8001 ASCEND_RT_VISIBLE_DEVICES=7 \
++./tools/p27_launch_ds4flash_npu_longcontext.sh
++
++# 终端 2（MAX_NEW 须 >= 32）
++PORT=8001 PROMPT_LEN=32768 MAX_NEW=64 bash tools/p27_curl_long_prompt_sweep.sh
++```
++
++生产路径 graph + msprof：见 `tools/p27_msprof_graph_baseline_exec.sh`、`tools/p27_msprof_r1_workload.sh`。
++
++---
++
++## 7. 环境变量备忘
++
++| 变量 | 重启后是否要手设 | 说明 |
++|------|------------------|------|
++| `ASCEND_RT_VISIBLE_DEVICES` | **是** | 物理 NPU 卡号 |
++| `PORT` | 可选 | 默认 8000；与 curl 脚本一致 |
++| `SGLANG_NPU_PROFILE_ENABLE` | 验证时用 `0` | `1` 会自动加 `--disable-cuda-graph` |
++| `PYTHONPATH` | **否** | launch / preflight 脚本自动设置 |
++| `P27_SITE_PATCH=1` | 一般 **否** | 仅旧 `get_hf_config` 补丁；源码已修可不开 |
++| `KT_GGUF_TEMPLATE` | 一般 **否** | 默认 `/workspace/models/cache/dsv4_layer{layer_idx}.gguf` |
++
++---
++
++## 8. 一键复制（日常重启最短路径）
++
++```bash
++export REPO=/workspace/code/ktransformer/ktransformers-AK
++cd "$REPO"
++
++apt-get update && apt-get install -y libhwloc15
++bash tools/p27_e2e_preflight.sh
++
++SGLANG_NPU_PROFILE_ENABLE=0 PORT=8001 ASCEND_RT_VISIBLE_DEVICES=7 \
++  ./tools/p27_launch_ds4flash_npu_num_expert_0.sh
++# 另开终端：
++# PORT=8001 bash tools/p27_curl_f2_prompts.sh
++```
++
++---
++
++*文档版本：2026-05-28，基于容器 `55f22c9c8a42` 重启踩坑整理。*

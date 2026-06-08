@@ -1,0 +1,2110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 10/13] =?UTF-8?q?feat(moe=5Fmicrobench):=20=E6=96=B0?= (part 2/4)
+
+diff --git a/tools/moe_microbench/moe_bench/bench_gate_up_order_check.py b/tools/moe_microbench/moe_bench/bench_gate_up_order_check.py
+new file mode 100644
+index 0000000..f06a8fc
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/bench_gate_up_order_check.py
+@@ -0,0 +1,72 @@
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++
++from moe_bench.config import load_config
++
++
++def _load_expert_w1_w3(ckpt: Path, layer: int, expert: int = 0):
++    import json as js
++    from safetensors import safe_open
++
++    idx = js.load(open(ckpt / "model.safetensors.index.json"))
++    w1_key = f"layers.{layer}.ffn.experts.{expert}.w1.weight"
++    w3_key = f"layers.{layer}.ffn.experts.{expert}.w3.weight"
++    shard = ckpt / idx["weight_map"][w1_key]
++    with safe_open(shard, framework="pt", device="cpu") as f:
++        w1 = f.get_tensor(w1_key).float()
++        w3 = f.get_tensor(w3_key).float()
++    return w1, w3
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description="Verify gate/up chunk order against ckpt w1/w3")
++    parser.add_argument("--ckpt", type=str, default="/workspace/models/DeepSeek-V4-Flash-W8A8")
++    parser.add_argument("--layer", type=int, default=3)
++    parser.add_argument("--expert", type=int, default=0)
++    args = parser.parse_args(argv)
++
++    cfg = load_config()
++    H, I = cfg.hidden_size, cfg.moe_intermediate_size
++    ckpt = Path(args.ckpt)
++    w1, w3 = _load_expert_w1_w3(ckpt, args.layer, args.expert)
++    assert w1.shape == (I, H) and w3.shape == (I, H), (w1.shape, w3.shape)
++
++    gen = torch.Generator(device="cpu")
++    gen.manual_seed(42)
++    x = torch.randn(1, H, generator=gen)
++
++    ref_gate = F.silu(x @ w1.T) * (x @ w3.T)
++    ref_up_first = F.silu(x @ w3.T) * (x @ w1.T)
++
++    W_gate_first = torch.cat([w1, w3], dim=0)
++    W_up_first = torch.cat([w3, w1], dim=0)
++    out_gate_first = F.silu(x @ W_gate_first[:I].T) * (x @ W_gate_first[I:].T)
++    out_up_first = F.silu(x @ W_up_first[:I].T) * (x @ W_up_first[I:].T)
++
++    err_gate = (out_gate_first - ref_gate).abs().mean().item()
++    err_up = (out_up_first - ref_gate).abs().mean().item()
++    err_ref_swap = (ref_up_first - ref_gate).abs().mean().item()
++
++    conclusion = "gate-first" if err_gate <= err_up else "up-first"
++    payload = {
++        "layer": args.layer,
++        "expert": args.expert,
++        "w1_shape": list(w1.shape),
++        "w3_shape": list(w3.shape),
++        "err_gate_first_fused": err_gate,
++        "err_up_first_fused": err_up,
++        "err_ref_swap_separate": err_ref_swap,
++        "conclusion": conclusion,
++    }
++    print(json.dumps(payload, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/moe_microbench/moe_bench/bench_gemm_down.py b/tools/moe_microbench/moe_bench/bench_gemm_down.py
+new file mode 100644
+index 0000000..59ed744
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/bench_gemm_down.py
+@@ -0,0 +1,79 @@
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++from moe_bench.config import add_common_bench_args, repo_root, resolve_cfg, timing_payload
++from moe_bench.init_npu import init_custom_ops, log_versions, print_npu_smi, require_npu, setup_pythonpath
++from moe_bench.ops_runner import run_act_quant, run_gemm_up, run_gemm_down, _unfused_silu_mul, run_act_quant_mid
++from moe_bench.profile import maybe_profile
++from moe_bench.sanity import sanity_check
++from moe_bench.synthetic import assert_shapes, build_synthetic
++from moe_bench.timing import bench_op
++
++
++def _prepare_mid(t, cfg):
++    xi, xs = run_act_quant(t, cfg)
++    t.x_int8, t.x_scale = xi, xs
++    up = run_gemm_up(t, cfg)
++    mid = _unfused_silu_mul(up)
++    mi8, ms = run_act_quant_mid(t, cfg, mid)
++    t.mid_int8, t.mid_scale = mi8, ms
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description="W8A8 grouped GEMM down")
++    add_common_bench_args(parser)
++    args = parser.parse_args(argv)
++    setup_pythonpath(repo_root())
++    cfg = resolve_cfg(args)
++    if args.dry_run:
++        from moe_bench.config import apply_overrides
++        cfg = apply_overrides(cfg, device="cpu")
++    t = build_synthetic(cfg, device="cpu" if args.dry_run else cfg.device)
++    assert_shapes(cfg, t)
++    if args.dry_run:
++        print(json.dumps({"kind": "gemm_down", "N": cfg.N}, indent=2))
++        return 0
++    init_custom_ops()
++    dev = require_npu()
++    log_versions(); print_npu_smi()
++    _prepare_mid(t, cfg)
++
++    if args.msprof:
++        from moe_bench.msprof_runner import hw_payload, msprof_kwargs_from_cfg, parse_gemm_hw, run_with_msprof
++
++        kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++        trace = run_with_msprof(lambda: run_gemm_down(t, cfg), "gemm_down", **kw)
++        hw = parse_gemm_hw(trace, n_active=cfg.n_active_experts, active_steps=kw["active"])
++        payload = hw_payload("gemm_down", hw, cfg=cfg, trace_dir=trace, extra={"gemm_path": hw.get("gemm_path")})
++        text = json.dumps(payload, indent=2)
++        print(text)
++        if args.out:
++            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++            Path(args.out).write_text(text, encoding="utf-8")
++        return 0
++
++    if args.sanity:
++        o = run_gemm_down(t, cfg)
++        rep = sanity_check("gemm_down", o)
++        sp = Path(args.out).parent if args.out else Path("results")
++        sp.mkdir(parents=True, exist_ok=True)
++        (sp / "sanity_gemm_down.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
++        print("[sanity]", json.dumps(rep, indent=2))
++        if rep["has_nan"]:
++            return 2
++    if args.profile_dir:
++        maybe_profile(args.profile_dir, "gemm_down", lambda: run_gemm_down(t, cfg))
++    result = bench_op(lambda: run_gemm_down(t, cfg), cfg.warmup, cfg.repeat, device=dev)
++    payload = {"kind": "gemm_down", "cfg": {"N": cfg.N, "H": cfg.hidden_size, "I": cfg.moe_intermediate_size, "E_act": cfg.n_active_experts}, "timing": timing_payload(result)}
++    text = json.dumps(payload, indent=2)
++    print(text)
++    if args.out:
++        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++        Path(args.out).write_text(text, encoding="utf-8")
++    return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/moe_microbench/moe_bench/bench_gemm_up.py b/tools/moe_microbench/moe_bench/bench_gemm_up.py
+new file mode 100644
+index 0000000..f11834b
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/bench_gemm_up.py
+@@ -0,0 +1,71 @@
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++from moe_bench.config import add_common_bench_args, repo_root, resolve_cfg, timing_payload
++from moe_bench.init_npu import init_custom_ops, log_versions, print_npu_smi, require_npu, setup_pythonpath
++from moe_bench.ops_runner import run_act_quant, run_gemm_up
++from moe_bench.profile import maybe_profile
++from moe_bench.sanity import sanity_check
++from moe_bench.synthetic import assert_shapes, build_synthetic
++from moe_bench.timing import bench_op
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description="W8A8 grouped GEMM up")
++    add_common_bench_args(parser)
++    args = parser.parse_args(argv)
++    setup_pythonpath(repo_root())
++    cfg = resolve_cfg(args)
++    if args.dry_run:
++        from moe_bench.config import apply_overrides
++        cfg = apply_overrides(cfg, device="cpu")
++    t = build_synthetic(cfg, device="cpu" if args.dry_run else cfg.device)
++    assert_shapes(cfg, t)
++    if args.dry_run:
++        print(json.dumps({"kind": "gemm_up", "N": cfg.N}, indent=2))
++        return 0
++    init_custom_ops()
++    dev = require_npu()
++    log_versions(); print_npu_smi()
++    xi, xs = run_act_quant(t, cfg)
++    t.x_int8, t.x_scale = xi, xs
++
++    if args.msprof:
++        from moe_bench.msprof_runner import hw_payload, msprof_kwargs_from_cfg, parse_gemm_hw, run_with_msprof
++
++        kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++        trace = run_with_msprof(lambda: run_gemm_up(t, cfg), "gemm_up", **kw)
++        hw = parse_gemm_hw(trace, n_active=cfg.n_active_experts, active_steps=kw["active"])
++        payload = hw_payload("gemm_up", hw, cfg=cfg, trace_dir=trace, extra={"gemm_path": hw.get("gemm_path")})
++        text = json.dumps(payload, indent=2)
++        print(text)
++        if args.out:
++            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++            Path(args.out).write_text(text, encoding="utf-8")
++        return 0
++
++    if args.sanity:
++        o = run_gemm_up(t, cfg)
++        rep = sanity_check("gemm_up", o)
++        sp = Path(args.out).parent if args.out else Path("results")
++        sp.mkdir(parents=True, exist_ok=True)
++        (sp / "sanity_gemm_up.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
++        print("[sanity]", json.dumps(rep, indent=2))
++        if rep["has_nan"]:
++            return 2
++    if args.profile_dir:
++        maybe_profile(args.profile_dir, "gemm_up", lambda: run_gemm_up(t, cfg))
++    result = bench_op(lambda: run_gemm_up(t, cfg), cfg.warmup, cfg.repeat, device=dev)
++    payload = {"kind": "gemm_up", "cfg": {"N": cfg.N, "H": cfg.hidden_size, "I": cfg.moe_intermediate_size, "E_act": cfg.n_active_experts}, "timing": timing_payload(result)}
++    text = json.dumps(payload, indent=2)
++    print(text)
++    if args.out:
++        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++        Path(args.out).write_text(text, encoding="utf-8")
++    return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/moe_microbench/moe_bench/bench_grouped_vs_loop.py b/tools/moe_microbench/moe_bench/bench_grouped_vs_loop.py
+new file mode 100644
+index 0000000..fee157c
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/bench_grouped_vs_loop.py
+@@ -0,0 +1,116 @@
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++from moe_bench.config import add_common_bench_args, repo_root, resolve_cfg, timing_payload
++from moe_bench.init_npu import init_custom_ops, log_versions, print_npu_smi, require_npu, setup_pythonpath
++from moe_bench.ops_runner import (
++    _unfused_silu_mul,
++    make_loop_runner,
++    run_act_quant,
++    run_act_quant_mid,
++    run_gemm_down,
++    run_gemm_up,
++)
++from moe_bench.synthetic import assert_shapes, build_synthetic
++from moe_bench.timing import bench_op
++
++
++def _bench_target(t, cfg, dev, target: str):
++    if target == "up":
++        grouped_fn = lambda: run_gemm_up(t, cfg)
++        loop_fn = make_loop_runner(t, cfg, target="up")
++    else:
++        grouped_fn = lambda: run_gemm_down(t, cfg)
++        loop_fn = make_loop_runner(t, cfg, target="down")
++    r_grouped = bench_op(grouped_fn, cfg.warmup, cfg.repeat, device=dev)
++    r_loop = bench_op(loop_fn, cfg.warmup, cfg.repeat, device=dev)
++    return {
++        "target": target,
++        "grouped": timing_payload(r_grouped),
++        "loop": timing_payload(r_loop),
++    }
++
++
++def _msprof_grouped_loop(cfg, t, args, target: str):
++    from moe_bench.msprof_runner import hw_payload, msprof_kwargs_from_cfg, parse_gemm_hw, run_with_msprof
++
++    kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++    base = Path(kw["out_dir"])
++    if target == "up":
++        grouped_fn = lambda: run_gemm_up(t, cfg)
++        loop_fn = make_loop_runner(t, cfg, target="up")
++    else:
++        grouped_fn = lambda: run_gemm_down(t, cfg)
++        loop_fn = make_loop_runner(t, cfg, target="down")
++
++    trace_g = run_with_msprof(grouped_fn, f"gvl_{target}_grouped", out_dir=str(base), **{k: v for k, v in kw.items() if k != "out_dir"})
++    hw_g = parse_gemm_hw(trace_g, n_active=cfg.n_active_experts, active_steps=kw["active"])
++
++    trace_l = run_with_msprof(loop_fn, f"gvl_{target}_loop", out_dir=str(base), **{k: v for k, v in kw.items() if k != "out_dir"})
++    hw_l = parse_gemm_hw(trace_l, n_active=cfg.n_active_experts, active_steps=kw["active"])
++
++    return {
++        "target": target,
++        "grouped_hw": hw_payload(f"grouped_{target}", hw_g, trace_dir=trace_g),
++        "loop_hw": hw_payload(f"loop_{target}", hw_l, trace_dir=trace_l),
++    }
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description="Grouped vs loop quant_matmul")
++    add_common_bench_args(parser)
++    parser.add_argument("--target", choices=["up", "down", "both"], default="both")
++    args = parser.parse_args(argv)
++    setup_pythonpath(repo_root())
++    cfg = resolve_cfg(args)
++    if args.dry_run:
++        from moe_bench.config import apply_overrides
++        cfg = apply_overrides(cfg, device="cpu")
++    t = build_synthetic(cfg, device="cpu" if args.dry_run else cfg.device)
++    assert_shapes(cfg, t)
++    if args.dry_run:
++        print(json.dumps({"kind": "grouped_vs_loop", "target": args.target}, indent=2))
++        return 0
++    init_custom_ops()
++    dev = require_npu()
++    log_versions(); print_npu_smi()
++    xi, xs = run_act_quant(t, cfg)
++    t.x_int8, t.x_scale = xi, xs
++    up = run_gemm_up(t, cfg)
++    mid = _unfused_silu_mul(up)
++    mi8, ms = run_act_quant_mid(t, cfg, mid)
++    t.mid_int8, t.mid_scale = mi8, ms
++    targets = ["up", "down"] if args.target == "both" else [args.target]
++
++    if args.msprof:
++        results = [_msprof_grouped_loop(cfg, t, args, tg) for tg in targets]
++        payload = {
++            "kind": "grouped_vs_loop",
++            "mode": "msprof_hardware_only",
++            "cfg": {"N": cfg.N, "E_act": cfg.n_active_experts},
++            "results": results,
++        }
++        if len(results) == 1:
++            payload["grouped_hw"] = results[0]["grouped_hw"]
++            payload["loop_hw"] = results[0]["loop_hw"]
++        text = json.dumps(payload, indent=2)
++        print(text)
++        if args.out:
++            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++            Path(args.out).write_text(text, encoding="utf-8")
++        return 0
++
++    results = [_bench_target(t, cfg, dev, tg) for tg in targets]
++    payload = {"kind": "grouped_vs_loop", "cfg": {"N": cfg.N, "E_act": cfg.n_active_experts}, "results": results}
++    text = json.dumps(payload, indent=2)
++    print(text)
++    if args.out:
++        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++        Path(args.out).write_text(text, encoding="utf-8")
++    return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/moe_microbench/moe_bench/bench_routed_full.py b/tools/moe_microbench/moe_bench/bench_routed_full.py
+new file mode 100644
+index 0000000..0d774d7
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/bench_routed_full.py
+@@ -0,0 +1,176 @@
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++from moe_bench.config import add_common_bench_args, repo_root, resolve_cfg, timing_payload
++from moe_bench.init_npu import init_custom_ops, log_versions, print_npu_smi, require_npu, setup_pythonpath
++from moe_bench.ops_runner import (
++    _unfused_silu_mul,
++    run_act_quant,
++    run_act_quant_mid,
++    run_gemm_down,
++    run_gemm_up,
++    run_routed_post_dispatch,
++)
++from moe_bench.profile import maybe_profile
++from moe_bench.sanity import sanity_check
++from moe_bench.synthetic import assert_shapes, build_synthetic
++from moe_bench.timing import bench_op
++
++
++def _msprof_routed(cfg, t, args):
++    from moe_bench.msprof_runner import (
++        hw_payload,
++        msprof_kwargs_from_cfg,
++        parse_gemm_hw,
++        parse_op_summary,
++        parse_op_summary_multi,
++        run_with_msprof,
++    )
++
++    kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++    base = Path(kw["out_dir"])
++
++    xi, xs = run_act_quant(t, cfg)
++    t.x_int8, t.x_scale = xi, xs
++    up = run_gemm_up(t, cfg)
++    mid = _unfused_silu_mul(up)
++    mi8, ms = run_act_quant_mid(t, cfg, mid)
++    t.mid_int8, t.mid_scale = mi8, ms
++
++    segments = {}
++    trace_aq = run_with_msprof(lambda: run_act_quant(t, cfg), "routed_act_quant", out_dir=str(base), **{k: v for k, v in kw.items() if k != "out_dir"})
++    for pattern in ("DynamicQuant", "DynamicQuantize"):
++        try:
++            segments["act_quant_hw"] = hw_payload("act_quant", parse_op_summary(trace_aq, pattern), trace_dir=trace_aq)
++            break
++        except ValueError:
++            continue
++
++    trace_up = run_with_msprof(lambda: run_gemm_up(t, cfg), "routed_gemm_up", out_dir=str(base), **{k: v for k, v in kw.items() if k != "out_dir"})
++    hw_up = parse_gemm_hw(trace_up, n_active=cfg.n_active_experts, active_steps=kw["active"])
++    segments["gemm_up_hw"] = hw_payload("gemm_up", hw_up, trace_dir=trace_up)
++
++    def silu_fn():
++        m = _unfused_silu_mul(up)
++        run_act_quant_mid(t, cfg, m)
++
++    trace_silu = run_with_msprof(silu_fn, "routed_silu", out_dir=str(base), **{k: v for k, v in kw.items() if k != "out_dir"})
++    silu_patterns = []
++    for p in ("Silu", "Mul", "DynamicQuant", "DynamicQuantize"):
++        try:
++            parse_op_summary(trace_silu, p)
++            if p not in silu_patterns:
++                silu_patterns.append(p)
++        except ValueError:
++            pass
++    segments["silu_hw"] = hw_payload("silu_mul", parse_op_summary_multi(trace_silu, silu_patterns[:3]), trace_dir=trace_silu)
++
++    trace_dn = run_with_msprof(lambda: run_gemm_down(t, cfg), "routed_gemm_down", out_dir=str(base), **{k: v for k, v in kw.items() if k != "out_dir"})
++    hw_dn = parse_gemm_hw(trace_dn, n_active=cfg.n_active_experts, active_steps=kw["active"])
++    segments["gemm_down_hw"] = hw_payload("gemm_down", hw_dn, trace_dir=trace_dn)
++
++    trace_pipe = run_with_msprof(lambda: run_routed_post_dispatch(t, cfg), "routed_full_pipeline", out_dir=str(base), **{k: v for k, v in kw.items() if k != "out_dir"})
++    pipe_hw = None
++    for pattern in ("GroupedMatmul", "QuantMatmul", "DynamicQuant", "Silu"):
++        try:
++            pipe_hw = parse_op_summary(trace_pipe, pattern)
++            break
++        except ValueError:
++            continue
++    if pipe_hw is None:
++        from moe_bench.msprof_runner import list_op_types_in_trace
++        types = list_op_types_in_trace(trace_pipe)
++        seg_sum = sum(
++            s.get("device_mean_us", 0)
++            for s in segments.values()
++            if isinstance(s, dict) and "device_mean_us" in s
++        )
++        pipe_hw = {"op_pattern": "segment_sum", "device_mean_us": seg_sum, "matched_rows": len(segments)}
++        segments["pipeline_note"] = f"pipeline trace unaggregated; types={types[:5]}"
++
++    segments["pipeline_hw"] = hw_payload("routed_full_pipeline", pipe_hw, trace_dir=trace_pipe)
++
++    seg_total = (
++        segments["act_quant_hw"]["device_mean_us"]
++        + segments["gemm_up_hw"]["device_mean_us"]
++        + segments["silu_hw"]["device_mean_us"]
++        + segments["gemm_down_hw"]["device_mean_us"]
++    )
++    return {
++        "kind": "routed_full",
++        "mode": "msprof_hardware_only",
++        "device_mean_us": seg_total,
++        "pipeline_device_mean_us": segments["pipeline_hw"]["device_mean_us"],
++        "segments_hw": segments,
++        "cfg": {"N": cfg.N, "E_act": cfg.n_active_experts},
++    }
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description="Routed MoE full path")
++    add_common_bench_args(parser)
++    args = parser.parse_args(argv)
++    setup_pythonpath(repo_root())
++    cfg = resolve_cfg(args)
++    if args.dry_run:
++        from moe_bench.config import apply_overrides
++        cfg = apply_overrides(cfg, device="cpu")
++    t = build_synthetic(cfg, device="cpu" if args.dry_run else cfg.device)
++    assert_shapes(cfg, t)
++    if args.dry_run:
++        print(json.dumps({"kind": "routed_full", "N": cfg.N}, indent=2))
++        return 0
++    init_custom_ops()
++    dev = require_npu()
++    log_versions(); print_npu_smi()
++
++    if args.msprof:
++        payload = _msprof_routed(cfg, t, args)
++        text = json.dumps(payload, indent=2)
++        print(text)
++        if args.out:
++            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++            Path(args.out).write_text(text, encoding="utf-8")
++        return 0
++
++    xi, xs = run_act_quant(t, cfg)
++    t.x_int8, t.x_scale = xi, xs
++    if args.sanity:
++        o = run_routed_post_dispatch(t, cfg)
++        rep = sanity_check("routed_full", o)
++        sp = Path(args.out).parent if args.out else Path("results")
++        sp.mkdir(parents=True, exist_ok=True)
++        (sp / "sanity_routed_full.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
++        if rep["has_nan"]:
++            return 2
++    if args.profile_dir:
++        maybe_profile(args.profile_dir, "routed_full", lambda: run_routed_post_dispatch(t, cfg))
++    from moe_bench.ops_runner import run_routed_compute_only
++    r_compute_only = bench_op(lambda: run_routed_compute_only(t, cfg), cfg.warmup, cfg.repeat, device=dev)
++    r_post = bench_op(lambda: run_routed_post_dispatch(t, cfg), cfg.warmup, cfg.repeat, device=dev)
++    payload = {
++        "kind": "routed_full",
++        "cfg": {"N": cfg.N, "H": cfg.hidden_size, "I": cfg.moe_intermediate_size, "E_act": cfg.n_active_experts},
++        "timing": timing_payload(r_post),
++        "derived": {
++            "routed_full_compute_only_us": r_compute_only.device_mean_us,
++            "routed_full_post_dispatch_us": r_post.device_mean_us,
++            "dispatch_overhead_us": r_post.host_mean_us - r_post.device_mean_us,
++        },
++        "segments": {
++            "compute_only": timing_payload(r_compute_only),
++            "post_dispatch": timing_payload(r_post),
++        },
++    }
++    text = json.dumps(payload, indent=2)
++    print(text)
++    if args.out:
++        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++        Path(args.out).write_text(text, encoding="utf-8")
++    return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/moe_microbench/moe_bench/bench_shared_expert.py b/tools/moe_microbench/moe_bench/bench_shared_expert.py
+new file mode 100644
+index 0000000..6abf077
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/bench_shared_expert.py
+@@ -0,0 +1,85 @@
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++from moe_bench.config import add_common_bench_args, repo_root, resolve_cfg, timing_payload
++from moe_bench.init_npu import init_custom_ops, log_versions, print_npu_smi, require_npu, setup_pythonpath
++from moe_bench.ops_runner import run_shared_expert
++from moe_bench.profile import maybe_profile
++from moe_bench.sanity import sanity_check
++from moe_bench.synthetic import assert_shapes, build_synthetic
++from moe_bench.timing import bench_op
++
++
++def _parse_shared_hw(trace):
++    from moe_bench.msprof_runner import parse_op_summary, parse_op_summary_multi
++
++    patterns = []
++    for p in ("QuantBatchMatmul", "QuantMatmul", "DynamicQuant", "DynamicQuantize", "Silu", "Mul"):
++        try:
++            parse_op_summary(trace, p)
++            patterns.append(p)
++        except ValueError:
++            continue
++    if not patterns:
++        raise ValueError("no shared expert ops in trace")
++    if len(patterns) == 1:
++        return parse_op_summary(trace, patterns[0])
++    return parse_op_summary_multi(trace, patterns)
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description="Shared expert dense W8A8 MLP")
++    add_common_bench_args(parser)
++    args = parser.parse_args(argv)
++    setup_pythonpath(repo_root())
++    cfg = resolve_cfg(args)
++    if args.dry_run:
++        from moe_bench.config import apply_overrides
++        cfg = apply_overrides(cfg, device="cpu")
++    t = build_synthetic(cfg, device="cpu" if args.dry_run else cfg.device)
++    assert_shapes(cfg, t)
++    if args.dry_run:
++        print(json.dumps({"kind": "shared_expert", "shape": [cfg.num_tokens, cfg.hidden_size]}, indent=2))
++        return 0
++    init_custom_ops()
++    dev = require_npu()
++    log_versions(); print_npu_smi()
++
++    if args.msprof:
++        from moe_bench.msprof_runner import hw_payload, msprof_kwargs_from_cfg, run_with_msprof
++
++        kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++        trace = run_with_msprof(lambda: run_shared_expert(t, cfg), "shared_expert", **kw)
++        hw = _parse_shared_hw(trace)
++        payload = hw_payload("shared_expert", hw, cfg=cfg, trace_dir=trace)
++        text = json.dumps(payload, indent=2)
++        print(text)
++        if args.out:
++            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++            Path(args.out).write_text(text, encoding="utf-8")
++        return 0
++
++    if args.sanity:
++        o = run_shared_expert(t, cfg)
++        rep = sanity_check("shared_expert", o)
++        sp = Path(args.out).parent if args.out else Path("results")
++        sp.mkdir(parents=True, exist_ok=True)
++        (sp / "sanity_shared_expert.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
++        if rep["has_nan"]:
++            return 2
++    if args.profile_dir:
++        maybe_profile(args.profile_dir, "shared_expert", lambda: run_shared_expert(t, cfg))
++    result = bench_op(lambda: run_shared_expert(t, cfg), cfg.warmup, cfg.repeat, device=dev)
++    payload = {"kind": "shared_expert", "cfg": {"num_tokens": cfg.num_tokens, "H": cfg.hidden_size, "S": cfg.shared_intermediate_size}, "timing": timing_payload(result)}
++    text = json.dumps(payload, indent=2)
++    print(text)
++    if args.out:
++        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++        Path(args.out).write_text(text, encoding="utf-8")
++    return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/moe_microbench/moe_bench/bench_silu_mul.py b/tools/moe_microbench/moe_bench/bench_silu_mul.py
+new file mode 100644
+index 0000000..68630ea
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/bench_silu_mul.py
+@@ -0,0 +1,118 @@
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++from moe_bench.config import add_common_bench_args, repo_root, resolve_cfg, timing_payload
++from moe_bench.init_npu import init_custom_ops, log_versions, print_npu_smi, require_npu, setup_pythonpath
++from moe_bench.ops_runner import make_silu_mul, run_act_quant, run_act_quant_mid, run_gemm_up
++from moe_bench.profile import maybe_profile
++from moe_bench.sanity import sanity_check
++from moe_bench.synthetic import assert_shapes, build_synthetic
++from moe_bench.timing import bench_op
++
++
++def _parse_silu_hw(trace, *, fused: bool):
++    from moe_bench.msprof_runner import list_op_types_in_trace, parse_op_summary, parse_op_summary_multi
++
++    if fused:
++        for pattern in ("Swiglu", "SwiGLU", "SiluMul", "DequantSwiglu"):
++            try:
++                return parse_op_summary(trace, pattern)
++            except ValueError:
++                continue
++        raise ValueError(f"no fused silu op; types: {list_op_types_in_trace(trace)}")
++
++    patterns = []
++    for candidates in (
++        ("Silu", "silu"),
++        ("Mul", "mul"),
++        ("DynamicQuant", "DynamicQuantize"),
++    ):
++        for p in candidates:
++            try:
++                parse_op_summary(trace, p)
++                patterns.append(p)
++                break
++            except ValueError:
++                continue
++    if len(patterns) < 2:
++        raise ValueError(f"silu sub-op patterns incomplete; saw {list_op_types_in_trace(trace)}")
++    if "DynamicQuant" not in patterns and "DynamicQuantize" not in patterns:
++        for p in ("DynamicQuant", "DynamicQuantize"):
++            try:
++                parse_op_summary(trace, p)
++                patterns.append(p)
++                break
++            except ValueError:
++                pass
++    return parse_op_summary_multi(trace, patterns)
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description="SiLU(gate)*up + mid quant")
++    add_common_bench_args(parser)
++    grp = parser.add_mutually_exclusive_group()
++    grp.add_argument("--fused", action="store_true")
++    grp.add_argument("--no-fused", action="store_true")
++    args = parser.parse_args(argv)
++    setup_pythonpath(repo_root())
++    cfg = resolve_cfg(args)
++    if args.dry_run:
++        from moe_bench.config import apply_overrides
++        cfg = apply_overrides(cfg, device="cpu")
++    t = build_synthetic(cfg, device="cpu" if args.dry_run else cfg.device)
++    assert_shapes(cfg, t)
++    if args.dry_run:
++        print(json.dumps({"kind": "silu_mul", "shape": [cfg.N, 2 * cfg.moe_intermediate_size]}, indent=2))
++        return 0
++    init_custom_ops()
++    dev = require_npu()
++    log_versions(); print_npu_smi()
++    xi, xs = run_act_quant(t, cfg)
++    t.x_int8, t.x_scale = xi, xs
++    gate_up = run_gemm_up(t, cfg)
++    force = True if args.fused else (False if args.no_fused else None)
++    silu_fn, mode = make_silu_mul(cfg, force_fused=force)
++
++    def fn():
++        mid = silu_fn(gate_up)
++        run_act_quant_mid(t, cfg, mid)
++
++    if args.msprof:
++        from moe_bench.msprof_runner import hw_payload, msprof_kwargs_from_cfg, run_with_msprof
++
++        kw = msprof_kwargs_from_cfg(cfg, args.msprof_out)
++        trace = run_with_msprof(fn, f"silu_mul_{mode}", **kw)
++        hw = _parse_silu_hw(trace, fused=(mode == "fused"))
++        payload = hw_payload(f"silu_mul_{mode}", hw, cfg=cfg, trace_dir=trace, extra={"mode": mode})
++        payload["mode"] = "msprof_hardware_only"
++        text = json.dumps(payload, indent=2)
++        print(text)
++        if args.out:
++            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++            Path(args.out).write_text(text, encoding="utf-8")
++        return 0
++
++    if args.sanity:
++        mid = silu_fn(gate_up)
++        rep = sanity_check(f"silu_mul_{mode}", mid)
++        sp = Path(args.out).parent if args.out else Path("results")
++        sp.mkdir(parents=True, exist_ok=True)
++        (sp / f"sanity_silu_mul_{mode}.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
++        if rep["has_nan"]:
++            return 2
++    if args.profile_dir:
++        maybe_profile(args.profile_dir, f"silu_mul_{mode}", fn)
++    result = bench_op(fn, cfg.warmup, cfg.repeat, device=dev)
++    payload = {"kind": f"silu_mul_{mode}", "cfg": {"N": cfg.N, "mode": mode}, "timing": timing_payload(result)}
++    text = json.dumps(payload, indent=2)
++    print(text)
++    if args.out:
++        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++        Path(args.out).write_text(text, encoding="utf-8")
++    return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/moe_microbench/moe_bench/config.py b/tools/moe_microbench/moe_bench/config.py
+new file mode 100644
+index 0000000..caa6163
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/config.py
+@@ -0,0 +1,162 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, replace
++from pathlib import Path
++from typing import Any
++
++import yaml
++
++
++@dataclass(frozen=True)
++class MoEConfig:
++    hidden_size: int
++    moe_intermediate_size: int
++    n_routed_experts: int
++    num_experts_per_tok: int
++    n_shared_experts: int
++    shared_intermediate_size: int
++    num_hidden_layers: int
++    device: str
++    weight_dtype: str
++    weight_scale_dtype: str
++    weight_scale_strategy: str
++    act_dtype: str
++    act_scale_strategy: str
++    accum_dtype: str
++    out_dtype: str
++    num_tokens: int
++    top_k: int
++    n_active_experts: int
++    tokens_per_expert: int
++    warmup: int
++    repeat: int
++    seed: int
++    ops: dict
++    sweep_n_active: list[int]
++    sweep_n_active_extended: list[int]
++    roofline_hbm_peak_tb_s: float
++    roofline_hbm_effective_tb_s: float
++    roofline_bytes_per_weight: int
++    msprof: dict
++
++    @property
++    def N(self) -> int:
++        """NPU grouped GEMM 实际 token 数 = n_active * tokens_per_expert (N2)."""
++        return self.n_active_experts * self.tokens_per_expert
++
++
++def microbench_root() -> Path:
++    return Path(__file__).resolve().parent.parent
++
++
++def repo_root() -> Path:
++    return microbench_root().parent.parent
++
++
++def default_config_path() -> Path:
++    return microbench_root() / "config" / "dsv4_flash_moe.yaml"
++
++
++def load_config(path: str | Path | None = None) -> MoEConfig:
++    cfg_path = Path(path) if path else default_config_path()
++    with open(cfg_path, encoding="utf-8") as f:
++        raw: dict[str, Any] = yaml.safe_load(f)
++    model = raw["model"]
++    runtime = raw["runtime"]
++    bench = raw["bench"]
++    ops = raw.get("ops", {})
++    sweep = raw.get("sweep", {})
++    roofline = raw.get("roofline", {})
++    msprof = raw.get("msprof", {})
++
++    shared_inter = model.get("shared_intermediate_size")
++    if shared_inter in (None, "null"):
++        shared_inter = int(model["n_shared_experts"]) * int(model["moe_intermediate_size"])
++
++    return MoEConfig(
++        hidden_size=int(model["hidden_size"]),
++        moe_intermediate_size=int(model["moe_intermediate_size"]),
++        n_routed_experts=int(model["n_routed_experts"]),
++        num_experts_per_tok=int(model["num_experts_per_tok"]),
++        n_shared_experts=int(model["n_shared_experts"]),
++        shared_intermediate_size=int(shared_inter),
++        num_hidden_layers=int(model.get("num_hidden_layers", 43)),
++        device=str(runtime["device"]),
++        weight_dtype=str(runtime["weight_dtype"]),
++        weight_scale_dtype=str(runtime["weight_scale_dtype"]),
++        weight_scale_strategy=str(runtime.get("weight_scale_strategy", "channel")),
++        act_dtype=str(runtime["act_dtype"]),
++        act_scale_strategy=str(runtime.get("act_scale_strategy", "token")),
++        accum_dtype=str(runtime["accum_dtype"]),
++        out_dtype=str(runtime["out_dtype"]),
++        num_tokens=int(bench["num_tokens"]),
++        top_k=int(bench["top_k"]),
++        n_active_experts=int(bench["n_active_experts"]),
++        tokens_per_expert=int(bench["tokens_per_expert"]),
++        warmup=int(bench["warmup"]),
++        repeat=int(bench["repeat"]),
++        seed=int(bench["seed"]),
++        ops=ops,
++        sweep_n_active=[int(x) for x in sweep.get("n_active_experts", [1, 2, 3, 4, 5, 6])],
++        sweep_n_active_extended=[int(x) for x in sweep.get("n_active_extended", [])],
++        roofline_hbm_peak_tb_s=float(roofline.get("hbm_peak_tb_s", 1.6)),
++        roofline_hbm_effective_tb_s=float(roofline.get("hbm_effective_tb_s", 1.0)),
++        roofline_bytes_per_weight=int(roofline.get("bytes_per_weight", 1)),
++        msprof={
++            "enabled": bool(msprof.get("enabled", False)),
++            "profiler_level": str(msprof.get("profiler_level", "Level1")),
++            "aic_metrics": str(msprof.get("aic_metrics", "PipeUtilization")),
++            "skip_first": int(msprof.get("skip_first", 5)),
++            "warmup": int(msprof.get("warmup", 2)),
++            "active": int(msprof.get("active", 10)),
++            "out_dir": str(msprof.get("out_dir", "./npu_results")),
++            "record_shapes": bool(msprof.get("record_shapes", True)),
++            "with_stack": bool(msprof.get("with_stack", False)),
++        },
++    )
++
++
++def apply_overrides(cfg: MoEConfig, **kwargs: Any) -> MoEConfig:
++    clean = {k: v for k, v in kwargs.items() if v is not None and hasattr(cfg, k)}
++    return replace(cfg, **clean)
++
++
++def timing_payload(result, extra: dict | None = None) -> dict:
++    d = result.to_dict()
++    d["dispatch_overhead_us"] = d["host_mean_us"] - d["device_mean_us"]
++    if extra:
++        d.update(extra)
++    return d
++
++
++def add_common_bench_args(parser) -> None:
++    import argparse
++
++    parser.add_argument("--config", type=str, default=None)
++    parser.add_argument("--num-tokens", type=int, default=None)
++    parser.add_argument("--top-k", type=int, default=None)
++    parser.add_argument("--n-active-experts", type=int, default=None)
++    parser.add_argument("--tokens-per-expert", type=int, default=None)
++    parser.add_argument("--warmup", type=int, default=None)
++    parser.add_argument("--repeat", type=int, default=None)
++    parser.add_argument("--quick-mode", action="store_true")
++    parser.add_argument("--out", type=str, default="")
++    parser.add_argument("--sanity", action="store_true")
++    parser.add_argument("--dry-run", action="store_true")
++    parser.add_argument("--profile-dir", type=str, default="")
++    parser.add_argument("--msprof", action="store_true", help="msprof Level1 hardware device time")
++    parser.add_argument("--msprof-out", default=None, help="msprof trace root; default cfg.msprof.out_dir")
++
++
++def resolve_cfg(args) -> MoEConfig:
++    cfg = load_config(args.config)
++    repeat = 100 if args.quick_mode else args.repeat
++    return apply_overrides(
++        cfg,
++        num_tokens=args.num_tokens,
++        top_k=args.top_k,
++        n_active_experts=args.n_active_experts,
++        tokens_per_expert=args.tokens_per_expert,
++        warmup=args.warmup,
++        repeat=repeat,
++    )
+diff --git a/tools/moe_microbench/moe_bench/init_npu.py b/tools/moe_microbench/moe_bench/init_npu.py
+new file mode 100644
+index 0000000..dafe8cd
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/init_npu.py
+@@ -0,0 +1,62 @@
++from __future__ import annotations
++
++import os
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++
++def setup_pythonpath(repo_root: Path) -> None:
++    sglang_py = repo_root / "third_party" / "sglang" / "python"
++    microbench = repo_root / "tools" / "moe_microbench"
++    for p in (str(microbench), str(sglang_py)):
++        if p not in sys.path:
++            sys.path.insert(0, p)
++
++
++def init_custom_ops() -> None:
++    import torch_npu  # noqa: F401
++
++    try:
++        import sgl_kernel_npu  # noqa: F401
++    except ImportError:
++        print("[moe_microbench] sgl_kernel_npu not installed (ok if using torch_npu.* only)")
++
++    assert hasattr(torch_npu, "npu_dynamic_quant"), "torch_npu.npu_dynamic_quant missing"
++    assert hasattr(torch_npu, "npu_grouped_matmul"), "torch_npu.npu_grouped_matmul missing"
++
++
++def require_npu():
++    import torch
++
++    if not hasattr(torch, "npu") or not torch.npu.is_available():
++        raise RuntimeError("NPU not available; check ASCEND_RT_VISIBLE_DEVICES and driver")
++    return torch.device("npu:0")
++
++
++def log_versions() -> None:
++    import torch_npu
++
++    print(f"[moe_microbench] torch_npu={torch_npu.__version__}")
++    try:
++        import sgl_kernel_npu
++
++        print(f"[moe_microbench] sgl_kernel_npu={getattr(sgl_kernel_npu, '__version__', 'unknown')}")
++    except ImportError:
++        pass
++
++
++def print_npu_smi() -> None:
++    """Best-effort: 打印 npu-smi info 简表 + ASCEND_RT_VISIBLE_DEVICES (N9)."""
++    vis = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "<unset>")
++    print(f"[moe_microbench] ASCEND_RT_VISIBLE_DEVICES={vis}")
++    if shutil.which("npu-smi") is None:
++        print("[moe_microbench] npu-smi not on PATH; cannot show device map")
++        return
++    try:
++        out = subprocess.check_output(["npu-smi", "info"], text=True, timeout=5)
++        print("[moe_microbench] npu-smi info (head):")
++        print(out[:2000])
++    except Exception as e:
++        print(f"[moe_microbench] npu-smi info failed: {e}")
+diff --git a/tools/moe_microbench/moe_bench/msprof_runner.py b/tools/moe_microbench/moe_bench/msprof_runner.py
+new file mode 100644
+index 0000000..20e6f75
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/msprof_runner.py
+@@ -0,0 +1,378 @@
++# NOTE: keep in sync with tools/attn_microbench/attn_bench/msprof_runner.py
++# Changes here should be mirrored manually (no shared module by design).
++
++"""Pure NPU hardware op timing via torch_npu.profiler Level1 + op_summary CSV."""
++
++from __future__ import annotations
++
++import csv
++import glob
++from pathlib import Path
++from typing import Callable
++
++import torch_npu
++
++
++def _glob_csv(trace_dir: Path, rel: str) -> list[str]:
++    return sorted(glob.glob(str(trace_dir / "**" / rel), recursive=True))
++
++
++def _read_csv(path: str) -> list[dict]:
++    with open(path, newline="", encoding="utf-8-sig") as f:
++        return list(csv.DictReader(f))
++
++
++def _find_profiler_csvs(trace_dir: Path) -> dict[str, list[str]]:
++    td = Path(trace_dir)
++    return {
++        "op_summary": _glob_csv(td, "ASCEND_PROFILER_OUTPUT/op_summary_*.csv"),
++        "kernel_details": _glob_csv(td, "ASCEND_PROFILER_OUTPUT/kernel_details.csv"),
++        "op_statistic": _glob_csv(td, "ASCEND_PROFILER_OUTPUT/op_statistic.csv"),
++        "operator_details": _glob_csv(td, "ASCEND_PROFILER_OUTPUT/operator_details.csv"),
++    }
++
++
++def _stats(values: list[float]) -> dict:
++    if not values:
++        raise ValueError("no duration samples")
++    s = sorted(values)
++    n = len(s)
++
++    def q(p: float) -> float:
++        if n == 1:
++            return s[0]
++        k = (n - 1) * p
++        f = int(k)
++        c = min(f + 1, n - 1)
++        if f == c:
++            return s[f]
++        return s[f] + (s[c] - s[f]) * (k - f)
++
++    mean = sum(s) / n
++    var = sum((x - mean) ** 2 for x in s) / n if n > 1 else 0.0
++    return {
++        "device_mean_us": mean,
++        "device_std_us": var**0.5,
++        "device_p50_us": q(0.50),
++        "device_p95_us": q(0.95),
++        "device_p99_us": q(0.99),
++        "device_max_us": s[-1],
++        "device_min_us": s[0],
++        "matched_rows": n,
++    }
++
++
++def _match_text(text: str, pattern: str) -> bool:
++    return pattern.lower() in (text or "").lower()
++
++
++def _parse_kernel_details(path: str, op_pattern: str) -> list[float]:
++    rows = _read_csv(path)
++    dur: list[float] = []
++    for row in rows:
++        name = row.get("Name") or row.get("Type") or ""
++        if not _match_text(name, op_pattern):
++            continue
++        step = (row.get("Step Id") or "").strip()
++        if not step:
++            continue
++        col = "Duration(us)"
++        if col not in row:
++            continue
++        val = row[col].strip().replace("\t", "")
++        if val:
++            dur.append(float(val))
++    return dur
++
++
++def _parse_op_summary(path: str, op_pattern: str) -> list[float]:
++    rows = _read_csv(path)
++    op_col = next((c for c in ("OP Type", "Op Type", "op_type") if rows and c in rows[0]), None)
++    if not op_col:
++        return []
++    dur_col = next(
++        (c for c in ("Task Duration(us)", "Duration(us)", "Task Duration (us)") if c in rows[0]),
++        None,
++    )
++    if not dur_col:
++        return []
++    out: list[float] = []
++    for row in rows:
++        if _match_text(row.get(op_col, ""), op_pattern):
++            out.append(float(row[dur_col]))
++    return out
++
++
++def _parse_operator_details(path: str, op_pattern: str) -> list[float]:
++    rows = _read_csv(path)
++    out: list[float] = []
++    for row in rows:
++        name = row.get("Name") or ""
++        if not _match_text(name, op_pattern):
++            continue
++        for col in (
++            "Device Self Duration With AICore(us)",
++            "Device Self Duration(us)",
++            "Device Total Duration With AICore(us)",
++            "Device Total Duration(us)",
++        ):
++            if col in row and row[col]:
++                try:
++                    out.append(float(str(row[col]).strip()))
++                    break
++                except ValueError:
++                    continue
++    return out
++
++
++def _collect_op_types(csvs: dict[str, list[str]]) -> list[str]:
++    types: set[str] = set()
++    for path in csvs.get("kernel_details", []):
++        for row in _read_csv(path):
++            if row.get("Name"):
++                types.add(row["Name"])
++    for path in csvs.get("op_statistic", []):
++        for row in _read_csv(path):
++            if row.get("OP Type"):
++                types.add(row["OP Type"])
++    for path in csvs.get("operator_details", []):
++        for row in _read_csv(path):
++            if row.get("Name"):
++                types.add(row["Name"])
++    for path in csvs.get("op_summary", []):
++        for row in _read_csv(path):
++            for col in ("OP Type", "Op Type"):
++                if row.get(col):
++                    types.add(row[col])
++    return sorted(types)
++
++
++def run_with_msprof(
++    fn: Callable[[], None],
++    name: str,
++    out_dir: str,
++    skip_first: int = 5,
++    warmup: int = 2,
++    active: int = 10,
++    profiler_level: str = "Level1",
++    aic_metrics: str = "PipeUtilization",
++    record_shapes: bool = True,
++    with_stack: bool = False,
++) -> Path:
++    """Run fn (skip_first + warmup + active) times under msprof; return trace root."""
++    target = Path(out_dir) / name
++    target.mkdir(parents=True, exist_ok=True)
++
++    level = getattr(torch_npu.profiler.ProfilerLevel, profiler_level)
++    metrics = getattr(torch_npu.profiler.AiCMetrics, aic_metrics)
++    cfg = torch_npu.profiler._ExperimentalConfig(
++        profiler_level=level,
++        aic_metrics=metrics,
++    )
++    sched = torch_npu.profiler.schedule(
++        wait=0,
++        warmup=warmup,
++        active=active,
++        repeat=1,
++        skip_first=skip_first,
++    )
++
++    try:
++        with torch_npu.profiler.profile(
++            activities=[
++                torch_npu.profiler.ProfilerActivity.CPU,
++                torch_npu.profiler.ProfilerActivity.NPU,
++            ],
++            schedule=sched,
++            experimental_config=cfg,
++            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(target)),
++            record_shapes=record_shapes,
++            with_stack=with_stack,
++        ) as prof:
++            for _ in range(skip_first + warmup + active):
++                fn()
++                prof.step()
++            torch_npu.npu.synchronize()
++    except (TypeError, AttributeError):
++        with torch_npu.profiler.profile(
++            activities=[
++                torch_npu.profiler.ProfilerActivity.CPU,
++                torch_npu.profiler.ProfilerActivity.NPU,
++            ],
++            experimental_config=cfg,
++            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(target)),
++            record_shapes=record_shapes,
++            with_stack=with_stack,
++        ) as prof:
++            for _ in range(skip_first + warmup + active):
++                fn()
++            torch_npu.npu.synchronize()
++
++    return target
++
++
++def list_op_types_in_trace(trace_dir: Path) -> list[str]:
++    """Debug: list all op type names seen in trace CSVs."""
++    return _collect_op_types(_find_profiler_csvs(Path(trace_dir)))
++
++
++def parse_op_summary(
++    trace_dir: Path,
++    op_pattern: str,
++    *,
++    sub_ops_per_call: int | None = None,
++    active_steps: int | None = None,
++) -> dict:
++    """Parse profiler CSVs; fuzzy-match op name against op_pattern."""
++    trace_dir = Path(trace_dir)
++    csvs = _find_profiler_csvs(trace_dir)
++    durations: list[float] = []
++    source = ""
++
++    for path in csvs.get("op_summary", []):
++        d = _parse_op_summary(path, op_pattern)
++        if d:
++            durations = d
++            source = f"op_summary:{path}"
++            break
++
++    if not durations:
++        for path in csvs.get("kernel_details", []):
++            d = _parse_kernel_details(path, op_pattern)
++            if d:
++                durations = d
++                source = f"kernel_details:{path}"
++                break
++
++    if not durations:
++        for path in csvs.get("operator_details", []):
++            d = _parse_operator_details(path, op_pattern)
++            if d:
++                durations = d[-10:] if len(d) > 10 else d
++                source = f"operator_details:{path}"
++                break
++
++    if not durations:
++        avail = _collect_op_types(csvs)
++        types_dump = trace_dir / "op_types_seen.txt"
++        types_dump.write_text("\n".join(avail), encoding="utf-8")
++        raise ValueError(
++            f"no op match {op_pattern!r}; "
++            f"saw {len(avail)} unique op types, dumped to {types_dump}"
++        )
++
++    out = _stats(durations)
++    out["op_pattern"] = op_pattern
++    out["source_csv"] = source
++
++    if sub_ops_per_call and sub_ops_per_call > 1:
++        n = len(durations)
++        steps = active_steps or (n // sub_ops_per_call if n % sub_ops_per_call == 0 else None)
++        if steps and steps > 0 and n >= steps:
++            if n == steps * sub_ops_per_call:
++                per_call = [
++                    sum(durations[i : i + sub_ops_per_call])
++                    for i in range(0, n, sub_ops_per_call)
++                ]
++            else:
++                per_call = [sum(durations) / steps]
++            out = _stats(per_call)
++            out["device_mean_us_per_sub_op"] = sum(durations) / n
++            out["sub_ops_per_call"] = sub_ops_per_call
++            out["op_pattern"] = op_pattern
++            out["source_csv"] = source
++        else:
++            out["device_mean_us_per_sub_op"] = out["device_mean_us"]
++            out["device_mean_us"] = out["device_mean_us"] * sub_ops_per_call
++            out["sub_ops_per_call"] = sub_ops_per_call
++
++    return out
++
++
++def parse_op_summary_multi(trace_dir: Path, patterns: list[str]) -> dict:
++    """Sum device_mean_us across multiple op patterns (e.g. Silu + Mul + DynamicQuant)."""
++    parts = []
++    total = 0.0
++    for p in patterns:
++        s = parse_op_summary(trace_dir, p)
++        parts.append(s)
++        total += s["device_mean_us"]
++    agg = _stats([total])
++    agg["op_pattern"] = "+".join(patterns)
++    agg["sub_ops"] = parts
++    agg["matched_rows"] = sum(p["matched_rows"] for p in parts)
++    return agg
++
++
++def parse_gemm_hw(trace_dir: Path, *, n_active: int, active_steps: int | None = None) -> dict:
++    """Try GroupedMatmul first, then QuantMatmul loop fallback with sub-op scaling."""
++    for pattern in ("GroupedMatmul", "GroupedMatMul", "GroupMatmul"):
++        try:
++            hw = parse_op_summary(trace_dir, pattern)
++            hw["gemm_path"] = "grouped"
++            return hw
++        except ValueError:
++            continue
++
++    for pattern in ("QuantBatchMatmul", "QuantMatmul", "QuantBatchMatMul"):
++        try:
++            hw = parse_op_summary(
++                trace_dir,
++                pattern,
++                sub_ops_per_call=max(n_active, 1),
++                active_steps=active_steps,
++            )
++            hw["gemm_path"] = "loop_quant_matmul"
++            return hw
++        except ValueError:
++            continue
++
++    avail = list_op_types_in_trace(trace_dir)
++    dump = Path(trace_dir) / "op_types_seen.txt"
++    dump.write_text("\n".join(avail), encoding="utf-8")
++    raise ValueError(f"no gemm op match; dumped {len(avail)} types to {dump}")
++
++
++def msprof_kwargs_from_cfg(cfg, msprof_out: str | None = None) -> dict:
++    """Build run_with_msprof kwargs from MoEConfig.msprof + optional CLI override."""
++    m = cfg.msprof
++    return {
++        "out_dir": msprof_out or m.get("out_dir", "./npu_results"),
++        "skip_first": int(m.get("skip_first", 5)),
++        "warmup": int(m.get("warmup", 2)),
++        "active": int(m.get("active", 10)),
++        "profiler_level": str(m.get("profiler_level", "Level1")),
++        "aic_metrics": str(m.get("aic_metrics", "PipeUtilization")),
++        "record_shapes": bool(m.get("record_shapes", True)),
++        "with_stack": bool(m.get("with_stack", False)),
++    }
++
++
++def hw_payload(kind: str, hw: dict, *, cfg=None, trace_dir: Path | None = None, extra: dict | None = None) -> dict:
++    """Standard msprof JSON envelope."""
++    payload = {
++        "kind": kind,
++        "mode": "msprof_hardware_only",
++        "op_pattern": hw.get("op_pattern"),
++        "device_mean_us": hw["device_mean_us"],
++        "device_std_us": hw.get("device_std_us", 0.0),
++        "device_p50_us": hw.get("device_p50_us"),
++        "device_p95_us": hw.get("device_p95_us"),
++        "device_p99_us": hw.get("device_p99_us"),
++        "device_max_us": hw.get("device_max_us"),
++        "device_min_us": hw.get("device_min_us"),
++        "matched_rows": hw.get("matched_rows"),
++        "source_csv": hw.get("source_csv"),
++    }
++    if trace_dir is not None:
++        payload["trace_dir"] = str(trace_dir)
++    if cfg is not None:
++        payload["cfg"] = {
++            "N": cfg.N,
++            "n_active_experts": cfg.n_active_experts,
++            "H": cfg.hidden_size,
++            "I": cfg.moe_intermediate_size,
++        }
++    if extra:
++        payload.update(extra)
++    return payload
+diff --git a/tools/moe_microbench/moe_bench/ops_runner.py b/tools/moe_microbench/moe_bench/ops_runner.py
+new file mode 100644
+index 0000000..e919dca
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/ops_runner.py
+@@ -0,0 +1,254 @@
++# Gate/up chunk order (N7): DSv4-Flash-W8A8 ckpt uses w1=gate, w3=up (gate-first fused as [gate|up] on dim=0).
++# Weight layout: [out, in] per expert (w1/w3: [I,H], fused gate_up: [2I,H], w2/down: [H,I]).
++
++from __future__ import annotations
++
++import importlib
++import itertools
++from typing import Callable, Literal, Tuple
++
++import torch
++import torch.nn.functional as F
++
++from moe_bench.config import MoEConfig
++from moe_bench.synthetic import MoESyntheticTensors
++
++GATE_UP_ORDER = "gate-first"
++
++
++def _out_dtype(cfg: MoEConfig) -> torch.dtype:
++    return {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(cfg.out_dtype, torch.bfloat16)
++
++
++def _squeeze_scale(scale: torch.Tensor) -> torch.Tensor:
++    if scale.dim() == 2 and scale.shape[-1] == 1:
++        return scale.squeeze(-1)
++    return scale
++
++
++def _split_by_group_list(
++    x: torch.Tensor, scale: torch.Tensor, group_list: torch.Tensor
++) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
++    gl_cpu = group_list.cpu().tolist()
++    xs, ss = [], []
++    prev = 0
++    for c in gl_cpu:
++        end = prev + c
++        xs.append(x[prev:end])
++        ss.append(scale[prev:end])
++        prev = end
++    return xs, ss
++
++
++def _grouped_matmul_loop_fallback(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    per_token_scale: torch.Tensor,
++    group_list: torch.Tensor,
++    cfg: MoEConfig,
++) -> torch.Tensor:
++    """Fallback when npu_grouped_matmul unavailable (CANN 161002 on W8A8 M=1)."""
++    gl_cpu = group_list.cpu().tolist()
++    bounds = list(itertools.accumulate(gl_cpu))
++    outs = []
++    prev = 0
++    for e, end in enumerate(bounds):
++        if end == prev:
++            continue
++        outs.append(
++            _quant_matmul(
++                x[prev:end].clone(),
++                weight[e],
++                weight_scale[e],
++                per_token_scale[prev:end].clone(),
++                cfg,
++            )
++        )
++        prev = end
++    return torch.cat(outs, dim=0)
++
++
++def _grouped_matmul(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    per_token_scale: torch.Tensor,
++    group_list: torch.Tensor,
++    cfg: MoEConfig,
++) -> torch.Tensor:
++    import torch_npu
++
++    xs, act_scales = _split_by_group_list(x, per_token_scale, group_list)
++    E = weight.shape[0]
++    ws = [weight[i] for i in range(E)]
++    wss = [_squeeze_scale(weight_scale[i]) for i in range(E)]
++    act_scales_f32 = act_scales
++    act_scales_gmm = [s.to(torch.bfloat16) for s in act_scales_f32]
++    out_dtype = _out_dtype(cfg)
++    gl = group_list.cpu().tolist()
++    try:
++        outs = torch_npu.npu_grouped_matmul(
++            xs,
++            ws,
++            scale=wss,
++            per_token_scale=act_scales_gmm,
++            group_list=torch.tensor(gl, device=x.device, dtype=torch.int64),
++            split_item=3,
++            group_type=0,
++            output_dtype=out_dtype,
++        )
++        if isinstance(outs, list):
++            return torch.cat(outs, dim=0)
++        return outs
++    except RuntimeError:
++        return _grouped_matmul_loop_fallback(x, weight, weight_scale, per_token_scale, group_list, cfg)
++
++
++def _quant_matmul(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    per_token_scale: torch.Tensor,
++    cfg: MoEConfig,
++) -> torch.Tensor:
++    import torch_npu
++
++    w = weight.clone()
++    ws = _squeeze_scale(weight_scale).clone()
++    return torch_npu.npu_quant_matmul(
++        x,
++        w,
++        ws,
++        pertoken_scale=per_token_scale,
++        output_dtype=_out_dtype(cfg),
++    )
++
++
++def run_act_quant(
++    t: MoESyntheticTensors, cfg: MoEConfig, *, pre_dispatch: bool = False
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    import torch_npu
++
++    x = t.x_bf16[: cfg.num_tokens] if pre_dispatch else t.x_bf16
++    return torch_npu.npu_dynamic_quant(x)
++
++
++def run_gemm_up(t: MoESyntheticTensors, cfg: MoEConfig) -> torch.Tensor:
++    return _grouped_matmul(
++        t.x_int8, t.w_gate_up, t.w_gate_up_scale, t.x_scale, t.group_list, cfg
++    )
++
++
++def run_gemm_down(t: MoESyntheticTensors, cfg: MoEConfig) -> torch.Tensor:
++    return _grouped_matmul(
++        t.mid_int8, t.w_down, t.w_down_scale, t.mid_scale, t.group_list, cfg
++    )
++
++
++def _unfused_silu_mul(gate_up_bf16: torch.Tensor) -> torch.Tensor:
++    gate, up = gate_up_bf16.chunk(2, dim=-1)
++    return F.silu(gate) * up
++
++
++def make_silu_mul(
++    cfg: MoEConfig,
++    *,
++    force_fused: bool | None = None,
++) -> Tuple[Callable[[torch.Tensor], torch.Tensor], str]:
++    fused_path = cfg.ops.get("swiglu_fused")
++
++    if force_fused is False:
++        return _unfused_silu_mul, "unfused"
++
++    if force_fused is True:
++        if not fused_path:
++            raise RuntimeError("--fused requested but ops.swiglu_fused is null in yaml")
++        mod_name, fn_name = fused_path.rsplit(".", 1)
++        fn = getattr(importlib.import_module(mod_name), fn_name)
++        return fn, "fused"
++
++    if fused_path:
++        try:
++            mod_name, fn_name = fused_path.rsplit(".", 1)
++            fn = getattr(importlib.import_module(mod_name), fn_name)
++            return fn, "fused"
++        except Exception:
++            pass
++    return _unfused_silu_mul, "unfused"
++
++
++def run_act_quant_mid(
++    t: MoESyntheticTensors, cfg: MoEConfig, mid_bf16: torch.Tensor
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    import torch_npu
++
++    return torch_npu.npu_dynamic_quant(mid_bf16)
++
++
++def run_routed_compute_only(t: MoESyntheticTensors, cfg: MoEConfig) -> torch.Tensor:
++    up = run_gemm_up(t, cfg)
++    mid = _unfused_silu_mul(up)
++    mid_int8, mid_scale = run_act_quant_mid(t, cfg, mid)
++    t.mid_int8 = mid_int8
++    t.mid_scale = mid_scale
++    return run_gemm_down(t, cfg)
++
++
++def run_routed_post_dispatch(t: MoESyntheticTensors, cfg: MoEConfig) -> torch.Tensor:
++    x_int8, x_scale = run_act_quant(t, cfg, pre_dispatch=False)
++    t.x_int8 = x_int8
++    t.x_scale = x_scale
++    return run_routed_compute_only(t, cfg)
++
++
++def run_shared_expert(t: MoESyntheticTensors, cfg: MoEConfig) -> torch.Tensor:
++    import torch_npu
++
++    x = t.x_bf16[: cfg.num_tokens]
++    x_int8, x_scale = torch_npu.npu_dynamic_quant(x)
++    up = _quant_matmul(x_int8, t.w_shared_gate_up, t.w_shared_gate_up_scale, x_scale, cfg)
++    mid = _unfused_silu_mul(up)
++    mid_int8, mid_scale = torch_npu.npu_dynamic_quant(mid)
++    return _quant_matmul(mid_int8, t.w_shared_down, t.w_shared_down_scale, mid_scale, cfg)
++
++
++def make_loop_runner(
++    t: MoESyntheticTensors,
++    cfg: MoEConfig,
++    target: Literal["up", "down"] = "up",
++) -> Callable[[], torch.Tensor | None]:
++    gl_cpu = t.group_list.cpu().tolist()
++    bounds = list(itertools.accumulate(gl_cpu))
++    x_parts: list[torch.Tensor] = []
++    s_parts: list[torch.Tensor] = []
++    prev = 0
++    for end in bounds:
++        if target == "up":
++            x_parts.append(t.x_int8[prev:end].clone())
++            s_parts.append(t.x_scale[prev:end].clone())
++        else:
++            x_parts.append(t.mid_int8[prev:end].clone())
++            s_parts.append(t.mid_scale[prev:end].clone())
++        prev = end
++
++    def loop_fn() -> torch.Tensor | None:
++        outs = []
++        for e, end in enumerate(bounds):
++            if gl_cpu[e] == 0:
++                continue
++            if target == "up":
++                outs.append(
++                    _quant_matmul(
++                        x_parts[e], t.w_gate_up[e], t.w_gate_up_scale[e], s_parts[e], cfg
++                    )
++                )
++            else:
++                outs.append(
++                    _quant_matmul(
++                        x_parts[e], t.w_down[e], t.w_down_scale[e], s_parts[e], cfg
++                    )
++                )
++        return torch.cat(outs, dim=0) if outs else None
++
++    return loop_fn
+diff --git a/tools/moe_microbench/moe_bench/profile.py b/tools/moe_microbench/moe_bench/profile.py
+new file mode 100644
+index 0000000..c463b80
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/profile.py
+@@ -0,0 +1,41 @@
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++
++def maybe_profile(out_dir: str | Path, name: str, fn, *, n_steps: int = 8, warmup: int = 2) -> Path:
++    """N3: schedule + prof.step(); dump 到 OUT_DIR/profile/<name>/."""
++    import torch_npu
++
++    target = Path(out_dir) / name
++    target.mkdir(parents=True, exist_ok=True)
++    try:
++        sched = torch_npu.profiler.schedule(wait=0, warmup=warmup, active=n_steps, repeat=1)
++        with torch_npu.profiler.profile(
++            activities=[
++                torch_npu.profiler.ProfilerActivity.CPU,
++                torch_npu.profiler.ProfilerActivity.NPU,
++            ],
++            schedule=sched,
++            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(target)),
++            record_shapes=True,
++        ) as prof:
++            for _ in range(warmup + n_steps):
++                fn()
++                prof.step()
++            torch_npu.npu.synchronize()
++    except Exception:
++        with torch_npu.profiler.profile(
++            activities=[
++                torch_npu.profiler.ProfilerActivity.CPU,
++                torch_npu.profiler.ProfilerActivity.NPU,
++            ],
++            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(target)),
++            record_shapes=True,
++        ) as prof:
++            for _ in range(warmup + n_steps):
++                fn()
++                prof.step()
++            torch_npu.npu.synchronize()
++    return target
+diff --git a/tools/moe_microbench/moe_bench/report.py b/tools/moe_microbench/moe_bench/report.py
+new file mode 100644
+index 0000000..c2ce6fc
+--- /dev/null
++++ b/tools/moe_microbench/moe_bench/report.py
+@@ -0,0 +1,415 @@
++from __future__ import annotations
++
++import argparse
++import glob
++import json
++import re
++from pathlib import Path
++
++from moe_bench.config import apply_overrides, load_config
++from moe_bench.roofline import lower_bound_us, routed_weight_bytes, shared_weight_bytes, utilizations
++
++
++def _load(path: Path):
++    if not path.exists():
++        return None
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _timing(d):
++    if not d:
++        return {}
++    if isinstance(d, list):
++        return {}
++    return d.get("timing") or d.get("segments", {}).get("post_dispatch") or {}
++
++
++def _mean(d, key="device_mean_us"):
++    t = _timing(d)
++    return t.get(key)
++
++
++def _fmt(v):
++    if v is None:
++        return "-"
++    if isinstance(v, (int, float)):
++        return f"{v:.2f}"
++    return str(v)
++
++
++def _hw_us(obj) -> float | None:
++    if not obj:
++        return None
++    if isinstance(obj.get("device_mean_us"), (int, float)):
++        return obj["device_mean_us"]
++    if obj.get("mode") == "msprof_hardware_only":
++        return obj.get("device_mean_us")
++    if "post_hw" in obj:
++        return obj["post_hw"].get("device_mean_us")
++    if "grouped_hw" in obj:
++        return obj["grouped_hw"].get("device_mean_us")
++    return None
++
++
++def _event_us(data: dict, kind: str) -> float | None:
++    if kind == "act_quant_post":
++        obj = data.get("act_quant_post")
++        if obj is None and isinstance(data.get("act_quant"), list):
++            for item in data["act_quant"]:
++                if item.get("kind") == "act_quant_post":
++                    obj = item
++        return _mean(obj)
++    if kind == "act_quant_pre":
++        obj = data.get("act_quant_pre")
++        if obj is None and isinstance(data.get("act_quant"), list):
++            for item in data.get("act_quant", []):
++                if item.get("kind") == "act_quant_pre":
++                    obj = item
++        return _mean(obj)
++    obj = data.get(kind)
++    return _mean(obj)
++
++
++def _roofline_row(cfg, kind, actual_us):
++    if actual_us is None:
++        return ("-", "-", "-", "-")
++    if kind == "gemm_up":
++        wb, _ = routed_weight_bytes(cfg)
++        u = utilizations(actual_us, wb, cfg)
++    elif kind == "gemm_down":
++        _, wb = routed_weight_bytes(cfg)
++        u = utilizations(actual_us, wb, cfg)
++    elif kind == "routed_full":
++        up_b, dn_b = routed_weight_bytes(cfg)
++        u = utilizations(actual_us, up_b + dn_b, cfg)
++    elif kind == "shared_expert":
++        gu, dn = shared_weight_bytes(cfg)
++        u = utilizations(actual_us, gu + dn, cfg)
++    else:
++        return ("(n/a)", "(n/a)", "(n/a)", "(n/a)")
++    return (_fmt(u["lb_peak_us"]), _fmt(u["util_vs_peak"]), _fmt(u["lb_effective_us"]), _fmt(u["util_vs_achievable"]))
++
++
++def _load_msprof_map(paths: list[str]) -> dict:
++    out = {}
++    for p in paths:
++        obj = _load(Path(p))
++        if not obj:
++            continue
++        kind = obj.get("kind", Path(p).stem.replace("_msprof", ""))
++        out[kind] = obj
++        if kind.startswith("silu_mul"):
++            out["silu_mul_unfused"] = obj
++        if kind == "act_quant":
++            out["act_quant_post_hw"] = obj.get("post_hw")
++            out["act_quant_pre_hw"] = obj.get("pre_hw")
++    return out
++
++
++def _load_event_map(paths: list[str]) -> dict:
++    data = {}
++    for ip in paths:
++        obj = _load(Path(ip))
++        if obj is None:
++            continue
++        if isinstance(obj, list):
++            for item in obj:
++                data[item.get("kind", Path(ip).stem)] = item
++        else:
++            data[obj.get("kind", Path(ip).stem)] = obj
++    return data
++
++
++def _comparison_row(label: str, py_us: float | None, hw_us: float | None) -> dict:
++    if py_us is None or hw_us is None:
++        return {"segment": label, "python_event_us": py_us, "msprof_device_us": hw_us}
++    overhead = py_us - hw_us
++    pct = (overhead / py_us * 100) if py_us > 0 else 0.0
++    return {
++        "segment": label,
++        "python_event_us": py_us,
++        "msprof_device_us": hw_us,
++        "launch_overhead_us": overhead,
++        "overhead_pct": pct,
++    }
++
++
++def _comparison_mode(args) -> str:
++    cfg = load_config(args.config)
++    msprof = _load_msprof_map(args.msprof_jsons or [])
++    events = _load_event_map(args.event_jsons or [])
++
++    rows = [
++        _comparison_row("act_quant_post", _event_us(events, "act_quant_post"), _hw_us(msprof.get("act_quant", {}).get("post_hw") if msprof.get("act_quant") else msprof.get("act_quant_post_hw"))),
++        _comparison_row("act_quant_pre", _event_us(events, "act_quant_pre"), _hw_us(msprof.get("act_quant", {}).get("pre_hw") if msprof.get("act_quant") else msprof.get("act_quant_pre_hw"))),
++        _comparison_row("gemm_up", _mean(events.get("gemm_up")), _hw_us(msprof.get("gemm_up"))),
++        _comparison_row("silu_mul", _mean(events.get("silu_mul_unfused")) or _mean(events.get("silu_mul_unfused")), _hw_us(msprof.get("silu_mul_unfused"))),
++        _comparison_row("gemm_down", _mean(events.get("gemm_down")), _hw_us(msprof.get("gemm_down"))),
++        _comparison_row("routed_full", _mean(events.get("routed_full")), msprof.get("routed_full", {}).get("device_mean_us")),
++        _comparison_row("shared_expert", _mean(events.get("shared_expert")), _hw_us(msprof.get("shared_expert"))),
++    ]
++
++    lines = [
++        "# msprof vs Python Event Comparison (MoE)",
++        "",
++        "> Python Event = eager end-to-end per op call (D4)",
++        "> msprof device time = NPU hardware kernel time (Level1, D5)",
++        "> 两者差额 = launch overhead",
++        "",
++        "## Launch Overhead 拆解",
++        "",
++        "| segment | python_event_us | msprof_device_us | launch_overhead_us | overhead_pct |",
++        "|---------|-----------------|------------------|--------------------|--------------|",
++    ]
++    for r in rows:
++        if r.get("python_event_us") is None and r.get("msprof_device_us") is None:
++            continue
++        lines.append(
++            f"| {r['segment']} | {_fmt(r.get('python_event_us'))} | {_fmt(r.get('msprof_device_us'))} | "
++            f"{_fmt(r.get('launch_overhead_us'))} | {_fmt(r.get('overhead_pct'))}% |"
++        )
++
++    lines += [
++        "",
++        "## Roofline 对照 (硬件层, measured @ {:.2f} TB/s)".format(cfg.roofline_hbm_effective_tb_s),
++        "",
++        "| segment | device_us (hw) | lb @ measured | util_vs_measured |",
++        "|---------|----------------|---------------|------------------|",
++    ]
++    roof = [
++        ("gemm_up", _hw_us(msprof.get("gemm_up")), routed_weight_bytes(cfg)[0]),
++        ("gemm_down", _hw_us(msprof.get("gemm_down")), routed_weight_bytes(cfg)[1]),
++        ("shared_expert", _hw_us(msprof.get("shared_expert")), sum(shared_weight_bytes(cfg))),
++    ]
++    for name, hw, wb in roof:
++        lb = lower_bound_us(wb, cfg.roofline_hbm_effective_tb_s)
++        util = (lb / hw * 100) if hw and hw > 0 else None
++        lines.append(f"| {name} | {_fmt(hw)} | {_fmt(lb)} | {_fmt(util)}% |")
++
++    gvl = msprof.get("grouped_vs_loop")
++    if gvl:
++        up = next((r for r in gvl.get("results", []) if r.get("target") == "up"), gvl)
++        py_g = events.get("grouped_vs_loop", {}).get("results", [{}])[0].get("grouped", {}).get("device_mean_us")
++        py_l = events.get("grouped_vs_loop", {}).get("results", [{}])[0].get("loop", {}).get("device_mean_us")
++        hw_g = up.get("grouped_hw", {}).get("device_mean_us")
++        hw_l = up.get("loop_hw", {}).get("device_mean_us")
++        lines += [
++            "",
++            "## Grouped vs Loop 硬件层确认 (D4 谜团)",
++            "",
++            "| path | python_event_us | hw_device_us | overhead_us | overhead_pct |",
++            "|------|-----------------|--------------|-------------|--------------|",
++        ]
++        for label, py, hw in (("grouped", py_g, hw_g), ("loop", py_l, hw_l)):
++            row = _comparison_row(label, py, hw)
++            lines.append(
++                f"| {label} | {_fmt(row.get('python_event_us'))} | {_fmt(row.get('msprof_device_us'))} | "
++                f"{_fmt(row.get('launch_overhead_us'))} | {_fmt(row.get('overhead_pct'))}% |"
++            )
++        if hw_g and hw_l:
++            if hw_g <= hw_l * 1.15:
++                verdict = "hw_grouped ≈ hw_loop：差异主要来自 grouped fallback 的 Python 路径开销"
++            elif hw_g > hw_l * 1.5:
++                verdict = "hw_grouped > hw_loop × 1.5：NPU kernel 层面 grouped 实现欠优化"
++            else:
++                verdict = "hw 层有一定差距，Python overhead 与 kernel 差异并存"
++            lines += ["", f"判定: {verdict}"]
++
++    lines += [
++        "",
++        "## 顶部速览 (overhead_pct)",
++    ]
++    for r in rows:
++        if r.get("overhead_pct") is not None:
++            lines.append(f"- {r['segment']}: {r['overhead_pct']:.1f}%")
++
++    gd = _hw_us(msprof.get("gemm_down"))
++    _, wb_dn = routed_weight_bytes(cfg)
++    lb_dn = lower_bound_us(wb_dn, cfg.roofline_hbm_effective_tb_s)
++    util_dn = (lb_dn / gd) if gd and gd > 0 else None
++    if util_dn is not None:
++        if util_dn > 0.8:
++            gd_verdict = "gemm_down 真打满带宽"
++        elif util_dn < 0.5:
++            gd_verdict = "D4 Event 99.78% 含大量 Python overhead，硬件 util 远低于 Event 报数"
++        else:
++            gd_verdict = "gemm_down 中等 util，Event 与硬件层均有优化空间"
++        lines += ["", f"gemm_down util_vs_measured = {util_dn*100:.1f}% (D4 Event util_eff=99.78%)；判定: {gd_verdict}"]
++
++    return "\n".join(lines) + "\n"
++
++
++def _msprof_n_active_sweep(args) -> str:
++    cfg = load_config(args.config)
++    by_na: dict[int, dict] = {}
++    for p in args.inputs:
++        m = re.search(r"_n(\d+)\.json$", p)
++        if not m:
++            continue
++        na = int(m.group(1))
++        obj = _load(Path(p))
++        if not obj:
++            continue
++        kind = obj.get("kind", "").replace("_msprof", "")
++        by_na.setdefault(na, {})[kind] = obj
++
++    lines = [
++        "# msprof n_active sweep (hardware only)",
++        "",
++        "| n_active | gemm_up_hw | gemm_up_util | gemm_down_hw | gemm_down_util | routed_full_hw |",
++        "|---------:|-----------:|-------------:|-------------:|---------------:|---------------:|",
++    ]
++    for na in sorted(by_na):
++        scfg = apply_overrides(cfg, n_active_experts=na)
++        up_b, dn_b = routed_weight_bytes(scfg)
++        lb_up = lower_bound_us(up_b, scfg.roofline_hbm_effective_tb_s)
++        lb_dn = lower_bound_us(dn_b, scfg.roofline_hbm_effective_tb_s)
++        up_hw = _hw_us(by_na[na].get("gemm_up"))
++        dn_hw = _hw_us(by_na[na].get("gemm_down"))
++        rf_hw = by_na[na].get("routed_full", {}).get("device_mean_us")
++        up_util = (lb_up / up_hw * 100) if up_hw else None
++        dn_util = (lb_dn / dn_hw * 100) if dn_hw else None
++        lines.append(
++            f"| {na} | {_fmt(up_hw)} | {_fmt(up_util)}% | {_fmt(dn_hw)} | {_fmt(dn_util)}% | {_fmt(rf_hw)} |"
++        )
++    lines += ["", "> act_quant(pre) 不随 n_active 变化（固定 [num_tokens, H]）。"]
++    return "\n".join(lines) + "\n"
++
++
++def _summary_mode(args) -> str:
++    cfg = load_config(args.config)
++    data = {}
++    for ip in args.inputs:
++        obj = _load(Path(ip))
++        if obj is None:
++            continue
++        if isinstance(obj, list):
++            for item in obj:
++                data[item.get("kind", Path(ip).stem)] = item
++        else:
++            data[obj.get("kind", Path(ip).stem)] = obj
++
++    lines = [
++        "# NPU MoE Microbench Summary",
++        "",
++        "> 仅 NPU 段，不含 gating / dispatch / combine / CPU MoE。",
++        "",
++        "| segment | dev_mean_us | p99 | host_mean_us | dispatch_overhead_us | lb_peak | util_peak | lb_eff | util_eff |",
++        "|---------|-------------|-----|--------------|----------------------|---------|-----------|--------|----------|",
++    ]
++
++    rows = [
++        ("act_quant_post", data.get("act_quant_post")),
++        ("act_quant_pre", data.get("act_quant_pre")),
++        ("gemm_up", data.get("gemm_up")),
++    ]
++    silu_keys = [k for k in data if k.startswith("silu_mul")]
++    for k in sorted(silu_keys):
++        rows.append((k, data[k]))
++    rows += [
++        ("gemm_down", data.get("gemm_down")),
++        ("routed_full", data.get("routed_full")),
++        ("shared_expert", data.get("shared_expert")),
++    ]
++
++    for kind, obj in rows:
++        if not obj:
++            continue
++        t = _timing(obj)
++        lb_p, u_p, lb_e, u_e = ("(n/a)", "(n/a)", "(n/a)", "(n/a)") if "act_quant" in kind or "silu" in kind else _roofline_row(cfg, kind.replace("_post", "").replace("_pre", ""), t.get("device_mean_us"))
++        if kind == "routed_full":
++            lb_p, u_p, lb_e, u_e = _roofline_row(cfg, "routed_full", t.get("device_mean_us"))
++        dispatch = t.get("dispatch_overhead_us", (t.get("host_mean_us") or 0) - (t.get("device_mean_us") or 0))
++        lines.append(
++            f"| {kind} | {_fmt(t.get('device_mean_us'))} | {_fmt(t.get('device_p99_us'))} | "
++            f"{_fmt(t.get('host_mean_us'))} | {_fmt(dispatch)} | {lb_p} | {u_p} | {lb_e} | {u_e} |"
++        )
++
++    rf = data.get("routed_full")
++    if rf and "derived" in rf:
++        d = rf["derived"]
++        lines += [
++            "",
++            f"- routed_full_compute_only_us: **{d.get('routed_full_compute_only_us', '-')}**",
++            f"- routed_full_post_dispatch_us: **{d.get('routed_full_post_dispatch_us', '-')}**",
++        ]
++
++    gvl = data.get("grouped_vs_loop")
++    if gvl:
++        lines += ["", "### Grouped vs Loop (S2)", "", "| target | grouped_us | loop_us | grouped_dispatch | loop_dispatch |", "|--------|------------|---------|------------------|---------------|"]
++        for r in gvl.get("results", []):
++            g, l = r.get("grouped", {}), r.get("loop", {})
++            lines.append(
++                f"| {r.get('target')} | {_fmt(g.get('device_mean_us'))} | {_fmt(l.get('device_mean_us'))} | "
++                f"{_fmt(g.get('dispatch_overhead_us'))} | {_fmt(l.get('dispatch_overhead_us'))} |"
++            )
++
++    sweep_dir = Path(args.sweep_dir) if args.sweep_dir else None
++    if sweep_dir and sweep_dir.exists():
++        lines += ["", "### n_active sweep (A5)", "", "| n_active | tpe | N | gemm_up_us | gemm_down_us | routed_full_us | util_eff |", "|---------:|----:|--:|-----------:|-------------:|---------------:|---------:|"]
++        for na in cfg.sweep_n_active:
++            sp = sweep_dir / f"n_active_{na}" / "routed_full.json"
++            gp = sweep_dir / f"n_active_{na}" / "gemm_up.json"
++            dp = sweep_dir / f"n_active_{na}" / "gemm_down.json"
++            ro = _load(sp); go = _load(gp); do = _load(dp)
++            n = na * cfg.tokens_per_expert
++            scfg = apply_overrides(cfg, n_active_experts=na)
++            up_b, dn_b = routed_weight_bytes(scfg)
++            rf_us = _mean(ro)
++            u_eff = utilizations(rf_us, up_b + dn_b, scfg)["util_vs_achievable"] if rf_us else None
++            lines.append(
++                f"| {na} | {cfg.tokens_per_expert} | {n} | {_fmt(_mean(go))} | {_fmt(_mean(do))} | {_fmt(rf_us)} | {_fmt(u_eff)} |"
++            )
++        lines += ["", "> act_quant(pre) 不随 n_active 变化（固定 [num_tokens, H]）。"]
++
++    lines += [
++        "",
++        "> ⚠ **shared_expert ‖ routed_full 并行** (A8)：端到端 ≈ max(shared, routed)，不能相加。",
++        "> ⚠ **util_vs_achievable > 0.75** 算打满 (N4)；表中 util_eff 列即 util_vs_achievable。",
++        "> ⚠ **act_quant pre vs post** (N5)：post 是上限；pre ≈ post / n_active。",
++        "",
++        "### HBM 带宽实测 (N4)",
++        f"- hbm_peak_tb_s = {cfg.roofline_hbm_peak_tb_s}",
++        f"- hbm_effective_tb_s = {cfg.roofline_hbm_effective_tb_s}",
++        "",
++        "### FP4 vs W8 roofline (N8)",
++        "| path | routed weight | @peak 1.6TB/s | @eff 1.0TB/s |",
++        "|------|---------------|--------------|--------------|",
++        "| W8 (本计划, n_active=6) | 144 MB | 90 μs | 144 μs |",
++        "| FP4 (论文估计) | ~76 MB | ~48 μs | ~76 μs |",
++        "| gap | ~1.9× HBM traffic | | |",
++    ]
++    return "\n".join(lines) + "\n"
++
++
++def main(argv=None) -> int:
++    p = argparse.ArgumentParser()
++    p.add_argument("--mode", choices=("summary", "comparison", "msprof-n-active-sweep"), default="summary")
++    p.add_argument("--inputs", nargs="+", default=None)
++    p.add_argument("--out", type=str, required=True)
++    p.add_argument("--config", type=str, default=None)
++    p.add_argument("--sweep-dir", type=str, default="")
++    p.add_argument("--msprof-jsons", nargs="+", default=None)
++    p.add_argument("--event-jsons", nargs="+", default=None)
++    args = p.parse_args(argv)
++
++    if args.mode == "comparison":
++        text = _comparison_mode(args)
++    elif args.mode == "msprof-n-active-sweep":
++        if not args.inputs:
++            raise SystemExit("msprof-n-active-sweep requires --inputs")
++        text = _msprof_n_active_sweep(args)
++    else:
++        if not args.inputs:
++            raise SystemExit("summary mode requires --inputs")
++        text = _summary_mode(args)
++
++    out = Path(args.out)
++    out.parent.mkdir(parents=True, exist_ok=True)
++    out.write_text(text, encoding="utf-8")
++    print(text)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

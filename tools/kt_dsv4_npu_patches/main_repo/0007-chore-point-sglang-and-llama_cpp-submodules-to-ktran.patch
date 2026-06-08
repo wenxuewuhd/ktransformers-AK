@@ -1,0 +1,29 @@
+From 19d64a60da2f5d476895cc91cd9e0070bb21968b Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Thu, 14 May 2026 04:50:31 +0000
+Subject: [PATCH 07/13] chore: point sglang and llama.cpp submodules to
+ ktransformers forks
+
+
+diff --git a/.gitmodules b/.gitmodules
+index bafecaf..7e9dc4e 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -1,6 +1,6 @@
+ [submodule "third_party/llama.cpp"]
+ 	path = third_party/llama.cpp
+-	url = https://github.com/ggerganov/llama.cpp.git
++	url = ssh://git@codehub-dg-y.huawei.com:2222/src-device-chipset/llama-cpp-kt.git
+ [submodule "third_party/pybind11"]
+ 	path = third_party/pybind11
+ 	url = https://github.com/pybind/pybind11.git
+@@ -10,5 +10,5 @@
+ 	branch = fix-precision-mla-merge-main
+ [submodule "third_party/sglang"]
+ 	path = third_party/sglang
+-	url = https://github.com/iforgetmyname/sglang.git
++	url = ssh://git@codehub-dg-y.huawei.com:2222/src-device-chipset/sglang-dsv4-npu.git
+ 	branch = dsv4_release
+-- 
+2.34.1
+

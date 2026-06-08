@@ -1,0 +1,2343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 11/13] feat(attn_microbench): add SWA/CSA/HCA decode profiling (part 4/5)
+
+diff --git a/tools/attn_microbench/results/diag_seq_scaling.json b/tools/attn_microbench/results/diag_seq_scaling.json
+new file mode 100644
+index 0000000..be1cf20
+--- /dev/null
++++ b/tools/attn_microbench/results/diag_seq_scaling.json
+@@ -0,0 +1,266 @@
++{
++  "warmup": 30,
++  "repeat": 100,
++  "note": "indexer/SWA timed independently; see device_std_us in each block",
++  "results": [
++    {
++      "test": "seq_sweep",
++      "seq_len": 1024,
++      "c4_cols": 256,
++      "c4_pages": 2,
++      "seqused_kv": 1024,
++      "indexer_us": {
++        "device_mean_us": 250.33999904990196,
++        "device_p50_us": 245.4099953174591,
++        "device_p95_us": 264.890992641449,
++        "device_p99_us": 280.65878778696134,
++        "device_max_us": 425.08000135421753,
++        "device_std_us": 19.394100446190354,
++        "host_mean_us": 352.2402048110962,
++        "mean_us": 250.33999904990196,
++        "p50_us": 245.4099953174591,
++        "p99_us": 280.65878778696134,
++        "n": 100
++      },
++      "swa_attn_us": {
++        "device_mean_us": 129.24499936401844,
++        "device_p50_us": 127.34999507665634,
++        "device_p95_us": 138.57799991965294,
++        "device_p99_us": 143.02379444241527,
++        "device_max_us": 147.35999703407288,
++        "device_std_us": 5.058163852130889,
++        "host_mean_us": 220.74298933148384,
++        "mean_us": 129.24499936401844,
++        "p50_us": 127.34999507665634,
++        "p99_us": 143.02379444241527,
++        "n": 100
++      },
++      "indexer_summary": "250.3 \u00b1 19.4 (p95=264.9, n=100)",
++      "swa_summary": "129.2 \u00b1 5.1 (p95=138.6, n=100)"
++    },
++    {
++      "test": "seq_sweep",
++      "seq_len": 4096,
++      "c4_cols": 1024,
++      "c4_pages": 8,
++      "seqused_kv": 4096,
++      "indexer_us": {
++        "device_mean_us": 251.67859986424446,
++        "device_p50_us": 251.86999142169952,
++        "device_p95_us": 262.2879907488823,
++        "device_p99_us": 271.57138615846634,
++        "device_max_us": 274.6799886226654,
++        "device_std_us": 6.82991520791973,
++        "host_mean_us": 346.84548154473305,
++        "mean_us": 251.67859986424446,
++        "p50_us": 251.86999142169952,
++        "p99_us": 271.57138615846634,
++        "n": 100
++      },
++      "swa_attn_us": {
++        "device_mean_us": 127.84760028123856,
++        "device_p50_us": 126.04999542236328,
++        "device_p95_us": 139.44199979305267,
++        "device_p99_us": 140.20420655608177,
++        "device_max_us": 142.59999990463257,
++        "device_std_us": 5.0305741083544095,
++        "host_mean_us": 218.86891685426235,
++        "mean_us": 127.84760028123856,
++        "p50_us": 126.04999542236328,
++        "p99_us": 140.20420655608177,
++        "n": 100
++      },
++      "indexer_summary": "251.7 \u00b1 6.8 (p95=262.3, n=100)",
++      "swa_summary": "127.8 \u00b1 5.0 (p95=139.4, n=100)"
++    },
++    {
++      "test": "seq_sweep",
++      "seq_len": 8192,
++      "c4_cols": 2048,
++      "c4_pages": 16,
++      "seqused_kv": 8192,
++      "indexer_us": {
++        "device_mean_us": 251.2395991384983,
++        "device_p50_us": 250.74999034404755,
++        "device_p95_us": 260.64399778842926,
++        "device_p99_us": 263.9244142174721,
++        "device_max_us": 268.3199942111969,
++        "device_std_us": 6.06437007414869,
++        "host_mean_us": 346.0947144776583,
++        "mean_us": 251.2395991384983,
++        "p50_us": 250.74999034404755,
++        "p99_us": 263.9244142174721,
++        "n": 100
++      },
++      "swa_attn_us": {
++        "device_mean_us": 128.61580036580563,
++        "device_p50_us": 126.53999775648117,
++        "device_p95_us": 137.30200231075287,
++        "device_p99_us": 143.02020654082298,
++        "device_max_us": 145.019993185997,
++        "device_std_us": 4.770658985751738,
++        "host_mean_us": 218.992717564106,
++        "mean_us": 128.61580036580563,
++        "p50_us": 126.53999775648117,
++        "p99_us": 143.02020654082298,
++        "n": 100
++      },
++      "indexer_summary": "251.2 \u00b1 6.1 (p95=260.6, n=100)",
++      "swa_summary": "128.6 \u00b1 4.8 (p95=137.3, n=100)"
++    },
++    {
++      "test": "seq_sweep",
++      "seq_len": 16384,
++      "c4_cols": 4096,
++      "c4_pages": 32,
++      "seqused_kv": 16384,
++      "indexer_us": {
++        "device_mean_us": 240.51219999790192,
++        "device_p50_us": 240.9999966621399,
++        "device_p95_us": 250.68199932575226,
++        "device_p99_us": 253.1214076280594,
++        "device_max_us": 255.23999333381653,
++        "device_std_us": 18.94420936571477,
++        "host_mean_us": 336.2043108791113,
++        "mean_us": 240.51219999790192,
++        "p50_us": 240.9999966621399,
++        "p99_us": 253.1214076280594,
++        "n": 100
++      },
++      "swa_attn_us": {
++        "device_mean_us": 124.00360018014908,
++        "device_p50_us": 123.16999956965446,
++        "device_p95_us": 131.45499974489212,
++        "device_p99_us": 140.10960221290588,
++        "device_max_us": 141.0599946975708,
++        "device_std_us": 3.6246910482029175,
++        "host_mean_us": 212.842533364892,
++        "mean_us": 124.00360018014908,
++        "p50_us": 123.16999956965446,
++        "p99_us": 140.10960221290588,
++        "n": 100
++      },
++      "indexer_summary": "240.5 \u00b1 18.9 (p95=250.7, n=100)",
++      "swa_summary": "124.0 \u00b1 3.6 (p95=131.5, n=100)"
++    },
++    {
++      "test": "seq_sweep",
++      "seq_len": 32768,
++      "c4_cols": 8192,
++      "c4_pages": 64,
++      "seqused_kv": 32768,
++      "indexer_us": {
++        "device_mean_us": 244.4931997358799,
++        "device_p50_us": 243.73000115156174,
++        "device_p95_us": 256.4209893345833,
++        "device_p99_us": 259.07799541950226,
++        "device_max_us": 260.85999608039856,
++        "device_std_us": 4.613637708446146,
++        "host_mean_us": 337.6828320324421,
++        "mean_us": 244.4931997358799,
++        "p50_us": 243.73000115156174,
++        "p99_us": 259.07799541950226,
++        "n": 100
++      },
++      "swa_attn_us": {
++        "device_mean_us": 124.05780017375946,
++        "device_p50_us": 123.52000176906586,
++        "device_p95_us": 127.60400250554083,
++        "device_p99_us": 137.41680383682254,
++        "device_max_us": 141.0599946975708,
++        "device_std_us": 3.1074310020377727,
++        "host_mean_us": 211.83080039918423,
++        "mean_us": 124.05780017375946,
++        "p50_us": 123.52000176906586,
++        "p99_us": 137.41680383682254,
++        "n": 100
++      },
++      "indexer_summary": "244.5 \u00b1 4.6 (p95=256.4, n=100)",
++      "swa_summary": "124.1 \u00b1 3.1 (p95=127.6, n=100)"
++    },
++    {
++      "test": "extreme_seqused_kv",
++      "label": "baseline",
++      "seq_len": 32768,
++      "seqused_kv": 32768,
++      "c4_cols": 8192,
++      "indexer_us": {
++        "device_mean_us": 244.38000082969666,
++        "device_p50_us": 243.69000643491745,
++        "device_p95_us": 252.8419941663742,
++        "device_p99_us": 260.84039866924286,
++        "device_max_us": 260.8799934387207,
++        "device_std_us": 3.7688042336647802,
++        "host_mean_us": 337.71813847124577,
++        "mean_us": 244.38000082969666,
++        "p50_us": 243.69000643491745,
++        "p99_us": 260.84039866924286,
++        "n": 100
++      },
++      "indexer_summary": "244.4 \u00b1 3.8 (p95=252.8, n=100)"
++    },
++    {
++      "test": "extreme_seqused_kv",
++      "label": "extreme_128",
++      "seq_len": 32768,
++      "seqused_kv": 128,
++      "c4_cols": 8192,
++      "indexer_us": {
++        "device_mean_us": 240.83240032196045,
++        "device_p50_us": 240.0899976491928,
++        "device_p95_us": 247.26299345493317,
++        "device_p99_us": 252.51500040292743,
++        "device_max_us": 255.9800148010254,
++        "device_std_us": 3.255925121189987,
++        "host_mean_us": 333.1476729363203,
++        "mean_us": 240.83240032196045,
++        "p50_us": 240.0899976491928,
++        "p99_us": 252.51500040292743,
++        "n": 100
++      },
++      "indexer_summary": "240.8 \u00b1 3.3 (p95=247.3, n=100)"
++    },
++    {
++      "test": "key_len_variant",
++      "label": "token_len",
++      "seq_len": 32768,
++      "actual_seq_lengths_key": 32768,
++      "c4_cols": 8192,
++      "indexer_us": {
++        "device_mean_us": 242.71760046482086,
++        "device_p50_us": 242.15999990701675,
++        "device_p95_us": 246.09599858522412,
++        "device_p99_us": 257.7131989598274,
++        "device_max_us": 261.00000739097595,
++        "device_std_us": 3.7453209699533594,
++        "host_mean_us": 335.0669052451849,
++        "mean_us": 242.71760046482086,
++        "p50_us": 242.15999990701675,
++        "p99_us": 257.7131989598274,
++        "n": 100
++      },
++      "indexer_summary": "242.7 \u00b1 3.7 (p95=246.1, n=100)"
++    },
++    {
++      "test": "key_len_variant",
++      "label": "c4_len",
++      "seq_len": 32768,
++      "actual_seq_lengths_key": 8192,
++      "c4_cols": 8192,
++      "indexer_us": {
++        "device_mean_us": 242.84940004348755,
++        "device_p50_us": 241.93000048398972,
++        "device_p95_us": 250.950987637043,
++        "device_p99_us": 258.54940444231033,
++        "device_max_us": 259.4799995422363,
++        "device_std_us": 3.7325490383701263,
++        "host_mean_us": 335.1636417210102,
++        "mean_us": 242.84940004348755,
++        "p50_us": 241.93000048398972,
++        "p99_us": 258.54940444231033,
++        "n": 100
++      },
++      "indexer_summary": "242.8 \u00b1 3.7 (p95=251.0, n=100)"
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/diag_seq_scaling_p1.json b/tools/attn_microbench/results/diag_seq_scaling_p1.json
+new file mode 100644
+index 0000000..863dd09
+--- /dev/null
++++ b/tools/attn_microbench/results/diag_seq_scaling_p1.json
+@@ -0,0 +1,227 @@
++{
++  "scenario": "seq_sweep",
++  "warmup": 30,
++  "repeat": 100,
++  "results": [
++    {
++      "test": "seq_sweep",
++      "seq_len": 1024,
++      "c4_cols": 256,
++      "c4_pages": 2,
++      "seqused_kv": 1024,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": null,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 290.81499844789505,
++        "device_mean_us": 290.81499844789505,
++        "device_p50_us": 289.9099886417389,
++        "device_p95_us": 303.0020132660866,
++        "device_p99_us": 314.92498904466635,
++        "device_max_us": 323.3399987220764,
++        "device_std_us": 7.796667477232917,
++        "host_mean_us": 399.95494298636913,
++        "mean_us": 290.81499844789505,
++        "p50_us": 289.9099886417389,
++        "p99_us": 314.92498904466635,
++        "n": 100
++      },
++      "indexer_summary": "290.8 \u00b1 7.8 (p95=303.0, n=100)",
++      "swa_attn_us": {
++        "mean": 151.9109995663166,
++        "device_mean_us": 151.9109995663166,
++        "device_p50_us": 150.66000074148178,
++        "device_p95_us": 161.8700034916401,
++        "device_p99_us": 165.60900181531906,
++        "device_max_us": 166.5000021457672,
++        "device_std_us": 5.446639580058859,
++        "host_mean_us": 251.9138716161251,
++        "mean_us": 151.9109995663166,
++        "p50_us": 150.66000074148178,
++        "p99_us": 165.60900181531906,
++        "n": 100
++      },
++      "swa_summary": "151.9 \u00b1 5.4 (p95=161.9, n=100)"
++    },
++    {
++      "test": "seq_sweep",
++      "seq_len": 4096,
++      "c4_cols": 1024,
++      "c4_pages": 8,
++      "seqused_kv": 4096,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": null,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 296.6720014810562,
++        "device_mean_us": 296.6720014810562,
++        "device_p50_us": 295.23999989032745,
++        "device_p95_us": 311.3850072026253,
++        "device_p99_us": 324.06179308891296,
++        "device_max_us": 324.2399990558624,
++        "device_std_us": 8.17071035013021,
++        "host_mean_us": 398.77203293144703,
++        "mean_us": 296.6720014810562,
++        "p50_us": 295.23999989032745,
++        "p99_us": 324.06179308891296,
++        "n": 100
++      },
++      "indexer_summary": "296.7 \u00b1 8.2 (p95=311.4, n=100)",
++      "swa_attn_us": {
++        "mean": 152.8860005736351,
++        "device_mean_us": 152.8860005736351,
++        "device_p50_us": 151.24999731779099,
++        "device_p95_us": 165.46699330210686,
++        "device_p99_us": 168.7030026316643,
++        "device_max_us": 174.94000494480133,
++        "device_std_us": 6.251208010696104,
++        "host_mean_us": 252.10823863744736,
++        "mean_us": 152.8860005736351,
++        "p50_us": 151.24999731779099,
++        "p99_us": 168.7030026316643,
++        "n": 100
++      },
++      "swa_summary": "152.9 \u00b1 6.3 (p95=165.5, n=100)"
++    },
++    {
++      "test": "seq_sweep",
++      "seq_len": 8192,
++      "c4_cols": 2048,
++      "c4_pages": 16,
++      "seqused_kv": 8192,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": null,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 299.40839916467667,
++        "device_mean_us": 299.40839916467667,
++        "device_p50_us": 300.27998983860016,
++        "device_p95_us": 309.2079892754555,
++        "device_p99_us": 318.18379759788513,
++        "device_max_us": 320.54001092910767,
++        "device_std_us": 6.51399751058084,
++        "host_mean_us": 401.48074738681316,
++        "mean_us": 299.40839916467667,
++        "p50_us": 300.27998983860016,
++        "p99_us": 318.18379759788513,
++        "n": 100
++      },
++      "indexer_summary": "299.4 \u00b1 6.5 (p95=309.2, n=100)",
++      "swa_attn_us": {
++        "mean": 153.7376007437706,
++        "device_mean_us": 153.7376007437706,
++        "device_p50_us": 151.83000266551971,
++        "device_p95_us": 165.1859976351261,
++        "device_p99_us": 171.68460592627525,
++        "device_max_us": 174.1199940443039,
++        "device_std_us": 6.001513305930277,
++        "host_mean_us": 254.20978665351868,
++        "mean_us": 153.7376007437706,
++        "p50_us": 151.83000266551971,
++        "p99_us": 171.68460592627525,
++        "n": 100
++      },
++      "swa_summary": "153.7 \u00b1 6.0 (p95=165.2, n=100)"
++    },
++    {
++      "test": "seq_sweep",
++      "seq_len": 16384,
++      "c4_cols": 4096,
++      "c4_pages": 32,
++      "seqused_kv": 16384,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": null,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 288.44640016555786,
++        "device_mean_us": 288.44640016555786,
++        "device_p50_us": 287.4799966812134,
++        "device_p95_us": 298.853999376297,
++        "device_p99_us": 305.76120138168335,
++        "device_max_us": 309.83999371528625,
++        "device_std_us": 5.228356532083683,
++        "host_mean_us": 387.9486210644245,
++        "mean_us": 288.44640016555786,
++        "p50_us": 287.4799966812134,
++        "p99_us": 305.76120138168335,
++        "n": 100
++      },
++      "indexer_summary": "288.4 \u00b1 5.2 (p95=298.9, n=100)",
++      "swa_attn_us": {
++        "mean": 185.8653998374939,
++        "device_mean_us": 185.8653998374939,
++        "device_p50_us": 190.22000581026077,
++        "device_p95_us": 204.5499950647354,
++        "device_p99_us": 215.74899524450302,
++        "device_max_us": 216.63999557495117,
++        "device_std_us": 17.29456504704333,
++        "host_mean_us": 311.9190502911806,
++        "mean_us": 185.8653998374939,
++        "p50_us": 190.22000581026077,
++        "p99_us": 215.74899524450302,
++        "n": 100
++      },
++      "swa_summary": "185.9 \u00b1 17.3 (p95=204.5, n=100)"
++    },
++    {
++      "test": "seq_sweep",
++      "seq_len": 32768,
++      "c4_cols": 8192,
++      "c4_pages": 64,
++      "seqused_kv": 32768,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": null,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 294.02799904346466,
++        "device_mean_us": 294.02799904346466,
++        "device_p50_us": 292.50000417232513,
++        "device_p95_us": 308.26100409030914,
++        "device_p99_us": 312.8088045120242,
++        "device_max_us": 369.1200017929077,
++        "device_std_us": 9.251210409651263,
++        "host_mean_us": 399.0794811397791,
++        "mean_us": 294.02799904346466,
++        "p50_us": 292.50000417232513,
++        "p99_us": 312.8088045120242,
++        "n": 100
++      },
++      "indexer_summary": "294.0 \u00b1 9.3 (p95=308.3, n=100)",
++      "swa_attn_us": {
++        "mean": 153.6635997891426,
++        "device_mean_us": 153.6635997891426,
++        "device_p50_us": 152.75999903678894,
++        "device_p95_us": 167.60299429297447,
++        "device_p99_us": 171.1649976670742,
++        "device_max_us": 171.66000604629517,
++        "device_std_us": 6.4062790485628796,
++        "host_mean_us": 258.69897566735744,
++        "mean_us": 153.6635997891426,
++        "p50_us": 152.75999903678894,
++        "p99_us": 171.1649976670742,
++        "n": 100
++      },
++      "swa_summary": "153.7 \u00b1 6.4 (p95=167.6, n=100)"
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/diag_unique_pages.json b/tools/attn_microbench/results/diag_unique_pages.json
+new file mode 100644
+index 0000000..3715cdc
+--- /dev/null
++++ b/tools/attn_microbench/results/diag_unique_pages.json
+@@ -0,0 +1,99 @@
++{
++  "scenario": "unique_pages",
++  "warmup": 30,
++  "repeat": 100,
++  "results": [
++    {
++      "test": "unique_pages",
++      "seq_len": 32768,
++      "c4_cols": 8192,
++      "c4_pages": 64,
++      "seqused_kv": 32768,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": null,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 296.7183983325958,
++        "device_mean_us": 296.7183983325958,
++        "device_p50_us": 296.38999700546265,
++        "device_p95_us": 315.2370035648346,
++        "device_p99_us": 321.28681302070623,
++        "device_max_us": 329.8799991607666,
++        "device_std_us": 8.763889364901365,
++        "host_mean_us": 415.35758413374424,
++        "mean_us": 296.7183983325958,
++        "p50_us": 296.38999700546265,
++        "p99_us": 321.28681302070623,
++        "n": 100
++      },
++      "indexer_summary": "296.7 \u00b1 8.8 (p95=315.2, n=100)",
++      "label": "default_modulo",
++      "page_table_unique_pages": false,
++      "swa_attn_us": {
++        "mean": 153.57640027999878,
++        "device_mean_us": 153.57640027999878,
++        "device_p50_us": 151.50000154972076,
++        "device_p95_us": 162.9629984498024,
++        "device_p99_us": 167.61479884386065,
++        "device_max_us": 175.0199943780899,
++        "device_std_us": 5.482958999442644,
++        "host_mean_us": 257.78502225875854,
++        "mean_us": 153.57640027999878,
++        "p50_us": 151.50000154972076,
++        "p99_us": 167.61479884386065,
++        "n": 100
++      },
++      "swa_summary": "153.6 \u00b1 5.5 (p95=163.0, n=100)"
++    },
++    {
++      "test": "unique_pages",
++      "seq_len": 32768,
++      "c4_cols": 8192,
++      "c4_pages": 64,
++      "seqused_kv": 32768,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": null,
++        "page_table_unique_pages": true,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 296.9594007730484,
++        "device_mean_us": 296.9594007730484,
++        "device_p50_us": 296.1000055074692,
++        "device_p95_us": 310.1900026202202,
++        "device_p99_us": 320.78801423311234,
++        "device_max_us": 325.5400061607361,
++        "device_std_us": 7.727233353538874,
++        "host_mean_us": 406.32341988384724,
++        "mean_us": 296.9594007730484,
++        "p50_us": 296.1000055074692,
++        "p99_us": 320.78801423311234,
++        "n": 100
++      },
++      "indexer_summary": "297.0 \u00b1 7.7 (p95=310.2, n=100)",
++      "label": "unique_pages",
++      "page_table_unique_pages": true,
++      "swa_attn_us": {
++        "mean": 152.15660020709038,
++        "device_mean_us": 152.15660020709038,
++        "device_p50_us": 150.35999566316605,
++        "device_p95_us": 163.58599662780762,
++        "device_p99_us": 168.7452068924904,
++        "device_max_us": 171.24000191688538,
++        "device_std_us": 5.6009131764438065,
++        "host_mean_us": 255.50714693963528,
++        "mean_us": 152.15660020709038,
++        "p50_us": 150.35999566316605,
++        "p99_us": 168.7452068924904,
++        "n": 100
++      },
++      "swa_summary": "152.2 \u00b1 5.6 (p95=163.6, n=100)"
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/hca.json b/tools/attn_microbench/results/hca.json
+new file mode 100644
+index 0000000..2c24a34
+--- /dev/null
++++ b/tools/attn_microbench/results/hca.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "hca",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 158.8019996881485,
++    "device_mean_us": 158.8019996881485,
++    "device_p50_us": 150.7899984717369,
++    "device_p95_us": 191.109000146389,
++    "device_p99_us": 197.5818035006523,
++    "device_max_us": 199.20000433921814,
++    "device_std_us": 17.14885356811357,
++    "host_mean_us": 343.51255744695663,
++    "mean_us": 158.8019996881485,
++    "p50_us": 150.7899984717369,
++    "p99_us": 197.5818035006523,
++    "n": 10
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/hca_msprof.json b/tools/attn_microbench/results/hca_msprof.json
+new file mode 100644
+index 0000000..fd8701d
+--- /dev/null
++++ b/tools/attn_microbench/results/hca_msprof.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "hca",
++  "mode": "msprof_hardware_only",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "attn_hw": {
++    "device_mean_us": 26.514499999999998,
++    "device_std_us": 1.1912104138228472,
++    "device_p50_us": 26.66,
++    "device_p95_us": 28.17745,
++    "device_p99_us": 28.22749,
++    "device_max_us": 28.24,
++    "device_min_us": 24.781,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/hca_attn_seq32768/05d710313bd1_735912_20260526073548732_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dir": "npu_results/hca_attn_seq32768"
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/microbench_indexer_dump.json b/tools/attn_microbench/results/microbench_indexer_dump.json
+new file mode 100644
+index 0000000..9466de8
+--- /dev/null
++++ b/tools/attn_microbench/results/microbench_indexer_dump.json
+@@ -0,0 +1,340 @@
++{
++  "source": "microbench_ops_runner",
++  "seq_len": 32768,
++  "kwargs": {
++    "query": {
++      "shape": [
++        1,
++        64,
++        128
++      ],
++      "dtype": "torch.int8",
++      "device": "npu:0",
++      "sample": [
++        -2,
++        19,
++        -21,
++        -1,
++        -5,
++        10,
++        48,
++        70
++      ]
++    },
++    "key": {
++      "shape": [
++        64,
++        128,
++        1,
++        128
++      ],
++      "dtype": "torch.int8",
++      "device": "npu:0",
++      "sample": [
++        -27,
++        41,
++        -89,
++        33,
++        -124,
++        -122,
++        118,
++        -59
++      ]
++    },
++    "key_dequant_scale": {
++      "shape": [
++        64,
++        128,
++        1
++      ],
++      "dtype": "torch.float16",
++      "device": "npu:0",
++      "sample": [
++        0.01000213623046875,
++        0.01000213623046875,
++        0.01000213623046875,
++        0.01000213623046875,
++        0.01000213623046875,
++        0.01000213623046875,
++        0.01000213623046875,
++        0.01000213623046875
++      ]
++    },
++    "actual_seq_lengths_query": {
++      "shape": [
++        1
++      ],
++      "dtype": "torch.int32",
++      "device": "npu:0",
++      "value": 1
++    },
++    "actual_seq_lengths_key": {
++      "shape": [
++        1
++      ],
++      "dtype": "torch.int32",
++      "device": "npu:0",
++      "value": 32768
++    },
++    "block_table": {
++      "shape": [
++        1,
++        64
++      ],
++      "dtype": "torch.int32",
++      "device": "npu:0",
++      "sample": [
++        0,
++        1,
++        2,
++        3,
++        4,
++        5,
++        6,
++        7,
++        8,
++        9,
++        10,
++        11,
++        12,
++        13,
++        14,
++        15,
++        16,
++        17,
++        18,
++        19,
++        20,
++        21,
++        22,
++        23,
++        24,
++        25,
++        26,
++        27,
++        28,
++        29,
++        30,
++        31,
++        32,
++        33,
++        34,
++        35,
++        36,
++        37,
++        38,
++        39,
++        40,
++        41,
++        42,
++        43,
++        44,
++        45,
++        46,
++        47,
++        48,
++        49,
++        50,
++        51,
++        52,
++        53,
++        54,
++        55,
++        56,
++        57,
++        58,
++        59,
++        60,
++        61,
++        62,
++        63
++      ]
++    },
++    "layout_query": {
++      "value": "TND"
++    },
++    "layout_key": {
++      "value": "PA_BSND"
++    },
++    "weights": {
++      "shape": [
++        1,
++        64
++      ],
++      "dtype": "torch.float16",
++      "device": "npu:0",
++      "sample": [
++        -1.7978515625,
++        -1.46875,
++        1.095703125,
++        0.1722412109375,
++        -1.8720703125,
++        -1.2958984375,
++        -1.203125,
++        0.6611328125,
++        -3.408203125,
++        0.0648193359375,
++        -1.9404296875,
++        1.0732421875,
++        -1.490234375,
++        -0.7265625,
++        -1.1630859375,
++        0.73486328125,
++        0.6875,
++        -0.1602783203125,
++        -0.609375,
++        1.6875,
++        -0.4453125,
++        -0.97998046875,
++        -0.84423828125,
++        0.47412109375,
++        -2.369140625,
++        -0.9677734375,
++        1.3701171875,
++        -0.35693359375,
++        0.107421875,
++        0.6103515625,
++        -0.473388671875,
++        0.52783203125,
++        0.404541015625,
++        -0.64306640625,
++        -0.1602783203125,
++        -1.74609375,
++        -0.63671875,
++        0.43701171875,
++        0.49267578125,
++        -0.035888671875,
++        0.595703125,
++        -1.125,
++        0.4462890625,
++        1.291015625,
++        -0.3046875,
++        0.250732421875,
++        -0.7392578125,
++        -1.3369140625,
++        0.1729736328125,
++        1.1552734375,
++        -0.6455078125,
++        -0.64599609375,
++        -0.63232421875,
++        -0.51416015625,
++        0.53173828125,
++        1.8408203125,
++        0.00704193115234375,
++        -0.481201171875,
++        0.734375,
++        0.127685546875,
++        0.40625,
++        -0.16650390625,
++        -0.7939453125,
++        1.162109375
++      ]
++    },
++    "query_dequant_scale": {
++      "shape": [
++        1,
++        64
++      ],
++      "dtype": "torch.float16",
++      "device": "npu:0",
++      "sample": [
++        0.02362060546875,
++        0.020416259765625,
++        0.0206756591796875,
++        0.0218963623046875,
++        0.0255889892578125,
++        0.0215301513671875,
++        0.0217742919921875,
++        0.0175933837890625,
++        0.02362060546875,
++        0.020050048828125,
++        0.0207977294921875,
++        0.019317626953125,
++        0.0215301513671875,
++        0.02288818359375,
++        0.018707275390625,
++        0.0220184326171875,
++        0.0215301513671875,
++        0.02410888671875,
++        0.019683837890625,
++        0.0244903564453125,
++        0.031494140625,
++        0.033966064453125,
++        0.02313232421875,
++        0.0182037353515625,
++        0.019805908203125,
++        0.0180816650390625,
++        0.0211639404296875,
++        0.018707275390625,
++        0.02288818359375,
++        0.02337646484375,
++        0.02435302734375,
++        0.018585205078125,
++        0.0184478759765625,
++        0.019561767578125,
++        0.02349853515625,
++        0.0175933837890625,
++        0.0258331298828125,
++        0.0177154541015625,
++        0.019439697265625,
++        0.0206756591796875,
++        0.0214080810546875,
++        0.0255889892578125,
++        0.019805908203125,
++        0.0211639404296875,
++        0.0215301513671875,
++        0.020172119140625,
++        0.0218963623046875,
++        0.028289794921875,
++        0.02423095703125,
++        0.01611328125,
++        0.0221405029296875,
++        0.020416259765625,
++        0.0216522216796875,
++        0.0215301513671875,
++        0.02288818359375,
++        0.02423095703125,
++        0.0259552001953125,
++        0.0255889892578125,
++        0.02301025390625,
++        0.0214080810546875,
++        0.028167724609375,
++        0.027923583984375,
++        0.018585205078125,
++        0.0218963623046875
++      ]
++    },
++    "cmp_ratio": {
++      "value": "4"
++    },
++    "query_quant_mode": {
++      "value": "0"
++    },
++    "key_quant_mode": {
++      "value": "0"
++    },
++    "sparse_mode": {
++      "value": "3"
++    },
++    "sparse_count": {
++      "value": "512"
++    },
++    "metadata": {
++      "shape": [
++        1024
++      ],
++      "dtype": "torch.int32",
++      "device": "npu:0",
++      "sample": [
++        1,
++        0,
++        0,
++        0,
++        1,
++        0,
++        0,
++        0
++      ]
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/msprof_seq_sweep.md b/tools/attn_microbench/results/msprof_seq_sweep.md
+new file mode 100644
+index 0000000..194b9a3
+--- /dev/null
++++ b/tools/attn_microbench/results/msprof_seq_sweep.md
+@@ -0,0 +1,17 @@
++# msprof CSA seq sweep (hardware only)
++
++> **完整复现 / 数据索引 / 解析说明**：见 [`P1_7_analysis_guide.md`](./P1_7_analysis_guide.md)  
++> **数据来源**：`results/csa_msprof_seq_{1024,4096,8192,16384,32768}.json`  
++> **Trace 目录**：`npu_results/seq_{S}/csa_{indexer,attn}_seq{S}/`  
++> **生成命令**：`SEQ_LEN_SWEEP="1024 4096 8192 16384 32768" bash run_msprof.sh`
++
++| seq_len | indexer_hw_us (mean±std) | attn_hw_us (mean±std) | scaling_vs_1k |
++|---------|--------------------------|------------------------|---------------|
++| 1024 | 16.2 ± 0.8 | 30.5 ± 1.3 | 1.00 |
++| 4096 | 24.1 ± 0.7 | 38.3 ± 1.1 | 1.49 |
++| 8192 | 20.7 ± 0.4 | 36.2 ± 2.1 | 1.28 |
++| 16384 | 27.9 ± 1.0 | 38.5 ± 0.8 | 1.72 |
++| 32768 | 33.9 ± 0.7 | 37.5 ± 0.8 | 2.09 |
++
++判定:
++- 硬件层随 seq_len 单调 — P1.5 平坦结论被推翻（Python overhead 平坦）
+diff --git a/tools/attn_microbench/results/msprof_vs_python_comparison.md b/tools/attn_microbench/results/msprof_vs_python_comparison.md
+new file mode 100644
+index 0000000..96851be
+--- /dev/null
++++ b/tools/attn_microbench/results/msprof_vs_python_comparison.md
+@@ -0,0 +1,41 @@
++# msprof vs Python Event Comparison
++
++> **完整复现 / 数据索引 / 解析说明**：见 [`P1_7_analysis_guide.md`](./P1_7_analysis_guide.md)  
++> **数据来源**：`swa_msprof.json` / `csa_msprof.json` / `hca_msprof.json` + `seq_32768/*.json`  
++> **生成命令**：`bash run_msprof.sh` 或 §7.3 in guide
++
++> Python Event = eager end-to-end per op call  
++> msprof device time = NPU hardware kernel time（`kernel_details.csv`，非旧版 op_summary）
++
++## Launch Overhead 拆解
++
++| op | python_event_us (mean±std) | msprof_device_us (mean±std) | launch_overhead_us | overhead_pct |
++|----|----------------------------|------------------------------|--------------------|--------------|
++| swa_attn | 133.8 ± 6.7 | 21.6 ± 1.2 | 112.3 | 83.9% |
++| csa_indexer | 265.0 ± 13.5 | 36.1 ± 1.6 | 228.9 | 86.4% |
++| csa_attn | 157.2 ± 10.1 | 38.8 ± 1.3 | 118.3 | 75.3% |
++| hca_attn | 136.1 ± 5.7 | 26.5 ± 1.2 | 109.6 | 80.5% |
++
++判定:
++- overhead_pct > 50% → Python launch 主导, 优化方向 = NPUGraph / op fusion
++- overhead_pct < 30% → NPU kernel 主导, 优化方向 = kernel 内部 / 算法
++- 中间 → 两边都要看
++- **本次判定: Python launch 主导**
++
++## Roofline 对照 (hw 层, effective 1.0 TB/s)
++
++| op | device_us (msprof) | hw_lower_bound_us | util_vs_achievable |
++|----|--------------------|-------------------|---------------------|
++| swa_attn | 21.6 | 0.13 | 0.006 |
++| csa_indexer | 36.1 | 1.05 | 0.029 |
++| csa_attn | 38.8 | 8.39 | 0.216 |
++| hca_attn | 26.5 | 0.26 | 0.010 |
++
++> util_vs_achievable < 0.1 → kernel 远未打满带宽
++> util_vs_achievable > 0.5 → kernel 已接近带宽极限
++
++## 顶部速览 (overhead_pct)
++- swa_attn: 83.9%
++- csa_indexer: 86.4%
++- csa_attn: 75.3%
++- hca_attn: 80.5%
+diff --git a/tools/attn_microbench/results/network_hw_estimate.md b/tools/attn_microbench/results/network_hw_estimate.md
+new file mode 100644
+index 0000000..18e8894
+--- /dev/null
++++ b/tools/attn_microbench/results/network_hw_estimate.md
+@@ -0,0 +1,47 @@
++# Network Attention Hardware Estimate (auto-generated)
++
++> 由 `scripts/summarize_network_hw.py` 从 `results/*_msprof*.json` 生成。  
++> **完整复现 / 解析说明**：见 [`P1_7_analysis_guide.md`](./P1_7_analysis_guide.md)  
++> **重新生成**：`python scripts/summarize_network_hw.py --out results/network_hw_estimate.md`  
++> 层数：SWA×2 + CSA×20 + HCA×20 = 42（不含 L43）。  
++> **@32k CSA 用 seq sweep 的 `csa_msprof_seq_32768.json`**（与 `csa_msprof.json` 同口径、独立两次 run，数值差 ~5% 正常）。
++
++## 单层硬件 @ 32k（msprof kernel_details）
++
++| 层类型 | Indexer (µs) | Attn (µs) | 层合计 (µs) |
++|--------|--------------|-----------|-------------|
++| SWA | — | 21.6 ± 1.2 | 21.6 |
++| CSA | 33.9 | 37.5 | 71.4 |
++| HCA | — | 26.5 ± 1.2 | 26.5 |
++
++## 整网 @ 32k
++
++```
++Total = 2×SWA + 20×CSA + 20×HCA
++      = 2×21.6 + 20×71.4 + 20×26.5
++      ≈ 2.00 ms
++```
++
++| 组成部分 | 耗时 | 占比 |
++|----------|------|------|
++| SWA×2 | 43 µs | 2.2% |
++| CSA indexer×20 | 678 µs | 33.9% |
++| CSA attn×20 | 751 µs | 37.5% |
++| HCA attn×20 | 530 µs | 26.5% |
++| **合计** | **2002 µs** | 100% |
++
++## Seq sweep（CSA 可变，SWA/HCA 用 32k 常数）
++
++| seq_len | indexer_hw | attn_hw | CSA×20 | 整网 hw | vs 1024 |
++|---------|------------|---------|--------|---------|---------|
++| 1024 | 16.2±0.8 | 30.5±1.3 | 933 µs | 1.51 ms | 1.00× |
++| 4096 | 24.1±0.7 | 38.3±1.1 | 1250 µs | 1.82 ms | 1.21× |
++| 8192 | 20.7±0.4 | 36.2±2.1 | 1139 µs | 1.71 ms | 1.14× |
++| 16384 | 27.9±1.0 | 38.5±0.8 | 1327 µs | 1.90 ms | 1.26× |
++| 32768 | 33.9±0.7 | 37.5±0.8 | 1429 µs | 2.00 ms | 1.33× |
++
++## Python Event @ 32k（对比）
++
++- 硬件：2.00 ms
++- Python Event（repeat=1000）：11.43 ms
++- Launch overhead：82.5%
+diff --git a/tools/attn_microbench/results/p1_1_floor_evidence.json b/tools/attn_microbench/results/p1_1_floor_evidence.json
+new file mode 100644
+index 0000000..5926f1b
+--- /dev/null
++++ b/tools/attn_microbench/results/p1_1_floor_evidence.json
+@@ -0,0 +1,17 @@
++{
++  "indexer_min_us": 248.43560054898262,
++  "indexer_max_us": 273.0635988712311,
++  "spread_pct": 9.913232349883245,
++  "floor_confirmed": false,
++  "verdict": "floor refuted",
++  "kernel_errors": [
++    4,
++    16
++  ],
++  "successful_cols": [
++    64,
++    256,
++    1024,
++    8192
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/p1_3_blocked.md b/tools/attn_microbench/results/p1_3_blocked.md
+new file mode 100644
+index 0000000..937289d
+--- /dev/null
++++ b/tools/attn_microbench/results/p1_3_blocked.md
+@@ -0,0 +1,29 @@
++# P1.3 阻塞记录
++
++## 目标
++
++`python tools/attn_microbench/scripts/dump_production_indexer_call.py results/production_indexer_dump.json`
++
++## 尝试
++
++| 次 | timeout | 结果 |
++|----|---------|------|
++| 1 | 900s | `/health` 未就绪；KT MoE 仍在加载 |
++| 2 | 1800s | 加载至 MOE layer ~38 时被脚本 `terminate()`；日志见 `results/p1_3_server.log` 末尾 `main process disappeared` |
++
++## 根因
++
++DeepSeek-V4-Flash W8A8 + KT LLAMAFILE 单卡 **冷启动 >30 min**，超过脚本 health 等待上限；**非 monkey-patch 逻辑错误**（hook 未有机会触发）。
++
++## 下一步（需人工）
++
++1. 先用 `bash tools/p27_launch_ds4flash_npu_num_expert_0.sh` 预热至 `/health` 200。
++2. **重启** server 并注入 hook：
++   ```bash
++   export ATTN_DUMP_INDEXER_PATH=$PWD/results/production_indexer_dump.json
++   export PYTHONSTARTUP=$PWD/scripts/dump_hook_startup.py
++   # 再 launch_server …
++   ```
++3. 或把 `dump_production_indexer_call.py --timeout` 提高到 **≥3600** 后重跑。
++
++**未生成** `production_indexer_dump.json` — P1.4 正式 diff 未完成。
+diff --git a/tools/attn_microbench/results/p1_5_floor_final.md b/tools/attn_microbench/results/p1_5_floor_final.md
+new file mode 100644
+index 0000000..4ccf11f
+--- /dev/null
++++ b/tools/attn_microbench/results/p1_5_floor_final.md
+@@ -0,0 +1,28 @@
++# P1.5 结论：indexer seq sweep 仍平坦（repeat=1000, warmup=30）
++
++## 数据（`results/summary_seq_sweep_r1000.md`）
++
++| seq_len | c4_num_pages | indexer mean±std (µs) | vs 1024 ratio |
++|---------|--------------|-------------------------|---------------|
++| 1024 | 2 | 273.7 ± 62.0 | 1.00 |
++| 4096 | 8 | 261.3 ± 10.0 | 0.95 |
++| 8192 | 16 | 288.8 ± 11.7 | 1.06 |
++| 16384 | 32 | 299.8 ± 10.9 | 1.10 |
++| 32768 | 64 | 265.0 ± 13.5 | 0.97 |
++
++最大比值 **1.10 ≪ 1.5** → **仍平坦**。
++
++## 已做修复
++
++- **P1.4 部分**：`c4_page_table` / `c128_page_table` 对齐 `ascend_backend.py` decode 路径的 **strided page id**（`[B, c4_num_pages]` 而非 `[B, c4_cols]`）。见 `page_table.py::_strided_page_table`。
++- microbench dump：`results/microbench_indexer_dump.json` 显示 `block_table.shape=[1,64]` @ seq=32768。
++
++## 结论
++
++在 strided page table 修复后，**indexer 仍不随 seq_len / c4 候选规模单调缩放** → **假说 (iii) kernel floor / isolated 上界** 为当前最可信解释。
++
++**对外**：本 microbench **不适合** long-context indexer 性能分析；只能报告 **isolated 上界 ~270–300 µs**（repeat=1000, NPU decode, batch=1）。
++
++---
++
++> **已被 P1.7 推翻**（2026-05-26）：msprof 硬件路径显示 indexer @32k 仅 **~34 µs**，1024→32768 硬件缩放 **2.1×**；平坦来自 Python launch overhead。见 [`P1_7_analysis_guide.md`](./P1_7_analysis_guide.md)。
+diff --git a/tools/attn_microbench/results/p1_field_diff.md b/tools/attn_microbench/results/p1_field_diff.md
+new file mode 100644
+index 0000000..206f1b1
+--- /dev/null
++++ b/tools/attn_microbench/results/p1_field_diff.md
+@@ -0,0 +1,32 @@
++# P1.4 indexer kwargs diff — **未完成（缺生产 dump）**
++
++> 生产侧 `results/production_indexer_dump.json` **未生成**（见 `p1_3_blocked.md`）。以下为 microbench 侧已钉死字段 + 代码审查修复。
++
++## 已修复（代码审查 `ascend_backend.py` + `nsa_indexer.py`）
++
++| 字段 | 修复前 microbench | 修复后 microbench | 生产预期（静态） |
++|------|-------------------|-------------------|------------------|
++| `block_table` | `[1, 8192]` int32 | `[1, 64]` strided page id | `c4_page_table[:,::128]//128` → `[B, c4_num_pages]` |
++| `key_dequant_scale` | squeeze(-2) ✅ | 同左 | `k_scale.squeeze(-2)` ✅ |
++| 标量 kwargs | cmp_ratio=4, sparse_mode=3, … | 同 `ops_runner.py` | 同 `nsa_indexer.py` li_input_kwargs ✅ |
++
++## Microbench dump（`microbench_indexer_dump.json`, seq=32768）
++
++- `block_table`: shape `[1, 64]`, dtype int32
++- `key`: `[64, 128, 1, 128]` int8
++- `key_dequant_scale`: `[64, 128, 1]` fp16
++- `actual_seq_lengths_key`: `[1]` = 32768
++- `sparse_count`: 512
++
++## 待生产 dump 确认
++
++- `block_table` 运行时 sample 值域
++- `actual_seq_lengths_key` 是否恒为 token_len（非 c4_len）
++- `metadata` tensor 内部 layout
++
++**正式 diff 命令**（P1.3 完成后）：
++
++```bash
++python scripts/diff_indexer_kwargs.py
++grep "❌" results/p1_field_diff.md  # 目标 0 行
++```
+diff --git a/tools/attn_microbench/results/seq_1024/csa.json b/tools/attn_microbench/results/seq_1024/csa.json
+new file mode 100644
+index 0000000..a1490ef
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_1024/csa.json
+@@ -0,0 +1,41 @@
++{
++  "kind": "csa",
++  "seq_len": 1024,
++  "batch_size": 1,
++  "skip_indexer": false,
++  "attn_us": {
++    "mean": 169.84856002032757,
++    "device_mean_us": 169.84856002032757,
++    "device_p50_us": 169.25999522209167,
++    "device_p95_us": 176.97400599718094,
++    "device_p99_us": 186.74999609589577,
++    "device_max_us": 194.72000002861023,
++    "device_std_us": 3.8809757787418087,
++    "host_mean_us": 313.4067915380001,
++    "mean_us": 169.84856002032757,
++    "p50_us": 169.25999522209167,
++    "p99_us": 186.74999609589577,
++    "n": 1000
++  },
++  "indexer_us": {
++    "mean": 273.7411198243499,
++    "device_mean_us": 273.7411198243499,
++    "device_p50_us": 274.0200012922287,
++    "device_p95_us": 291.8459877371788,
++    "device_p99_us": 301.58641159534454,
++    "device_max_us": 2138.9000415802,
++    "device_std_us": 62.04951116806506,
++    "host_mean_us": 410.9153877943754,
++    "mean_us": 273.7411198243499,
++    "p50_us": 274.0200012922287,
++    "p99_us": 301.58641159534454,
++    "n": 1000
++  },
++  "isolated_device_sum_us": {
++    "device_mean_us": 443.58967984467745,
++    "device_std_us": 62.17076329908626,
++    "host_mean_us": 724.3221793323755,
++    "mean_us": 443.58967984467745,
++    "note": "NOT end-to-end; sum of independently timed indexer + attn"
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_1024/hca.json b/tools/attn_microbench/results/seq_1024/hca.json
+new file mode 100644
+index 0000000..ec3d112
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_1024/hca.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "hca",
++  "seq_len": 1024,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 152.08000020682812,
++    "device_mean_us": 152.08000020682812,
++    "device_p50_us": 151.29999816417694,
++    "device_p95_us": 163.92500028014183,
++    "device_p99_us": 187.96559885144234,
++    "device_max_us": 348.14000129699707,
++    "device_std_us": 11.276320079019605,
++    "host_mean_us": 268.50854977965355,
++    "mean_us": 152.08000020682812,
++    "p50_us": 151.29999816417694,
++    "p99_us": 187.96559885144234,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_1024/summary_1024.md b/tools/attn_microbench/results/seq_1024/summary_1024.md
+new file mode 100644
+index 0000000..e8ac531
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_1024/summary_1024.md
+@@ -0,0 +1,11 @@
++# Synthetic Attention Microbench Summary
++
++> ⚠️ Read `results/diag_seq_scaling.json` before trusting seq_len scaling.
++> `attn_us` for csa/hca **includes SWA branch**; do not add with swa.
++> `isolated_sum_us` = indexer + attn **independent** timings (not fused E2E).
++
++| kind | seq_len | batch | n | indexer (µs) | attn (µs) | attn_compressed_only | isolated_sum (µs) | attn_host (µs) |
++|------|---------|-------|---|--------------|-----------|----------------------|-------------------|----------------|
++| csa | 1024 | 1 | 1000 | 273.7 ± 62.0 | 169.8 ± 3.9 | 29.7 | 443.6 ± 62.2 | 313.4067915380001 |
++| hca | 1024 | 1 | 1000 | - | 152.1 ± 11.3 | 11.9 | - | 268.50854977965355 |
++| swa | 1024 | 1 | 1000 | - | 140.2 ± 10.5 | - | - | 246.08726613223553 |
+diff --git a/tools/attn_microbench/results/seq_1024/swa.json b/tools/attn_microbench/results/seq_1024/swa.json
+new file mode 100644
+index 0000000..e8753a7
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_1024/swa.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "swa",
++  "seq_len": 1024,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 140.1763598844409,
++    "device_mean_us": 140.1763598844409,
++    "device_p50_us": 137.24999874830246,
++    "device_p95_us": 154.60399463772774,
++    "device_p99_us": 187.3830009996891,
++    "device_max_us": 251.78000330924988,
++    "device_std_us": 10.490200796197557,
++    "host_mean_us": 246.08726613223553,
++    "mean_us": 140.1763598844409,
++    "p50_us": 137.24999874830246,
++    "p99_us": 187.3830009996891,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_16384/csa.json b/tools/attn_microbench/results/seq_16384/csa.json
+new file mode 100644
+index 0000000..d0916dc
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_16384/csa.json
+@@ -0,0 +1,41 @@
++{
++  "kind": "csa",
++  "seq_len": 16384,
++  "batch_size": 1,
++  "skip_indexer": false,
++  "attn_us": {
++    "mean": 189.32532028853893,
++    "device_mean_us": 189.32532028853893,
++    "device_p50_us": 188.65999579429626,
++    "device_p95_us": 200.79000368714333,
++    "device_p99_us": 210.48140451312065,
++    "device_max_us": 244.13999915122986,
++    "device_std_us": 5.737869382107669,
++    "host_mean_us": 309.227061457932,
++    "mean_us": 189.32532028853893,
++    "p50_us": 188.65999579429626,
++    "p99_us": 210.48140451312065,
++    "n": 1000
++  },
++  "indexer_us": {
++    "mean": 299.7519004493952,
++    "device_mean_us": 299.7519004493952,
++    "device_p50_us": 298.9799976348877,
++    "device_p95_us": 316.10200107097626,
++    "device_p99_us": 331.2214010953903,
++    "device_max_us": 397.7400064468384,
++    "device_std_us": 10.901192757754604,
++    "host_mean_us": 430.43490778654814,
++    "mean_us": 299.7519004493952,
++    "p50_us": 298.9799976348877,
++    "p99_us": 331.2214010953903,
++    "n": 1000
++  },
++  "isolated_device_sum_us": {
++    "device_mean_us": 489.0772207379341,
++    "device_std_us": 12.319056318884579,
++    "host_mean_us": 739.6619692444801,
++    "mean_us": 489.0772207379341,
++    "note": "NOT end-to-end; sum of independently timed indexer + attn"
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_16384/hca.json b/tools/attn_microbench/results/seq_16384/hca.json
+new file mode 100644
+index 0000000..484dbf4
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_16384/hca.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "hca",
++  "seq_len": 16384,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 146.4924799874425,
++    "device_mean_us": 146.4924799874425,
++    "device_p50_us": 144.4000005722046,
++    "device_p95_us": 158.90199318528175,
++    "device_p99_us": 163.9741949737072,
++    "device_max_us": 349.81998801231384,
++    "device_std_us": 9.125463941518813,
++    "host_mean_us": 246.58016953617334,
++    "mean_us": 146.4924799874425,
++    "p50_us": 144.4000005722046,
++    "p99_us": 163.9741949737072,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_16384/summary_16384.md b/tools/attn_microbench/results/seq_16384/summary_16384.md
+new file mode 100644
+index 0000000..99669e5
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_16384/summary_16384.md
+@@ -0,0 +1,11 @@
++# Synthetic Attention Microbench Summary
++
++> ⚠️ Read `results/diag_seq_scaling.json` before trusting seq_len scaling.
++> `attn_us` for csa/hca **includes SWA branch**; do not add with swa.
++> `isolated_sum_us` = indexer + attn **independent** timings (not fused E2E).
++
++| kind | seq_len | batch | n | indexer (µs) | attn (µs) | attn_compressed_only | isolated_sum (µs) | attn_host (µs) |
++|------|---------|-------|---|--------------|-----------|----------------------|-------------------|----------------|
++| csa | 16384 | 1 | 1000 | 299.8 ± 10.9 | 189.3 ± 5.7 | 45.3 | 489.1 ± 12.3 | 309.227061457932 |
++| hca | 16384 | 1 | 1000 | - | 146.5 ± 9.1 | 2.5 | - | 246.58016953617334 |
++| swa | 16384 | 1 | 1000 | - | 144.0 ± 6.6 | - | - | 254.9059521406889 |
+diff --git a/tools/attn_microbench/results/seq_16384/swa.json b/tools/attn_microbench/results/seq_16384/swa.json
+new file mode 100644
+index 0000000..4418205
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_16384/swa.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "swa",
++  "seq_len": 16384,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 144.03478012233973,
++    "device_mean_us": 144.03478012233973,
++    "device_p50_us": 142.15999841690063,
++    "device_p95_us": 157.15100169181824,
++    "device_p99_us": 163.72459679841995,
++    "device_max_us": 177.0399957895279,
++    "device_std_us": 6.6490196651540305,
++    "host_mean_us": 254.9059521406889,
++    "mean_us": 144.03478012233973,
++    "p50_us": 142.15999841690063,
++    "p99_us": 163.72459679841995,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_32768/csa.json b/tools/attn_microbench/results/seq_32768/csa.json
+new file mode 100644
+index 0000000..075f5b0
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_32768/csa.json
+@@ -0,0 +1,41 @@
++{
++  "kind": "csa",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "skip_indexer": false,
++  "attn_us": {
++    "mean": 157.18170005083084,
++    "device_mean_us": 157.18170005083084,
++    "device_p50_us": 155.03999590873718,
++    "device_p95_us": 162.1699973940849,
++    "device_p99_us": 207.82599821686745,
++    "device_max_us": 212.11999654769897,
++    "device_std_us": 10.105597595868124,
++    "host_mean_us": 248.53789899498224,
++    "mean_us": 157.18170005083084,
++    "p50_us": 155.03999590873718,
++    "p99_us": 207.82599821686745,
++    "n": 1000
++  },
++  "indexer_us": {
++    "mean": 264.9807204455137,
++    "device_mean_us": 264.9807204455137,
++    "device_p50_us": 260.3999972343445,
++    "device_p95_us": 305.0310045480728,
++    "device_p99_us": 317.85100996494293,
++    "device_max_us": 334.65999364852905,
++    "device_std_us": 13.510134832596487,
++    "host_mean_us": 362.33922746032476,
++    "mean_us": 264.9807204455137,
++    "p50_us": 260.3999972343445,
++    "p99_us": 317.85100996494293,
++    "n": 1000
++  },
++  "isolated_device_sum_us": {
++    "device_mean_us": 422.16242049634457,
++    "device_std_us": 16.871480254101964,
++    "host_mean_us": 610.877126455307,
++    "mean_us": 422.16242049634457,
++    "note": "NOT end-to-end; sum of independently timed indexer + attn"
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_32768/hca.json b/tools/attn_microbench/results/seq_32768/hca.json
+new file mode 100644
+index 0000000..9823080
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_32768/hca.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "hca",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 136.1176600009203,
++    "device_mean_us": 136.1176600009203,
++    "device_p50_us": 134.63999330997467,
++    "device_p95_us": 146.16900607943535,
++    "device_p99_us": 154.4188058376312,
++    "device_max_us": 171.46000266075134,
++    "device_std_us": 5.668236602780346,
++    "host_mean_us": 231.60381522029638,
++    "mean_us": 136.1176600009203,
++    "p50_us": 134.63999330997467,
++    "p99_us": 154.4188058376312,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_32768/summary_32768.md b/tools/attn_microbench/results/seq_32768/summary_32768.md
+new file mode 100644
+index 0000000..791685a
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_32768/summary_32768.md
+@@ -0,0 +1,11 @@
++# Synthetic Attention Microbench Summary
++
++> ⚠️ Read `results/diag_seq_scaling.json` before trusting seq_len scaling.
++> `attn_us` for csa/hca **includes SWA branch**; do not add with swa.
++> `isolated_sum_us` = indexer + attn **independent** timings (not fused E2E).
++
++| kind | seq_len | batch | n | indexer (µs) | attn (µs) | attn_compressed_only | isolated_sum (µs) | attn_host (µs) |
++|------|---------|-------|---|--------------|-----------|----------------------|-------------------|----------------|
++| csa | 32768 | 1 | 1000 | 265.0 ± 13.5 | 157.2 ± 10.1 | 23.4 | 422.2 ± 16.9 | 248.53789899498224 |
++| hca | 32768 | 1 | 1000 | - | 136.1 ± 5.7 | 2.3 | - | 231.60381522029638 |
++| swa | 32768 | 1 | 1000 | - | 133.8 ± 6.7 | - | - | 231.86018131673336 |
+diff --git a/tools/attn_microbench/results/seq_32768/swa.json b/tools/attn_microbench/results/seq_32768/swa.json
+new file mode 100644
+index 0000000..dbe7fbc
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_32768/swa.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "swa",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 133.8277804106474,
++    "device_mean_us": 133.8277804106474,
++    "device_p50_us": 131.69999420642853,
++    "device_p95_us": 146.6819979250431,
++    "device_p99_us": 154.4833953678608,
++    "device_max_us": 178.39999496936798,
++    "device_std_us": 6.661001286143628,
++    "host_mean_us": 231.86018131673336,
++    "mean_us": 133.8277804106474,
++    "p50_us": 131.69999420642853,
++    "p99_us": 154.4833953678608,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_4096/csa.json b/tools/attn_microbench/results/seq_4096/csa.json
+new file mode 100644
+index 0000000..2518fbd
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_4096/csa.json
+@@ -0,0 +1,41 @@
++{
++  "kind": "csa",
++  "seq_len": 4096,
++  "batch_size": 1,
++  "skip_indexer": false,
++  "attn_us": {
++    "mean": 152.3410400748253,
++    "device_mean_us": 152.3410400748253,
++    "device_p50_us": 151.8400013446808,
++    "device_p95_us": 157.27999806404114,
++    "device_p99_us": 167.72560492157936,
++    "device_max_us": 179.60000038146973,
++    "device_std_us": 3.5303339247897414,
++    "host_mean_us": 246.1914736777544,
++    "mean_us": 152.3410400748253,
++    "p50_us": 151.8400013446808,
++    "p99_us": 167.72560492157936,
++    "n": 1000
++  },
++  "indexer_us": {
++    "mean": 261.25864024832845,
++    "device_mean_us": 261.25864024832845,
++    "device_p50_us": 259.0799927711487,
++    "device_p95_us": 275.3409907221794,
++    "device_p99_us": 283.11000883579254,
++    "device_max_us": 290.6399965286255,
++    "device_std_us": 10.042008176363284,
++    "host_mean_us": 362.1510649099946,
++    "mean_us": 261.25864024832845,
++    "p50_us": 259.0799927711487,
++    "p99_us": 283.11000883579254,
++    "n": 1000
++  },
++  "isolated_device_sum_us": {
++    "device_mean_us": 413.59968032315373,
++    "device_std_us": 10.644490867799567,
++    "host_mean_us": 608.342538587749,
++    "mean_us": 413.59968032315373,
++    "note": "NOT end-to-end; sum of independently timed indexer + attn"
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_4096/hca.json b/tools/attn_microbench/results/seq_4096/hca.json
+new file mode 100644
+index 0000000..47944b4
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_4096/hca.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "hca",
++  "seq_len": 4096,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 144.5539200156927,
++    "device_mean_us": 144.5539200156927,
++    "device_p50_us": 142.76999980211258,
++    "device_p95_us": 154.94099482893944,
++    "device_p99_us": 164.22580525279045,
++    "device_max_us": 209.3600034713745,
++    "device_std_us": 6.355669409140286,
++    "host_mean_us": 245.36670465022326,
++    "mean_us": 144.5539200156927,
++    "p50_us": 142.76999980211258,
++    "p99_us": 164.22580525279045,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_4096/summary_4096.md b/tools/attn_microbench/results/seq_4096/summary_4096.md
+new file mode 100644
+index 0000000..9063bdc
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_4096/summary_4096.md
+@@ -0,0 +1,11 @@
++# Synthetic Attention Microbench Summary
++
++> ⚠️ Read `results/diag_seq_scaling.json` before trusting seq_len scaling.
++> `attn_us` for csa/hca **includes SWA branch**; do not add with swa.
++> `isolated_sum_us` = indexer + attn **independent** timings (not fused E2E).
++
++| kind | seq_len | batch | n | indexer (µs) | attn (µs) | attn_compressed_only | isolated_sum (µs) | attn_host (µs) |
++|------|---------|-------|---|--------------|-----------|----------------------|-------------------|----------------|
++| csa | 4096 | 1 | 1000 | 261.3 ± 10.0 | 152.3 ± 3.5 | 9.5 | 413.6 ± 10.6 | 246.1914736777544 |
++| hca | 4096 | 1 | 1000 | - | 144.6 ± 6.4 | 1.7 | - | 245.36670465022326 |
++| swa | 4096 | 1 | 1000 | - | 142.9 ± 9.9 | - | - | 250.48568099737167 |
+diff --git a/tools/attn_microbench/results/seq_4096/swa.json b/tools/attn_microbench/results/seq_4096/swa.json
+new file mode 100644
+index 0000000..105606c
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_4096/swa.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "swa",
++  "seq_len": 4096,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 142.86318011581898,
++    "device_mean_us": 142.86318011581898,
++    "device_p50_us": 142.5199955701828,
++    "device_p95_us": 156.01300299167633,
++    "device_p99_us": 164.81380313634872,
++    "device_max_us": 337.02000975608826,
++    "device_std_us": 9.892209610577329,
++    "host_mean_us": 250.48568099737167,
++    "mean_us": 142.86318011581898,
++    "p50_us": 142.5199955701828,
++    "p99_us": 164.81380313634872,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_8192/csa.json b/tools/attn_microbench/results/seq_8192/csa.json
+new file mode 100644
+index 0000000..9036324
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_8192/csa.json
+@@ -0,0 +1,41 @@
++{
++  "kind": "csa",
++  "seq_len": 8192,
++  "batch_size": 1,
++  "skip_indexer": false,
++  "attn_us": {
++    "mean": 168.36327962577343,
++    "device_mean_us": 168.36327962577343,
++    "device_p50_us": 167.6899939775467,
++    "device_p95_us": 174.90499541163445,
++    "device_p99_us": 187.08459585905075,
++    "device_max_us": 194.99999284744263,
++    "device_std_us": 4.387621300225278,
++    "host_mean_us": 277.4792816489935,
++    "mean_us": 168.36327962577343,
++    "p50_us": 167.6899939775467,
++    "p99_us": 187.08459585905075,
++    "n": 1000
++  },
++  "indexer_us": {
++    "mean": 288.7961399257183,
++    "device_mean_us": 288.7961399257183,
++    "device_p50_us": 288.4800136089325,
++    "device_p95_us": 307.48200714588165,
++    "device_p99_us": 316.9622069597244,
++    "device_max_us": 330.6399881839752,
++    "device_std_us": 11.65446177883977,
++    "host_mean_us": 409.8434494808316,
++    "mean_us": 288.7961399257183,
++    "p50_us": 288.4800136089325,
++    "p99_us": 316.9622069597244,
++    "n": 1000
++  },
++  "isolated_device_sum_us": {
++    "device_mean_us": 457.15941955149174,
++    "device_std_us": 12.453019715258932,
++    "host_mean_us": 687.3227311298251,
++    "mean_us": 457.15941955149174,
++    "note": "NOT end-to-end; sum of independently timed indexer + attn"
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_8192/hca.json b/tools/attn_microbench/results/seq_8192/hca.json
+new file mode 100644
+index 0000000..d10abfc
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_8192/hca.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "hca",
++  "seq_len": 8192,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 156.38009993731976,
++    "device_mean_us": 156.38009993731976,
++    "device_p50_us": 156.41999989748,
++    "device_p95_us": 171.7559956014156,
++    "device_p99_us": 182.22399711608887,
++    "device_max_us": 236.6199940443039,
++    "device_std_us": 9.623281591889576,
++    "host_mean_us": 273.72924610972404,
++    "mean_us": 156.38009993731976,
++    "p50_us": 156.41999989748,
++    "p99_us": 182.22399711608887,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/seq_8192/summary_8192.md b/tools/attn_microbench/results/seq_8192/summary_8192.md
+new file mode 100644
+index 0000000..ba65d15
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_8192/summary_8192.md
+@@ -0,0 +1,11 @@
++# Synthetic Attention Microbench Summary
++
++> ⚠️ Read `results/diag_seq_scaling.json` before trusting seq_len scaling.
++> `attn_us` for csa/hca **includes SWA branch**; do not add with swa.
++> `isolated_sum_us` = indexer + attn **independent** timings (not fused E2E).
++
++| kind | seq_len | batch | n | indexer (µs) | attn (µs) | attn_compressed_only | isolated_sum (µs) | attn_host (µs) |
++|------|---------|-------|---|--------------|-----------|----------------------|-------------------|----------------|
++| csa | 8192 | 1 | 1000 | 288.8 ± 11.7 | 168.4 ± 4.4 | 30.9 | 457.2 ± 12.5 | 277.4792816489935 |
++| hca | 8192 | 1 | 1000 | - | 156.4 ± 9.6 | 18.9 | - | 273.72924610972404 |
++| swa | 8192 | 1 | 1000 | - | 137.5 ± 10.5 | - | - | 235.196472145617 |
+diff --git a/tools/attn_microbench/results/seq_8192/swa.json b/tools/attn_microbench/results/seq_8192/swa.json
+new file mode 100644
+index 0000000..802c6aa
+--- /dev/null
++++ b/tools/attn_microbench/results/seq_8192/swa.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "swa",
++  "seq_len": 8192,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 137.47948019206524,
++    "device_mean_us": 137.47948019206524,
++    "device_p50_us": 134.44000482559204,
++    "device_p95_us": 147.6059950888157,
++    "device_p99_us": 186.89020738005638,
++    "device_max_us": 204.33999598026276,
++    "device_std_us": 10.512232380597624,
++    "host_mean_us": 235.196472145617,
++    "mean_us": 137.47948019206524,
++    "p50_us": 134.44000482559204,
++    "p99_us": 186.89020738005638,
++    "n": 1000
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/summary_32768.md b/tools/attn_microbench/results/summary_32768.md
+new file mode 100644
+index 0000000..682f0bc
+--- /dev/null
++++ b/tools/attn_microbench/results/summary_32768.md
+@@ -0,0 +1,12 @@
++# Synthetic Attention Microbench Summary
++
++> ⚠️ Read `results/diag_seq_scaling.json` before trusting seq_len scaling.
++> `attn_us` for csa/hca **includes SWA branch**; do not add with swa.
++> `isolated_sum_us` = indexer + attn **independent** timings (not fused E2E).
++
++| kind | seq_len | batch | n | indexer (µs) | attn (µs) | attn_compressed_only | isolated_sum (µs) | attn_host (µs) |
++|------|---------|-------|---|--------------|-----------|----------------------|-------------------|----------------|
++| csa | 32768 | 1 | 10 | 277.5 ± 16.2 | 158.8 ± 3.6 | 20.2 | 436.3 ± 16.6 | 270.40401473641396 |
++| csa | 32768 | 1 | 10 | - | 176.1 ± 11.7 | 37.5 | - | 363.4059801697731 |
++| hca | 32768 | 1 | 10 | - | 158.8 ± 17.1 | 20.2 | - | 343.51255744695663 |
++| swa | 32768 | 1 | 10 | - | 138.6 ± 10.4 | - | - | 316.4181485772133 |
+diff --git a/tools/attn_microbench/results/summary_32768_r1000.md b/tools/attn_microbench/results/summary_32768_r1000.md
+new file mode 100644
+index 0000000..26d46f7
+--- /dev/null
++++ b/tools/attn_microbench/results/summary_32768_r1000.md
+@@ -0,0 +1,13 @@
++# Synthetic Attention Microbench Summary (repeat=1000, warmup=30)
++
++> P1.5 正式数据 @ seq=32768, NPU batch=1 decode。
++> indexer 仍不随 seq_len 缩放 → 见 `p1_5_floor_final.md`。
++> `attn_us` for csa/hca **includes SWA branch**; do not add with swa.
++
++| kind | seq_len | batch | n | indexer (µs) | attn (µs) | attn_compressed_only | isolated_sum (µs) |
++|------|---------|-------|---|--------------|-----------|----------------------|-------------------|
++| csa | 32768 | 1 | 1000 | 265.0 ± 13.5 | 157.2 ± 10.1 | 23.4 | 422.2 ± 16.9 |
++| hca | 32768 | 1 | 1000 | - | 136.1 ± 5.7 | 2.3 | - |
++| swa | 32768 | 1 | 1000 | - | 133.8 ± 6.7 | - | - |
++
++Seq sweep: `results/summary_seq_sweep_r1000.md`
+diff --git a/tools/attn_microbench/results/summary_seq_sweep_r1000.md b/tools/attn_microbench/results/summary_seq_sweep_r1000.md
+new file mode 100644
+index 0000000..2d12308
+--- /dev/null
++++ b/tools/attn_microbench/results/summary_seq_sweep_r1000.md
+@@ -0,0 +1,9 @@
++# Seq sweep summary (repeat=1000)
++
++| seq_len | indexer mean±std (µs) | attn mean±std (µs) |
++|---------|----------------------|-------------------|
++| 1024 | 273.7 ± 62.0 | 169.8 ± 3.9 |
++| 4096 | 261.3 ± 10.0 | 152.3 ± 3.5 |
++| 8192 | 288.8 ± 11.7 | 168.4 ± 4.4 |
++| 16384 | 299.8 ± 10.9 | 189.3 ± 5.7 |
++| 32768 | 265.0 ± 13.5 | 157.2 ± 10.1 |
+diff --git a/tools/attn_microbench/results/swa.json b/tools/attn_microbench/results/swa.json
+new file mode 100644
+index 0000000..cb84736
+--- /dev/null
++++ b/tools/attn_microbench/results/swa.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "swa",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "attn_us": {
++    "mean": 138.59199732542038,
++    "device_mean_us": 138.59199732542038,
++    "device_p50_us": 134.9399983882904,
++    "device_p95_us": 156.79199993610382,
++    "device_p99_us": 163.93440067768097,
++    "device_max_us": 165.72000086307526,
++    "device_std_us": 10.390871640742084,
++    "host_mean_us": 316.4181485772133,
++    "mean_us": 138.59199732542038,
++    "p50_us": 134.9399983882904,
++    "p99_us": 163.93440067768097,
++    "n": 10
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/swa_msprof.json b/tools/attn_microbench/results/swa_msprof.json
+new file mode 100644
+index 0000000..0abf627
+--- /dev/null
++++ b/tools/attn_microbench/results/swa_msprof.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "swa",
++  "mode": "msprof_hardware_only",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "attn_hw": {
++    "device_mean_us": 21.5722,
++    "device_std_us": 1.227222620391264,
++    "device_p50_us": 21.430500000000002,
++    "device_p95_us": 23.48,
++    "device_p99_us": 23.624,
++    "device_max_us": 23.66,
++    "device_min_us": 19.88,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/swa_attn_seq32768/05d710313bd1_728663_20260526073447340_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dir": "npu_results/swa_attn_seq32768"
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/swa_msprof_smoke.json b/tools/attn_microbench/results/swa_msprof_smoke.json
+new file mode 100644
+index 0000000..be06a4b
+--- /dev/null
++++ b/tools/attn_microbench/results/swa_msprof_smoke.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "swa",
++  "mode": "msprof_hardware_only",
++  "seq_len": 1024,
++  "batch_size": 1,
++  "attn_hw": {
++    "device_mean_us": 52.767100000000006,
++    "device_std_us": 11.81546693491205,
++    "device_p50_us": 55.811,
++    "device_p95_us": 63.57199999999999,
++    "device_p99_us": 66.74719999999999,
++    "device_max_us": 67.541,
++    "device_min_us": 19.701,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/swa_attn_seq1024/05d710313bd1_716770_20260526072503514_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dir": "npu_results/swa_attn_seq1024"
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/run_all.sh b/tools/attn_microbench/run_all.sh
+new file mode 100644
+index 0000000..f74ba7c
+--- /dev/null
++++ b/tools/attn_microbench/run_all.sh
+@@ -0,0 +1,95 @@
++#!/usr/bin/env bash
++# Synthetic 32k SWA / CSA / HCA attention microbench（独立工作区，不改主干）
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=/dev/null
++source "${ROOT}/env.sh"
++
++SEQ_LEN="${SEQ_LEN:-32768}"
++BATCH_SIZE="${BATCH_SIZE:-1}"
++OUT_DIR="${OUT_DIR:-${ROOT}/results}"
++SANITY_FLAG="${SANITY_FLAG:---sanity}"
++REPEAT="${REPEAT:-}"
++WARMUP="${WARMUP:-}"
++
++mkdir -p "${OUT_DIR}"
++
++EXTRA=()
++[[ -n "${REPEAT}" ]] && EXTRA+=(--repeat "${REPEAT}")
++[[ -n "${WARMUP}" ]] && EXTRA+=(--warmup "${WARMUP}")
++
++_run_one() {
++  local seq="$1"
++  local out="${OUT_DIR}"
++  if [[ -n "${SEQ_LEN_SWEEP:-}" ]]; then
++    out="${OUT_DIR}/seq_${seq}"
++    mkdir -p "${out}"
++  fi
++  echo "[attn_microbench] seq_len=${seq} batch=${BATCH_SIZE} out=${out}"
++  local COMMON=(--seq-len "${seq}" --batch-size "${BATCH_SIZE}" "${EXTRA[@]:-}")
++
++  echo "[attn_microbench] SWA ..."
++  "${PYTHON_BIN}" -m attn_bench.bench_swa "${COMMON[@]}" ${SANITY_FLAG} --out "${out}/swa.json"
++
++  echo "[attn_microbench] CSA ..."
++  if [[ "${SKIP_INDEXER:-0}" == "1" ]]; then
++    "${PYTHON_BIN}" -m attn_bench.bench_csa "${COMMON[@]}" ${SANITY_FLAG} --skip-indexer --out "${out}/csa.json"
++  else
++    "${PYTHON_BIN}" -m attn_bench.bench_csa "${COMMON[@]}" ${SANITY_FLAG} --out "${out}/csa.json" || {
++      echo "[attn_microbench][WARN] CSA full path failed; retry attn-only (--skip-indexer)" >&2
++      "${PYTHON_BIN}" -m attn_bench.bench_csa "${COMMON[@]}" ${SANITY_FLAG} --skip-indexer --out "${out}/csa_attn_only.json"
++    }
++  fi
++
++  echo "[attn_microbench] HCA ..."
++  "${PYTHON_BIN}" -m attn_bench.bench_hca "${COMMON[@]}" ${SANITY_FLAG} --out "${out}/hca.json"
++
++  local INPUTS=("${out}/swa.json" "${out}/hca.json")
++  [[ -f "${out}/csa.json" ]] && INPUTS+=("${out}/csa.json")
++  [[ -f "${out}/csa_attn_only.json" ]] && INPUTS+=("${out}/csa_attn_only.json")
++
++  "${PYTHON_BIN}" -m attn_bench.report \
++    --inputs "${INPUTS[@]}" \
++    --out "${out}/summary_${seq}.md"
++  echo "[attn_microbench] done -> ${out}/summary_${seq}.md"
++}
++
++if [[ -n "${SEQ_LEN_SWEEP:-}" ]]; then
++  for s in ${SEQ_LEN_SWEEP}; do
++    _run_one "${s}"
++  done
++  SWEEP_SUMMARY="${OUT_DIR}/summary_seq_sweep_r${REPEAT:-1000}.md"
++  {
++    echo "# Seq sweep summary (repeat=${REPEAT:-1000})"
++    echo ""
++    echo "| seq_len | indexer mean±std (µs) | attn mean±std (µs) |"
++    echo "|---------|----------------------|-------------------|"
++    for s in ${SEQ_LEN_SWEEP}; do
++      csa="${OUT_DIR}/seq_${s}/csa.json"
++      if [[ -f "${csa}" ]]; then
++        "${PYTHON_BIN}" - <<PY
++import json
++from pathlib import Path
++d = json.loads(Path("${csa}").read_text())
++idx = d.get("indexer_us") or {}
++attn = d.get("attn_us") or {}
++def fmt(x):
++    if not x: return "n/a"
++    return f"{x.get('mean', x.get('device_mean_us', 0)):.1f} ± {x.get('device_std_us', 0):.1f}"
++print(f"| ${s} | {fmt(idx)} | {fmt(attn)} |")
++PY
++      fi
++    done
++  } > "${SWEEP_SUMMARY}"
++  echo "[attn_microbench] sweep summary -> ${SWEEP_SUMMARY}"
++  exit 0
++fi
++
++if [[ "${DRY_RUN:-0}" == "1" ]]; then
++  "${PYTHON_BIN}" -m attn_bench.bench_swa --dry-run --seq-len "${SEQ_LEN}" --batch-size "${BATCH_SIZE}"
++  "${PYTHON_BIN}" -m attn_bench.bench_csa --dry-run --seq-len "${SEQ_LEN}" --batch-size "${BATCH_SIZE}"
++  "${PYTHON_BIN}" -m attn_bench.bench_hca --dry-run --seq-len "${SEQ_LEN}" --batch-size "${BATCH_SIZE}"
++  exit 0
++fi
++
++_run_one "${SEQ_LEN}"
+diff --git a/tools/attn_microbench/run_diag.sh b/tools/attn_microbench/run_diag.sh
+new file mode 100755
+index 0000000..93c6198
+--- /dev/null
++++ b/tools/attn_microbench/run_diag.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++# P0 seq scaling diagnostics (Claude review). Uses repeat=100 by default for speed.
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=/dev/null
++source "${ROOT}/env.sh"
++
++REPEAT="${REPEAT:-100}"
++WARMUP="${WARMUP:-30}"
++SEQ_LEN="${SEQ_LEN:-32768}"
++OUT="${OUT:-${ROOT}/results/diag_seq_scaling.json}"
++
++echo "[diag] repeat=${REPEAT} warmup=${WARMUP} seq_len=${SEQ_LEN}"
++"${PYTHON_BIN}" -m attn_bench.bench_diag \
++  --seq-len "${SEQ_LEN}" \
++  --warmup "${WARMUP}" \
++  --repeat "${REPEAT}" \
++  --scenario "${SCENARIO:-all}" \
++  --out "${OUT}"
++
++echo "[diag] reference check (seq=512) ..."
++"${PYTHON_BIN}" -m attn_bench.reference_check --seq-len 512
+diff --git a/tools/attn_microbench/run_msprof.sh b/tools/attn_microbench/run_msprof.sh
+new file mode 100755
+index 0000000..63eef92
+--- /dev/null
++++ b/tools/attn_microbench/run_msprof.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++# P1.7: msprof hardware-only timing (not run by run_all.sh)
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=/dev/null
++source "${ROOT}/env.sh"
++
++SEQ_LEN="${SEQ_LEN:-32768}"
++MSPROF_OUT="${MSPROF_OUT:-${ROOT}/npu_results}"
++OUT_DIR="${OUT_DIR:-${ROOT}/results}"
++
++mkdir -p "${MSPROF_OUT}" "${OUT_DIR}"
++
++echo "[run_msprof] seq_len=${SEQ_LEN} trace_root=${MSPROF_OUT}"
++
++if [[ -n "${SEQ_LEN_SWEEP:-}" ]]; then
++  for S in ${SEQ_LEN_SWEEP}; do
++    echo "[run_msprof] CSA seq=${S} ..."
++    "${PYTHON_BIN}" -m attn_bench.bench_csa --seq-len "${S}" --msprof \
++      --msprof-out "${MSPROF_OUT}/seq_${S}" \
++      --out "${OUT_DIR}/csa_msprof_seq_${S}.json"
++  done
++  "${PYTHON_BIN}" -m attn_bench.report --mode msprof-sweep \
++    --inputs "${OUT_DIR}/csa_msprof_seq_*.json" \
++    --out "${OUT_DIR}/msprof_seq_sweep.md"
++  echo "[run_msprof] sweep -> ${OUT_DIR}/msprof_seq_sweep.md"
++  exit 0
++fi
++
++echo "[run_msprof] SWA ..."
++"${PYTHON_BIN}" -m attn_bench.bench_swa --seq-len "${SEQ_LEN}" --msprof \
++  --msprof-out "${MSPROF_OUT}" --out "${OUT_DIR}/swa_msprof.json"
++
++echo "[run_msprof] CSA ..."
++"${PYTHON_BIN}" -m attn_bench.bench_csa --seq-len "${SEQ_LEN}" --msprof \
++  --msprof-out "${MSPROF_OUT}" --out "${OUT_DIR}/csa_msprof.json"
++
++echo "[run_msprof] HCA ..."
++"${PYTHON_BIN}" -m attn_bench.bench_hca --seq-len "${SEQ_LEN}" --msprof \
++  --msprof-out "${MSPROF_OUT}" --out "${OUT_DIR}/hca_msprof.json"
++
++# Event JSONs: prefer seq sweep dir or root results
++EVENT_SWA="${OUT_DIR}/swa.json"
++EVENT_CSA="${OUT_DIR}/csa.json"
++EVENT_HCA="${OUT_DIR}/hca.json"
++[[ -f "${OUT_DIR}/seq_${SEQ_LEN}/swa.json" ]] && EVENT_SWA="${OUT_DIR}/seq_${SEQ_LEN}/swa.json"
++[[ -f "${OUT_DIR}/seq_${SEQ_LEN}/csa.json" ]] && EVENT_CSA="${OUT_DIR}/seq_${SEQ_LEN}/csa.json"
++[[ -f "${OUT_DIR}/seq_${SEQ_LEN}/hca.json" ]] && EVENT_HCA="${OUT_DIR}/seq_${SEQ_LEN}/hca.json"
++
++if [[ ! -f "${EVENT_SWA}" || ! -f "${EVENT_CSA}" || ! -f "${EVENT_HCA}" ]]; then
++  echo "[run_msprof] Event JSON missing; running Event mode once (repeat from yaml) ..."
++  SANITY_FLAG="" bash "${ROOT}/run_all.sh"
++fi
++
++"${PYTHON_BIN}" -m attn_bench.report --mode comparison \
++  --msprof-jsons "${OUT_DIR}/swa_msprof.json" "${OUT_DIR}/csa_msprof.json" "${OUT_DIR}/hca_msprof.json" \
++  --event-jsons "${EVENT_SWA}" "${EVENT_CSA}" "${EVENT_HCA}" \
++  --out "${OUT_DIR}/msprof_vs_python_comparison.md"
++
++"${PYTHON_BIN}" "${ROOT}/scripts/summarize_network_hw.py" \
++  --out "${OUT_DIR}/network_hw_estimate.md"
++
++echo "[run_msprof] done -> ${OUT_DIR}/msprof_vs_python_comparison.md"
++echo "[run_msprof]       -> ${OUT_DIR}/network_hw_estimate.md"
+diff --git a/tools/attn_microbench/scripts/diff_indexer_kwargs.py b/tools/attn_microbench/scripts/diff_indexer_kwargs.py
+new file mode 100644
+index 0000000..8d654ec
+--- /dev/null
++++ b/tools/attn_microbench/scripts/diff_indexer_kwargs.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++"""Diff production indexer dump vs microbench kwargs capture."""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++MICRO_ROOT = Path(__file__).resolve().parents[1]
++
++
++def _encode(v):
++    import torch
++
++    if isinstance(v, torch.Tensor):
++        out = {
++            "shape": list(v.shape),
++            "dtype": str(v.dtype),
++            "device": str(v.device),
++        }
++        if v.numel() == 1:
++            out["value"] = v.item()
++        elif v.numel() <= 64:
++            out["sample"] = v.flatten().tolist()
++        else:
++            out["sample"] = v.flatten()[:8].tolist()
++        return out
++    return {"value": str(v)}
++
++
++def capture_microbench_dump(out_path: Path, seq_len: int = 32768) -> None:
++    from attn_bench.bench_common import prepare_npu
++    from attn_bench.config import apply_overrides, load_config
++    from attn_bench.init_npu import setup_pythonpath
++    from attn_bench.metadata import build_metadata
++    from attn_bench.ops_runner import torch_npu_dynamic_quant
++    from attn_bench.synthetic import build_synthetic
++
++    setup_pythonpath(MICRO_ROOT.parents[1])
++    prepare_npu(argparse.Namespace(dry_run=False))
++    cfg = apply_overrides(load_config(), seq_len=seq_len, warmup=1, repeat=1)
++    t = build_synthetic(cfg, swa_no_sink=False)
++    meta = build_metadata(cfg, t)
++    q, q_scale = torch_npu_dynamic_quant(t.li_query)
++    kwargs = {
++        "query": q,
++        "key": t.li_key,
++        "key_dequant_scale": t.li_key_scale.squeeze(cfg.invariants["li_key_scale_squeeze_dim"]),
++        "actual_seq_lengths_query": t.actual_seq_lengths_q,
++        "actual_seq_lengths_key": t.seqused_kv,
++        "block_table": t.c4_page_table,
++        "layout_query": "TND",
++        "layout_key": "PA_BSND",
++        "weights": t.li_weights.to(__import__("torch").float16),
++        "query_dequant_scale": q_scale.to(__import__("torch").float16),
++        "cmp_ratio": 4,
++        "query_quant_mode": 0,
++        "key_quant_mode": 0,
++        "sparse_mode": 3,
++        "sparse_count": cfg.index_topk,
++        "metadata": meta.li_quant,
++    }
++    payload = {
++        "source": "microbench_ops_runner",
++        "seq_len": seq_len,
++        "kwargs": {k: _encode(v) for k, v in kwargs.items()},
++    }
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++
++
++def _scalar(v: dict) -> str:
++    if "value" in v:
++        return str(v["value"])
++    if "sample" in v and len(v.get("sample", [])) == 1:
++        return str(v["sample"][0])
++    return ""
++
++
++def _row(name: str, prod: dict | None, micro: dict | None) -> str:
++    if prod is None and micro is None:
++        return f"| `{name}` | — | — | — | ⚠ missing |"
++    p = prod or {}
++    m = micro or {}
++    ps = str(p.get("shape", p.get("value", "—")))
++    ms = str(m.get("shape", m.get("value", "—")))
++    pd = str(p.get("dtype", _scalar(p) or "—"))
++    md = str(m.get("dtype", _scalar(m) or "—"))
++    match = (
++        ps == ms
++        and pd == md
++        and (_scalar(p) == _scalar(m) or not _scalar(p))
++    )
++    flag = "✅" if match else "❌"
++    return f"| `{name}` | {ps} / {pd} / {_scalar(p) or '—'} | {ms} / {md} / {_scalar(m) or '—'} | {flag} |"
++
++
++def write_diff(prod_path: Path, micro_path: Path, out_md: Path) -> int:
++    prod = json.loads(prod_path.read_text(encoding="utf-8"))
++    micro = json.loads(micro_path.read_text(encoding="utf-8"))
++    pk = prod.get("kwargs", {})
++    mk = micro.get("kwargs", {})
++    keys = sorted(set(pk) | set(mk))
++    lines = [
++        "# P1.4 indexer kwargs field diff",
++        "",
++        f"- production: `{prod_path}`",
++        f"- microbench: `{micro_path}`",
++        "",
++        "| field | production shape/dtype/value | microbench shape/dtype/value | match |",
++        "|-------|------------------------------|------------------------------|-------|",
++    ]
++    mism = 0
++    for k in keys:
++        line = _row(k, pk.get(k), mk.get(k))
++        lines.append(line)
++        if "❌" in line:
++            mism += 1
++    lines.extend(["", f"**Mismatches: {mism}**", ""])
++    out_md.write_text("\n".join(lines), encoding="utf-8")
++    print(f"[diff] wrote {out_md} mismatches={mism}")
++    return mism
++
++
++def main() -> int:
++    p = argparse.ArgumentParser()
++    p.add_argument(
++        "--prod",
++        default=str(MICRO_ROOT / "results" / "production_indexer_dump.json"),
++    )
++    p.add_argument(
++        "--micro-out",
++        default=str(MICRO_ROOT / "results" / "microbench_indexer_dump.json"),
++    )
++    p.add_argument(
++        "--out",
++        default=str(MICRO_ROOT / "results" / "p1_field_diff.md"),
++    )
++    p.add_argument("--seq-len", type=int, default=32768)
++    args = p.parse_args()
++
++    prod_path = Path(args.prod)
++    if not prod_path.is_file():
++        print(f"[diff][ERROR] missing production dump: {prod_path}")
++        return 2
++
++    micro_path = Path(args.micro_out)
++    capture_microbench_dump(micro_path, args.seq_len)
++    mism = write_diff(prod_path, micro_path, Path(args.out))
++    return 0 if mism == 0 else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

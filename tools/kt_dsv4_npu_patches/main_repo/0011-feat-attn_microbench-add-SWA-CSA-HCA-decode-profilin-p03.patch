@@ -1,0 +1,1951 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 11/13] feat(attn_microbench): add SWA/CSA/HCA decode profiling (part 3/5)
+
+diff --git a/tools/attn_microbench/attn_bench/report.py b/tools/attn_microbench/attn_bench/report.py
+new file mode 100644
+index 0000000..297e8af
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/report.py
+@@ -0,0 +1,335 @@
++from __future__ import annotations
++
++import argparse
++import glob
++import json
++from pathlib import Path
++
++from attn_bench.config import load_config
++from attn_bench.roofline import (
++    csa_attn_cmp_kv_bytes,
++    effective_tb_s,
++    hca_cmp_kv_bytes,
++    hw_lower_bound_us,
++    indexer_kv_bytes,
++    swa_kv_bytes,
++    util_vs_achievable,
++)
++
++
++def _block(data: dict, key: str) -> dict | None:
++    return data.get(key)
++
++
++def _fmt_mean_std(block: dict | None) -> str:
++    if not block:
++        return "-"
++    mean = block.get("device_mean_us", block.get("mean_us"))
++    std = block.get("device_std_us")
++    if mean is None:
++        return "-"
++    if std is not None:
++        return f"{mean:.1f} ± {std:.1f}"
++    return f"{mean:.1f}"
++
++
++def _mean_us(data: dict, key: str) -> float | None:
++    block = _block(data, key)
++    if not block:
++        return None
++    return block.get("device_mean_us", block.get("mean_us"))
++
++
++def _hw_mean(data: dict, key: str = "attn_hw") -> float | None:
++    block = _block(data, key)
++    if not block:
++        return None
++    return block.get("device_mean_us")
++
++
++def _load_json(path: str | Path) -> dict:
++    return json.loads(Path(path).read_text(encoding="utf-8"))
++
++
++def _overhead_row(
++    name: str,
++    py_mean: float | None,
++    py_std: float | None,
++    hw_mean: float | None,
++    hw_std: float | None,
++) -> dict:
++    if py_mean is None or hw_mean is None:
++        return {
++            "op": name,
++            "python_event_us": "-",
++            "msprof_device_us": "-",
++            "launch_overhead_us": "-",
++            "overhead_pct": "-",
++            "py_mean": py_mean,
++            "hw_mean": hw_mean,
++        }
++    overhead = py_mean - hw_mean
++    pct = (overhead / py_mean * 100.0) if py_mean else 0.0
++    py_fmt = f"{py_mean:.1f} ± {py_std:.1f}" if py_std is not None else f"{py_mean:.1f}"
++    hw_fmt = f"{hw_mean:.1f} ± {hw_std:.1f}" if hw_std is not None else f"{hw_mean:.1f}"
++    return {
++        "op": name,
++        "python_event_us": py_fmt,
++        "msprof_device_us": hw_fmt,
++        "launch_overhead_us": f"{overhead:.1f}",
++        "overhead_pct": f"{pct:.1f}%",
++        "py_mean": py_mean,
++        "hw_mean": hw_mean,
++        "overhead_pct_val": pct,
++    }
++
++
++def _verdict_overhead(rows: list[dict]) -> str:
++    vals = [r["overhead_pct_val"] for r in rows if "overhead_pct_val" in r]
++    if not vals:
++        return "数据不足"
++    avg = sum(vals) / len(vals)
++    if avg > 50:
++        return "Python launch 主导"
++    if avg < 30:
++        return "NPU kernel 主导"
++    return "中间（两边都贡献）"
++
++
++def _summary_mode(args) -> str:
++    rows = []
++    swa_attn = None
++    for path in args.inputs:
++        data = _load_json(path)
++        kind = data["kind"]
++        row = {
++            "kind": kind,
++            "seq_len": data.get("seq_len"),
++            "batch_size": data.get("batch_size", 1),
++            "indexer": _fmt_mean_std(_block(data, "indexer_us")),
++            "attn": _fmt_mean_std(_block(data, "attn_us")),
++            "isolated_sum": _fmt_mean_std(
++                _block(data, "isolated_device_sum_us") or _block(data, "total_us")
++            ),
++            "attn_mean_raw": _mean_us(data, "attn_us"),
++            "attn_host": (
++                data.get("attn_us", {}).get("host_mean_us") if data.get("attn_us") else None
++            ),
++            "repeat_n": (data.get("attn_us") or {}).get("n"),
++        }
++        if kind == "swa":
++            swa_attn = row["attn_mean_raw"]
++        rows.append(row)
++
++    lines = [
++        "# Synthetic Attention Microbench Summary",
++        "",
++        "> ⚠️ Read `results/diag_seq_scaling.json` before trusting seq_len scaling.",
++        "> `attn_us` for csa/hca **includes SWA branch**; do not add with swa.",
++        "> `isolated_sum_us` = indexer + attn **independent** timings (not fused E2E).",
++        "",
++        "| kind | seq_len | batch | n | indexer (µs) | attn (µs) | attn_compressed_only | isolated_sum (µs) | attn_host (µs) |",
++        "|------|---------|-------|---|--------------|-----------|----------------------|-------------------|----------------|",
++    ]
++    for r in sorted(rows, key=lambda x: x["kind"]):
++        compressed = "-"
++        if r["kind"] in ("csa", "hca") and swa_attn is not None and r["attn_mean_raw"] is not None:
++            compressed = f"{r['attn_mean_raw'] - swa_attn:.1f}"
++        lines.append(
++            f"| {r['kind']} | {r['seq_len']} | {r['batch_size']} | {r.get('repeat_n', '-')} | "
++            f"{r['indexer']} | {r['attn']} | {compressed} | {r['isolated_sum']} | "
++            f"{r.get('attn_host', '-')} |"
++        )
++    return "\n".join(lines) + "\n"
++
++
++def _comparison_mode(args) -> str:
++    msprof_paths = args.msprof_jsons or []
++    event_paths = args.event_jsons or []
++    if len(msprof_paths) < 3 or len(event_paths) < 3:
++        raise SystemExit("comparison mode needs 3 msprof JSONs and 3 event JSONs")
++
++    by_kind_msprof = {_load_json(p)["kind"]: _load_json(p) for p in msprof_paths}
++    by_kind_event = {_load_json(p)["kind"]: _load_json(p) for p in event_paths}
++    cfg = load_config()
++
++    swa_e = by_kind_event["swa"]
++    csa_e = by_kind_event["csa"]
++    hca_e = by_kind_event["hca"]
++    swa_m = by_kind_msprof["swa"]
++    csa_m = by_kind_msprof["csa"]
++    hca_m = by_kind_msprof["hca"]
++
++    rows = [
++        _overhead_row(
++            "swa_attn",
++            _mean_us(swa_e, "attn_us"),
++            swa_e.get("attn_us", {}).get("device_std_us"),
++            _hw_mean(swa_m, "attn_hw"),
++            swa_m.get("attn_hw", {}).get("device_std_us"),
++        ),
++        _overhead_row(
++            "csa_indexer",
++            _mean_us(csa_e, "indexer_us"),
++            csa_e.get("indexer_us", {}).get("device_std_us"),
++            _hw_mean(csa_m, "indexer_hw"),
++            csa_m.get("indexer_hw", {}).get("device_std_us"),
++        ),
++        _overhead_row(
++            "csa_attn",
++            _mean_us(csa_e, "attn_us"),
++            csa_e.get("attn_us", {}).get("device_std_us"),
++            _hw_mean(csa_m, "attn_hw"),
++            csa_m.get("attn_hw", {}).get("device_std_us"),
++        ),
++        _overhead_row(
++            "hca_attn",
++            _mean_us(hca_e, "attn_us"),
++            hca_e.get("attn_us", {}).get("device_std_us"),
++            _hw_mean(hca_m, "attn_hw"),
++            hca_m.get("attn_hw", {}).get("device_std_us"),
++        ),
++    ]
++
++    tb = effective_tb_s(cfg)
++    roof_rows = [
++        ("swa_attn", _hw_mean(swa_m, "attn_hw"), swa_kv_bytes(cfg)),
++        ("csa_indexer", _hw_mean(csa_m, "indexer_hw"), indexer_kv_bytes(cfg)),
++        ("csa_attn", _hw_mean(csa_m, "attn_hw"), csa_attn_cmp_kv_bytes(cfg)),
++        ("hca_attn", _hw_mean(hca_m, "attn_hw"), hca_cmp_kv_bytes(cfg)),
++    ]
++
++    lines = [
++        "# msprof vs Python Event Comparison",
++        "",
++        "> Python Event = eager end-to-end per op call",
++        "> msprof device time = NPU hardware kernel time (Level1 op_summary)",
++        "",
++        "## Launch Overhead 拆解",
++        "",
++        "| op | python_event_us (mean±std) | msprof_device_us (mean±std) | launch_overhead_us | overhead_pct |",
++        "|----|----------------------------|------------------------------|--------------------|--------------|",
++    ]
++    for r in rows:
++        lines.append(
++            f"| {r['op']} | {r['python_event_us']} | {r['msprof_device_us']} | "
++            f"{r['launch_overhead_us']} | {r['overhead_pct']} |"
++        )
++
++    verdict = _verdict_overhead(rows)
++    lines.extend([
++        "",
++        "判定:",
++        f"- overhead_pct > 50% → Python launch 主导, 优化方向 = NPUGraph / op fusion",
++        f"- overhead_pct < 30% → NPU kernel 主导, 优化方向 = kernel 内部 / 算法",
++        f"- 中间 → 两边都要看",
++        f"- **本次判定: {verdict}**",
++        "",
++        "## Roofline 对照 (hw 层, effective {:.1f} TB/s)".format(tb),
++        "",
++        "| op | device_us (msprof) | hw_lower_bound_us | util_vs_achievable |",
++        "|----|--------------------|-------------------|---------------------|",
++    ])
++    for name, dev_us, nbytes in roof_rows:
++        lb = hw_lower_bound_us(nbytes, tb)
++        util = util_vs_achievable(dev_us or 0.0, lb) if dev_us else 0.0
++        lines.append(
++            f"| {name} | {dev_us:.1f} | {lb:.2f} | {util:.3f} |"
++            if dev_us is not None
++            else f"| {name} | - | {lb:.2f} | - |"
++        )
++    lines.extend([
++        "",
++        "> util_vs_achievable < 0.1 → kernel 远未打满带宽",
++        "> util_vs_achievable > 0.5 → kernel 已接近带宽极限",
++        "",
++        "## 顶部速览 (overhead_pct)",
++    ])
++    for r in rows:
++        lines.append(f"- {r['op']}: {r['overhead_pct']}")
++    return "\n".join(lines) + "\n"
++
++
++def _msprof_sweep_mode(args) -> str:
++    paths = sorted(glob.glob(args.inputs[0]) if len(args.inputs) == 1 and "*" in args.inputs[0] else args.inputs)
++    rows = []
++    base_idx = None
++    for p in paths:
++        data = _load_json(p)
++        seq = int(data.get("seq_len", 0))
++        idx = _hw_mean(data, "indexer_hw")
++        attn = _hw_mean(data, "attn_hw")
++        if seq == 1024:
++            base_idx = idx
++        scaling = (idx / base_idx) if base_idx and idx and seq != 1024 else (1.0 if seq == 1024 else None)
++        rows.append({
++            "seq_len": seq,
++            "indexer_hw": idx,
++            "indexer_std": data.get("indexer_hw", {}).get("device_std_us"),
++            "attn_hw": attn,
++            "attn_std": data.get("attn_hw", {}).get("device_std_us"),
++            "scaling": scaling,
++        })
++    rows.sort(key=lambda x: x["seq_len"])
++
++    max_scaling = max((r["scaling"] or 1.0) for r in rows)
++    if max_scaling > 2.0:
++        sweep_verdict = "硬件层随 seq_len 单调 — P1.5 平坦结论被推翻（Python overhead 平坦）"
++    elif max_scaling < 1.2:
++        sweep_verdict = "硬件层也平坦 — kernel-internal floor 实锤"
++    else:
++        sweep_verdict = f"硬件层部分缩放 (max ratio {max_scaling:.2f}×) — 需分项分析"
++
++    lines = [
++        "# msprof CSA seq sweep (hardware only)",
++        "",
++        "| seq_len | indexer_hw_us (mean±std) | attn_hw_us (mean±std) | scaling_vs_1k |",
++        "|---------|--------------------------|------------------------|---------------|",
++    ]
++    for r in rows:
++        idx_fmt = (
++            f"{r['indexer_hw']:.1f} ± {r['indexer_std']:.1f}"
++            if r["indexer_hw"] is not None and r["indexer_std"] is not None
++            else "-"
++        )
++        attn_fmt = (
++            f"{r['attn_hw']:.1f} ± {r['attn_std']:.1f}"
++            if r["attn_hw"] is not None and r["attn_std"] is not None
++            else "-"
++        )
++        sc = f"{r['scaling']:.2f}" if r["scaling"] is not None else "-"
++        lines.append(f"| {r['seq_len']} | {idx_fmt} | {attn_fmt} | {sc} |")
++
++    lines.extend(["", "判定:", f"- {sweep_verdict}"])
++    return "\n".join(lines) + "\n"
++
++
++def main(argv: list[str] | None = None) -> int:
++    p = argparse.ArgumentParser(description="Summarize SWA/CSA/HCA bench JSON")
++    p.add_argument("--mode", choices=("summary", "comparison", "msprof-sweep"), default="summary")
++    p.add_argument("--inputs", nargs="+", default=[])
++    p.add_argument("--msprof-jsons", nargs="+", default=None)
++    p.add_argument("--event-jsons", nargs="+", default=None)
++    p.add_argument("--out", type=str, required=True)
++    args = p.parse_args(argv)
++
++    if args.mode == "comparison":
++        text = _comparison_mode(args)
++    elif args.mode == "msprof-sweep":
++        if not args.inputs:
++            raise SystemExit("msprof-sweep requires --inputs")
++        text = _msprof_sweep_mode(args)
++    else:
++        if not args.inputs:
++            raise SystemExit("summary mode requires --inputs")
++        text = _summary_mode(args)
++
++    out = Path(args.out)
++    out.parent.mkdir(parents=True, exist_ok=True)
++    out.write_text(text, encoding="utf-8")
++    print(text)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/attn_microbench/attn_bench/roofline.py b/tools/attn_microbench/attn_bench/roofline.py
+new file mode 100644
+index 0000000..1c0c314
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/roofline.py
+@@ -0,0 +1,47 @@
++"""Roofline helpers for attention microbench (HBM lower-bound estimates)."""
++
++from __future__ import annotations
++
++from attn_bench.config import BenchConfig
++
++
++def effective_tb_s(cfg: BenchConfig) -> float:
++    return float(cfg.roofline.get("hbm_effective_tb_s", 1.0))
++
++
++def swa_kv_bytes(cfg: BenchConfig) -> int:
++    """SWA window: 128 tokens × 1 kv head × 512 dim × 2 B."""
++    win = min(cfg.sliding_window_size, cfg.seq_len)
++    return win * cfg.num_heads_kv * cfg.head_dim * 2
++
++
++def indexer_kv_bytes(cfg: BenchConfig) -> int:
++    """Indexer int8 KV: c4_cols × 1 × index_head_dim × 1 B."""
++    c4_cols = cfg.effective_c4_cols()
++    return c4_cols * cfg.num_heads_kv * cfg.index_head_dim * 1
++
++
++def csa_attn_cmp_kv_bytes(cfg: BenchConfig) -> int:
++    """CSA compressed attn bf16 KV read: c4_cols × 1 × head_dim × 2 B."""
++    c4_cols = cfg.effective_c4_cols()
++    return c4_cols * cfg.num_heads_kv * cfg.head_dim * 2
++
++
++def hca_cmp_kv_bytes(cfg: BenchConfig) -> int:
++    """HCA compressed attn bf16 KV: c128_cols × 1 × head_dim × 2 B."""
++    c128_cols = max(1, cfg.seq_len // 128)
++    return c128_cols * cfg.num_heads_kv * cfg.head_dim * 2
++
++
++def hw_lower_bound_us(num_bytes: int, tb_s: float = 1.0) -> float:
++    """Minimum device time (µs) if memory-bound at effective HBM bandwidth."""
++    if num_bytes <= 0 or tb_s <= 0:
++        return 0.0
++    return num_bytes / (tb_s * 1e6)
++
++
++def util_vs_achievable(device_us: float, lower_bound_us: float) -> float:
++    """Fraction of peak HBM bandwidth achieved (lb / device), capped at 1."""
++    if device_us <= 0 or lower_bound_us <= 0:
++        return 0.0
++    return min(1.0, lower_bound_us / device_us)
+diff --git a/tools/attn_microbench/attn_bench/sanity.py b/tools/attn_microbench/attn_bench/sanity.py
+new file mode 100644
+index 0000000..165ea79
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/sanity.py
+@@ -0,0 +1,28 @@
++from __future__ import annotations
++
++import torch
++
++
++def sanity_check(name: str, o: torch.Tensor) -> dict:
++    finite = torch.isfinite(o)
++    has_nan = bool((~finite).any().item())
++    report = {
++        "kind": name,
++        "shape": list(o.shape),
++        "dtype": str(o.dtype),
++        "has_nan": has_nan,
++    }
++    if not has_nan:
++        report["mean"] = float(o.float().mean().item())
++        report["std"] = float(o.float().std().item())
++        report["abs_max"] = float(o.float().abs().max().item())
++    else:
++        report["mean"] = float("nan")
++        report["std"] = float("nan")
++        report["abs_max"] = float("inf")
++    return report
++
++
++def require_sane(report: dict) -> None:
++    if report.get("has_nan"):
++        raise RuntimeError(f"sanity failed for {report['kind']}: NaN/Inf in output")
+diff --git a/tools/attn_microbench/attn_bench/synthetic.py b/tools/attn_microbench/attn_bench/synthetic.py
+new file mode 100644
+index 0000000..d1309db
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/synthetic.py
+@@ -0,0 +1,228 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import torch
++
++from attn_bench.config import BenchConfig
++from attn_bench.page_table import (
++    PageTableSpec,
++    build_c128_page_table,
++    build_c4_page_table,
++    build_swa_page_table,
++    compute_page_spec,
++)
++
++
++@dataclass
++class SyntheticTensors:
++    q: torch.Tensor
++    sinks: torch.Tensor
++    ori_kv: torch.Tensor
++    cmp_kv_c4: torch.Tensor
++    cmp_kv_c128: torch.Tensor
++    swa_page_table: torch.Tensor
++    c4_page_table: torch.Tensor
++    c128_page_table: torch.Tensor
++    seqused_kv: torch.Tensor
++    cu_seqlens_q_pa: torch.Tensor
++    actual_seq_lengths_q: torch.Tensor
++    li_query: torch.Tensor
++    li_key: torch.Tensor
++    li_key_scale: torch.Tensor
++    li_weights: torch.Tensor
++    page_spec: PageTableSpec
++
++
++def _dtype_from_name(name: str) -> torch.dtype:
++    if name == "bfloat16":
++        return torch.bfloat16
++    if name == "float16":
++        return torch.float16
++    if name == "int8":
++        return torch.int8
++    return torch.float32
++
++
++def build_topk_random(
++    cfg: BenchConfig, c4_cols: int, device: torch.device, generator: torch.Generator
++) -> torch.Tensor:
++    """[B, index_topk] int32 valid indices in [0, c4_cols)."""
++    k = min(cfg.index_topk, c4_cols)
++    idx = torch.randint(
++        0, c4_cols, (cfg.batch_size, k), generator=generator, device=device
++    )
++    if k < cfg.index_topk:
++        pad = torch.full(
++            (cfg.batch_size, cfg.index_topk - k),
++            -1,
++            dtype=torch.int32,
++            device=device,
++        )
++        idx = torch.cat([idx, pad], dim=1)
++    return idx.to(torch.int32)
++
++
++def build_synthetic(cfg: BenchConfig, *, swa_no_sink: bool = True) -> SyntheticTensors:
++    device = torch.device(cfg.device)
++    dtype = _dtype_from_name(cfg.dtype)
++    gen = torch.Generator(device=device)
++    gen.manual_seed(cfg.seed)
++
++    c4_override = cfg.diag.get("override_c4_cols")
++    spec = compute_page_spec(
++        cfg.seq_len,
++        cfg.page_size,
++        cfg.batch_size,
++        c4_cols_override=int(c4_override) if c4_override is not None else None,
++    )
++    num_tokens = cfg.num_tokens
++
++    q = torch.randn(
++        (num_tokens, cfg.num_heads_q, cfg.head_dim),
++        dtype=dtype,
++        device=device,
++        generator=gen,
++    )
++    if swa_no_sink:
++        sinks = torch.full(
++            (cfg.num_heads_q,), float("-inf"), dtype=torch.float32, device=device
++        )
++    else:
++        sinks = torch.zeros(cfg.num_heads_q, dtype=torch.float32, device=device)
++
++    ori_kv = torch.randn(
++        (spec.swa_num_pages, cfg.page_size, cfg.num_heads_kv, cfg.head_dim),
++        dtype=dtype,
++        device=device,
++        generator=gen,
++    )
++    cmp_kv_c4 = torch.randn(
++        (spec.c4_num_pages, cfg.page_size, cfg.num_heads_kv, cfg.head_dim),
++        dtype=dtype,
++        device=device,
++        generator=gen,
++    )
++    cmp_kv_c128 = torch.randn(
++        (spec.c128_num_pages, cfg.page_size, cfg.num_heads_kv, cfg.head_dim),
++        dtype=dtype,
++        device=device,
++        generator=gen,
++    )
++
++    swa_page_table = build_swa_page_table(spec, device)
++    c4_page_table = build_c4_page_table(spec, device, cfg)
++    c128_page_table = build_c128_page_table(spec, device, cfg)
++
++    seqused_kv = torch.full(
++        (cfg.batch_size,), cfg.effective_seqused_kv(), dtype=torch.int32, device=device
++    )
++    cu_seqlens_q_pa = torch.arange(
++        0, cfg.batch_size + 1, dtype=torch.int32, device=device
++    )
++    actual_seq_lengths_q = torch.arange(
++        1, cfg.batch_size + 1, dtype=torch.int32, device=device
++    )
++
++    li_query = torch.randn(
++        (num_tokens, cfg.index_n_heads, cfg.index_head_dim),
++        dtype=dtype,
++        device=device,
++        generator=gen,
++    )
++    li_key = torch.randint(
++        -127,
++        128,
++        (spec.c4_num_pages, cfg.page_size, cfg.num_heads_kv, cfg.index_head_dim),
++        dtype=torch.int8,
++        device=device,
++        generator=gen,
++    )
++    li_key_scale = torch.full(
++        (spec.c4_num_pages, cfg.page_size, cfg.num_heads_kv, 1),
++        0.01,
++        dtype=torch.float16,
++        device=device,
++    )
++    li_weights = torch.randn(
++        (num_tokens, cfg.index_n_heads),
++        dtype=torch.float16,
++        device=device,
++        generator=gen,
++    )
++
++    return SyntheticTensors(
++        q=q,
++        sinks=sinks,
++        ori_kv=ori_kv,
++        cmp_kv_c4=cmp_kv_c4,
++        cmp_kv_c128=cmp_kv_c128,
++        swa_page_table=swa_page_table,
++        c4_page_table=c4_page_table,
++        c128_page_table=c128_page_table,
++        seqused_kv=seqused_kv,
++        cu_seqlens_q_pa=cu_seqlens_q_pa,
++        actual_seq_lengths_q=actual_seq_lengths_q,
++        li_query=li_query,
++        li_key=li_key,
++        li_key_scale=li_key_scale,
++        li_weights=li_weights,
++        page_spec=spec,
++    )
++
++
++def assert_shapes(cfg: BenchConfig, t: SyntheticTensors) -> None:
++    spec = t.page_spec
++    num_tokens = cfg.num_tokens
++
++    assert t.q.shape == (num_tokens, cfg.num_heads_q, cfg.head_dim), t.q.shape
++    assert t.sinks.shape == (cfg.num_heads_q,)
++    assert t.ori_kv.shape == (
++        spec.swa_num_pages,
++        cfg.page_size,
++        cfg.num_heads_kv,
++        cfg.head_dim,
++    )
++    assert t.cmp_kv_c4.shape == (
++        spec.c4_num_pages,
++        cfg.page_size,
++        cfg.num_heads_kv,
++        cfg.head_dim,
++    )
++    assert t.cmp_kv_c128.shape == (
++        spec.c128_num_pages,
++        cfg.page_size,
++        cfg.num_heads_kv,
++        cfg.head_dim,
++    )
++    assert t.swa_page_table.shape == (cfg.batch_size, spec.swa_cols)
++    assert int(t.swa_page_table.max()) < spec.swa_num_pages, (
++        f"swa_page_table max {t.swa_page_table.max()} >= {spec.swa_num_pages}"
++    )
++    assert t.c4_page_table.shape == (cfg.batch_size, spec.c4_num_pages), t.c4_page_table.shape
++    assert int(t.c4_page_table.max()) < spec.c4_num_pages
++    assert t.c128_page_table.shape == (cfg.batch_size, spec.c128_num_pages), (
++        t.c128_page_table.shape
++    )
++    assert int(t.c128_page_table.max()) < spec.c128_num_pages
++    assert t.seqused_kv.shape == (cfg.batch_size,)
++    expected_seqused = cfg.effective_seqused_kv()
++    assert int(t.seqused_kv[0]) == expected_seqused, (
++        f"seqused_kv {t.seqused_kv[0]} != expected {expected_seqused}"
++    )
++    assert t.cu_seqlens_q_pa.tolist()[0] == 0
++    assert t.cu_seqlens_q_pa.tolist()[-1] == cfg.batch_size
++    assert t.li_key.shape == (
++        spec.c4_num_pages,
++        cfg.page_size,
++        cfg.num_heads_kv,
++        cfg.index_head_dim,
++    )
++    assert t.li_key.dtype == torch.int8
++    assert t.li_key_scale.shape == (
++        spec.c4_num_pages,
++        cfg.page_size,
++        cfg.num_heads_kv,
++        1,
++    )
++    assert t.li_query.shape == (num_tokens, cfg.index_n_heads, cfg.index_head_dim)
+diff --git a/tools/attn_microbench/attn_bench/timing.py b/tools/attn_microbench/attn_bench/timing.py
+new file mode 100644
+index 0000000..d0f479f
+--- /dev/null
++++ b/tools/attn_microbench/attn_bench/timing.py
+@@ -0,0 +1,98 @@
++from __future__ import annotations
++
++import statistics
++import time
++from dataclasses import dataclass
++from typing import Callable
++
++import torch
++
++
++@dataclass
++class TimingResult:
++    device_mean_us: float
++    device_p50_us: float
++    device_p95_us: float
++    device_p99_us: float
++    device_max_us: float
++    device_std_us: float
++    host_mean_us: float
++    samples_device: list[float]
++    samples_host: list[float]
++
++    # Backward-compatible aliases
++    @property
++    def mean_us(self) -> float:
++        return self.device_mean_us
++
++    @property
++    def p50_us(self) -> float:
++        return self.device_p50_us
++
++    @property
++    def p99_us(self) -> float:
++        return self.device_p99_us
++
++    def to_dict(self) -> dict:
++        return {
++            "mean": self.device_mean_us,
++            "device_mean_us": self.device_mean_us,
++            "device_p50_us": self.device_p50_us,
++            "device_p95_us": self.device_p95_us,
++            "device_p99_us": self.device_p99_us,
++            "device_max_us": self.device_max_us,
++            "device_std_us": self.device_std_us,
++            "host_mean_us": self.host_mean_us,
++            "mean_us": self.device_mean_us,
++            "p50_us": self.device_p50_us,
++            "p99_us": self.device_p99_us,
++            "n": len(self.samples_device),
++        }
++
++
++def _percentile(values: list[float], p: float) -> float:
++    if not values:
++        return 0.0
++    s = sorted(values)
++    k = (len(s) - 1) * p / 100.0
++    f = int(k)
++    c = min(f + 1, len(s) - 1)
++    if f == c:
++        return s[f]
++    return s[f] + (s[c] - s[f]) * (k - f)
++
++
++def bench_op(fn: Callable[[], None], warmup: int, repeat: int) -> TimingResult:
++    import torch_npu
++
++    for _ in range(warmup):
++        fn()
++    torch_npu.npu.synchronize()
++
++    samples_device: list[float] = []
++    samples_host: list[float] = []
++    for _ in range(repeat):
++        start = torch.npu.Event(enable_timing=True)
++        end = torch.npu.Event(enable_timing=True)
++        host_t0 = time.perf_counter()
++        start.record()
++        fn()
++        end.record()
++        torch_npu.npu.synchronize()
++        host_t1 = time.perf_counter()
++        samples_device.append(start.elapsed_time(end) * 1000.0)
++        samples_host.append((host_t1 - host_t0) * 1e6)
++
++    return TimingResult(
++        device_mean_us=statistics.mean(samples_device),
++        device_p50_us=statistics.median(samples_device),
++        device_p95_us=_percentile(samples_device, 95),
++        device_p99_us=_percentile(samples_device, 99),
++        device_max_us=max(samples_device),
++        device_std_us=statistics.pstdev(samples_device)
++        if len(samples_device) > 1
++        else 0.0,
++        host_mean_us=statistics.mean(samples_host),
++        samples_device=samples_device,
++        samples_host=samples_host,
++    )
+diff --git a/tools/attn_microbench/config/dsv4_flash.yaml b/tools/attn_microbench/config/dsv4_flash.yaml
+new file mode 100644
+index 0000000..e54725a
+--- /dev/null
++++ b/tools/attn_microbench/config/dsv4_flash.yaml
+@@ -0,0 +1,95 @@
++# DeepSeek-V4-Flash NPU attention microbench config
++# 实测来源: tools/p27_launch_ds4flash_npu.sh + ascend_backend.py + nsa_indexer.py (2026-05-26)
++#
++# 与论文 (§2.3.4 / §4.2.1) 的已知偏离:
++#   - 主 KV: bf16 全维, 论文为 bf16 (RoPE 64 维) + fp8 (其余) mixed; 偏离 ~2× HBM 流量
++#   - Indexer KV: int8 + per-block scale, 对应 LI_KV_DTYPE_INT8=1; 论文为 FP4
++#   - Synthetic 数据: 全 randn, 不区分 RoPE/非 RoPE 维
++#   - sinks 默认 -inf (≡ 无 sink); 论文 CSA/HCA core attention 带可学习 sink (前 2 层 SWA 未明确)
++# README §"已知偏离" 同步声明; 任何 long-context 性能结论需考虑这些偏差.
++
++model:
++  num_heads_q: 64                # CSA/HCA core attention query heads (n_h)
++  num_heads_kv: 1
++  head_dim: 512
++  softmax_scale: 0.044194173824065346    # 1/sqrt(head_dim); 显式避免下游推断
++  index_n_heads: 64              # indexer query heads (n^I_h); 与 num_heads_q 同值但语义独立
++  index_head_dim: 128
++  index_topk: 512                # Flash; Pro 用 1024
++  sliding_window_size: 128
++
++runtime:
++  page_size: 128
++  batch_size: 1
++  device: npu:0
++  dtypes:
++    q: bfloat16
++    ori_kv: bfloat16             # 论文 mixed bf16+fp8; 本 bench 全 bf16
++    cmp_kv: bfloat16
++    out: bfloat16
++    indexer_kv: int8             # LI_KV_DTYPE_INT8=1
++    indexer_weight: float16
++
++bench:
++  seq_len: 32768
++  q_len: 1                       # 1=decode; >1=chunked prefill (P3)
++  q_len_sweep: [1]               # 主线只跑 decode
++  warmup: 30
++  repeat: 1000                   # P0 后正式默认; M=1 GEMV-scale kernel 抖动大
++  quick_mode_repeat: 100         # CLI --quick-mode
++  quick_mode_warmup: 10
++  seed: 42
++  sanity: false
++
++# DSv4-Flash 主 stack layer 分布 (config.json compress_ratios)
++# 仅作信息; microbench synthetic 不区分层
++layer_layout_info:
++  total_layers_in_main: 43             # ⚠ len(compress_ratios)=44; L43 待 P1 dump 确认 (MTP head / padding / nextn?)
++  swa_layer_ids: [0, 1]                # ratio=1 pure SWA
++  csa_layer_count_in_main: 20          # 或 21; 取决于 L43 归属
++  hca_layer_count_in_main: 20          # 或 21
++
++metadata_keys:
++  # 所有值需对照 ascend_backend.py / nsa_indexer.py; CANN 升级时核对枚举重映射
++  ori_mask_mode: 4               # ascend_backend SparseAttnSharedkv kwargs; "sliding causal"
++  cmp_mask_mode: 3               # 同上; "compressed causal"
++  layout_q: TND                  # T=tokens, N=heads, D=dim
++  layout_kv: PA_ND               # PA=paged
++  layout_li_key: PA_BSND         # nsa_indexer.py::forward_npu_dsv4_fusion
++  sparse_mode: 3                 # nsa_indexer; "topk sparse"
++  key_quant_mode: 0              # nsa_indexer; 0=per-block scale
++  query_quant_mode: 0            # nsa_indexer; 0=dynamic per-token
++
++# 历史 bug 修复点 (审核报告 §6.2); 改之前必须先看报告
++invariants:
++  page_table_value_domain: physical_page_id    # not logical_index (B1)
++  seqused_kv_shape: "[B]"                       # not "[seq_len]" (B2)
++  li_key_scale_shape: "[P, page_size, 1, 1]"   # 4D buffer
++  li_key_scale_squeeze_dim: -2                  # squeeze 后传 indexer; not -1 (B3)
++  cmp_kv_c4_second_dim_semantics: TBD           # 128 vs 32; P1 dump 生产 buffer 钉死 (B4)
++  sinks_default: "-inf"                         # ≡ 无 sink; 生产 SWA 实际值待 ckpt dump
++
++# P0/P1 诊断旋钮; 默认 null = 跟随 bench.seq_len 自然推导
++diag:
++  override_seqused_kv: null              # 设 128 跑极端测试 (P0 B)
++  override_actual_seq_lengths_key: null  # 设 c4_len 跑变体 (P0 C)
++  override_c4_cols: null                 # 设 4/16/64 排除 kernel floor 假说 (P1.1)
++  page_table_unique_pages: false         # true = 每 logical col 一个 unique physical page (P1.2)
++  page_table_seed: 42
++
++# Roofline 下界 (与 moe yaml 一致); 用于 isolated bench 是否打满判断
++roofline:
++  hbm_peak_tb_s: 1.6
++  hbm_peak_source: "Ascend 910B vendor spec, confirm via npu-smi at P1"
++  hbm_effective_tb_s: 1.0                # P1 measure_hbm_effective_tb_s 校准后回填
++
++msprof:
++  enabled: false
++  profiler_level: "Level1"
++  aic_metrics: "PipeUtilization"
++  skip_first: 5
++  warmup: 2
++  active: 10
++  out_dir: "./npu_results"
++  record_shapes: true
++  with_stack: false
+\ No newline at end of file
+diff --git a/tools/attn_microbench/env.sh b/tools/attn_microbench/env.sh
+new file mode 100644
+index 0000000..c67478a
+--- /dev/null
++++ b/tools/attn_microbench/env.sh
+@@ -0,0 +1,82 @@
++#!/usr/bin/env bash
++# attn_microbench 独立环境：只读依赖仓库 third_party/sglang，不修改主干。
++set -euo pipefail
++MICROBENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "${MICROBENCH_ROOT}/../.." && pwd)"
++
++export REPO_ROOT
++export MICROBENCH_ROOT
++export PYTHONPATH="${MICROBENCH_ROOT}:${REPO_ROOT}/third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
++
++export ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
++export ASCEND_TOOLKIT_HOME
++
++# 与 tools/p27_launch_ds4flash_npu.sh 对齐（DSv4 attention / custom_ops 通路）
++export SGLANG_SET_CPU_AFFINITY="${SGLANG_SET_CPU_AFFINITY:-1}"
++export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"
++export STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}"
++export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
++export IS_DEEPSEEK_V4="${IS_DEEPSEEK_V4:-1}"
++export USE_FUSED_COMPRESSOR="${USE_FUSED_COMPRESSOR:-1}"
++export LI_KV_DTYPE_INT8="${LI_KV_DTYPE_INT8:-1}"
++export USE_PA_DECODE="${USE_PA_DECODE:-1}"
++export USE_PA_PREFILL="${USE_PA_PREFILL:-1}"
++export USE_FUSED_HC_POST_ASCENDC="${USE_FUSED_HC_POST_ASCENDC:-1}"
++export USE_FUSED_HC_PRE_ASCENDC="${USE_FUSED_HC_PRE_ASCENDC:-1}"
++export USE_NPU_MOE_GATING_TOP_K="${USE_NPU_MOE_GATING_TOP_K:-1}"
++export USE_FUSED_TRANSPOSE_BATCHMATMUL="${USE_FUSED_TRANSPOSE_BATCHMATMUL:-1}"
++export USE_ROPE_PARTIAL_IN_PLACE_ASCENDC="${USE_ROPE_PARTIAL_IN_PLACE_ASCENDC:-1}"
++export ASCEND_USE_FIA="${ASCEND_USE_FIA:-1}"
++
++# custom_ops.so 依赖 libc10.so；与 p27 一致先挂 kml，再挂当前 Python 的 torch/lib
++export LD_LIBRARY_PATH="/usr/local/kml/lib:${LD_LIBRARY_PATH:-}"
++
++if [[ -f "${ASCEND_TOOLKIT_HOME}/set_env.sh" ]]; then
++  # shellcheck source=/dev/null
++  source "${ASCEND_TOOLKIT_HOME}/set_env.sh" || true
++fi
++
++# ---------- NPU 卡选择 ----------
++# 进程内逻辑设备恒为 npu:0；物理卡由 ASCEND_RT_VISIBLE_DEVICES 指定。
++# 例：export ASCEND_RT_VISIBLE_DEVICES=3  →  绑定物理 NPU 3
++if [[ -z "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
++  export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICE_ID:-0}"
++fi
++echo "[attn_microbench] ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} (logical npu:0)"
++
++_probe_py() {
++  local bin="$1"
++  command -v "$bin" >/dev/null 2>&1 || return 1
++  PYTHONPATH="$PYTHONPATH" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" "$bin" - <<'PY' >/dev/null 2>&1
++import importlib
++for m in ("yaml", "torch", "torch_npu", "custom_ops"):
++    importlib.import_module(m)
++PY
++}
++if [[ -z "${PYTHON_BIN:-}" ]]; then
++  for _cand in python3 python3.11 /usr/local/python3.11.14/bin/python3.11 \
++               /usr/local/python3.11.14/bin/python3; do
++    if _probe_py "$_cand"; then
++      PYTHON_BIN="$(command -v "$_cand")"
++      break
++    fi
++  done
++fi
++if [[ -z "${PYTHON_BIN:-}" ]]; then
++  echo "[attn_microbench][ERROR] 没找到能 import torch/torch_npu/custom_ops 的 python。" >&2
++  echo "[attn_microbench][ERROR] 建议 export PYTHON_BIN=/usr/local/python3.11.14/bin/python3.11" >&2
++  exit 2
++fi
++export PYTHON_BIN
++
++_TORCH_LIB="$("${PYTHON_BIN}" - <<'PY'
++import os, torch
++print(os.path.join(os.path.dirname(torch.__file__), "lib"))
++PY
++)"
++if [[ -n "${_TORCH_LIB}" && -d "${_TORCH_LIB}" ]]; then
++  export LD_LIBRARY_PATH="${_TORCH_LIB}:${LD_LIBRARY_PATH}"
++fi
++echo "[attn_microbench] PYTHON_BIN=${PYTHON_BIN}"
++
++cd "${MICROBENCH_ROOT}"
+diff --git a/tools/attn_microbench/results/P1_7_analysis_guide.md b/tools/attn_microbench/results/P1_7_analysis_guide.md
+new file mode 100644
+index 0000000..9237e93
+--- /dev/null
++++ b/tools/attn_microbench/results/P1_7_analysis_guide.md
+@@ -0,0 +1,294 @@
++# P1.7 分析落盘：硬件耗时、整网折算、复现与数据解析
++
++> 日期：2026-05-26  
++> 前置：P1.7 msprof 双轨测量已完成（Event 保留，msprof 新增）
++
++---
++
++## 1. 核心结论（摘要）
++
++| 口径 | 整网 attention @ 32k decode | 说明 |
++|------|----------------------------|------|
++| **NPU 硬件 (msprof)** | **~2.0 ms / token** | 42 层加总（SWA×2 + CSA×20 + HCA×20） |
++| **Python Event (eager)** | **~11.4 ms / token** | repeat=1000；launch overhead ~82% |
++| **生产 msprof (token#200)** | SparseAttn **~1.12 ms / 43 层** | seq≈200，口径不同，不可直接对标 32k |
++
++**判定**：P1.5「kernel floor」被推翻 — 平坦来自 **Python launch**；硬件 indexer 随 seq 缩放（1024→32768 约 **2.1×**）。
++
++---
++
++## 2. 层架构与折算公式
++
++来源：`config/dsv4_flash.yaml` → `layer_layout_info` + `DeepSeek-V4-Flash-W8A8/config.json` compress_ratios
++
++| 层 | 类型 | 层数 | 每 token 算子 |
++|----|------|------|---------------|
++| L0–L1 | SWA (ratio=1) | 2 | `npu_sparse_attn_sharedkv` ×1 |
++| L2–L41 | CSA (ratio=4) | 20 | `npu_quant_lightning_indexer` + `npu_sparse_attn_sharedkv` |
++| L3–L41 间 | HCA (ratio=128) | 20 | `npu_sparse_attn_sharedkv` ×1 |
++| L43 | TBD | **不计** | MTP head / padding 待确认 |
++
++**整网硬件 attention（单 decode token）**：
++
++```text
++T_net_hw = N_swa × T_swa_hw
++         + N_csa × (T_indexer_hw + T_csa_attn_hw)
++         + N_hca × T_hca_hw
++
++         = 2×T_swa + 20×(T_idx + T_csa_attn) + 20×T_hca
++```
++
++**@ 32k 实测代入**（整网表用 seq sweep 的 `csa_msprof_seq_32768.json` + `swa/hca_msprof.json`）：
++
++> **口径说明**：`csa_msprof.json`（`run_msprof.sh` 32k 三类）与 `csa_msprof_seq_32768.json`（seq sweep 独立 run）数值略有差异（indexer 36.1 vs 33.9 µs），属 run-to-run 方差；**整网 / seq 表以 sweep JSON 为准**，launch overhead 对比以 `csa_msprof.json` + Event 为准。
++
++```text
++= 2×21.6 + 20×(33.9 + 37.5) + 20×26.5
++≈ 2001 µs ≈ 2.00 ms
++```
++
++| 组成部分 | 耗时 | 占比 |
++|----------|------|------|
++| SWA×2 | 43 µs | 2.1% |
++| CSA indexer×20 | 678 µs | 33.9% |
++| CSA attn×20 | 750 µs | 37.5% |
++| HCA attn×20 | 530 µs | 26.5% |
++
++---
++
++## 3. 不同 seq_len 的整网硬件估算
++
++CSA 用 msprof seq sweep；SWA/HCA 暂用 **32k 常数**（SWA 窗口=128 固定；HCA sweep 未跑）。
++
++| seq_len | indexer_hw | attn_hw (CSA) | 整网 hw | vs 1024 |
++|---------|------------|---------------|---------|---------|
++| 1024 | 16.2 µs | 30.5 µs | **1.51 ms** | 1.00× |
++| 4096 | 24.1 µs | 38.3 µs | **1.82 ms** | 1.21× |
++| 8192 | 20.7 µs | 36.2 µs | **1.71 ms** | 1.13× |
++| 16384 | 27.9 µs | 38.5 µs | **1.90 ms** | 1.26× |
++| 32768 | 33.9 µs | 37.5 µs | **2.00 ms** | 1.33× |
++
++---
++
++## 4. Launch Overhead（@ 32k）
++
++来源：`results/msprof_vs_python_comparison.md`
++
++| op | Python Event | msprof hw | overhead_pct |
++|----|--------------|-----------|--------------|
++| swa_attn | 133.8 µs | 21.6 µs | **83.9%** |
++| csa_indexer | 265.0 µs | 36.1 µs | **86.4%** |
++| csa_attn | 157.2 µs | 38.8 µs | **75.3%** |
++| hca_attn | 136.1 µs | 26.5 µs | **80.5%** |
++
++整网：Python **~11.4 ms** vs 硬件 **~2.0 ms** → launch **~82%**。
++
++---
++
++## 5. 数据文件索引
++
++### 5.1 JSON 结果（`results/`，可进 git）
++
++| 文件 | 内容 |
++|------|------|
++| `swa_msprof.json` | SWA @32k 硬件 attn |
++| `csa_msprof.json` | CSA @32k indexer + attn 硬件 |
++| `hca_msprof.json` | HCA @32k 硬件 attn |
++| `csa_msprof_seq_{1024,4096,8192,16384,32768}.json` | CSA seq sweep 硬件 |
++| `swa_msprof_smoke.json` | P1.7.1 冒烟 |
++| `msprof_vs_python_comparison.md` | Python vs hw 对比 + Roofline |
++| `msprof_seq_sweep.md` | CSA 硬件 seq sweep 表 |
++| `seq_{S}/swa.json`, `csa.json`, `hca.json` | Python Event @ repeat=1000 |
++| `summary_seq_sweep_r1000.md` | Python Event seq sweep |
++| `network_hw_estimate.md` | **自动生成**整网折算表 |
++
++### 5.2 msprof Trace（`./npu_results/`，**不进 git**）
++
++| 目录 | 内容 |
++|------|------|
++| `npu_results/swa_attn_seq32768/` | SWA trace |
++| `npu_results/csa_indexer_seq32768/` | CSA indexer trace（独立） |
++| `npu_results/csa_attn_seq32768/` | CSA attn trace（独立） |
++| `npu_results/hca_attn_seq32768/` | HCA trace |
++| `npu_results/seq_{S}/csa_indexer_seq{S}/` | seq sweep indexer |
++| `npu_results/seq_{S}/csa_attn_seq{S}/` | seq sweep attn |
++
++每个 trace 子目录结构：
++
++```text
++npu_results/<name>/<host>_<pid>_<ts>_ascend_pt/
++└── ASCEND_PROFILER_OUTPUT/
++    ├── kernel_details.csv      ← **主解析目标**
++    ├── op_statistic.csv        ← 聚合统计（备用）
++    ├── operator_details.csv    ← PyTorch op 级（备用）
++    └── step_trace_time.csv
++```
++
++匹配失败时：`npu_results/<name>/op_types_seen.txt`（自动 dump）
++
++---
++
++## 6. 应解析哪些数据
++
++### 6.1 主路径：`kernel_details.csv`
++
++| 列 | 用途 |
++|----|------|
++| `Step Id` | **非空** = profiler active 区间内的单次 kernel（取 active=10 行） |
++| `Name` / `Type` | op 名；模糊匹配 pattern |
++| `Duration(us)` | **硬件 device time**（统计 mean/std/p95） |
++
++**Op pattern（`parse_op_summary` 参数）**：
++
++| Bench | Pattern | 对应 CANN op |
++|-------|---------|--------------|
++| SWA / HCA / CSA attn | `SparseAttnSharedkv` | `npu_sparse_attn_sharedkv` |
++| CSA indexer | `QuantLightningIndexer` | `npu_quant_lightning_indexer` |
++
++实现：`attn_bench/msprof_runner.py` → `parse_op_summary()`
++
++> 注：CANN 新版本无 `op_summary_*.csv`，代码已 fallback 到 `kernel_details.csv`。
++
++### 6.2 备用路径
++
++| 文件 | 何时用 |
++|------|--------|
++| `op_statistic.csv` | 只需 aggregate Avg Time，不需要 per-call 分布 |
++| `operator_details.csv` | pattern 在 kernel 名对不上时；列 `Device Self Duration With AICore(us)` |
++| `op_summary_*.csv` | 旧版 CANN；列 `OP Type` + `Task Duration(us)` |
++
++### 6.3 JSON 字段
++
++msprof bench 输出统一：
++
++```json
++{
++  "mode": "msprof_hardware_only",
++  "indexer_hw": { "device_mean_us", "device_std_us", "matched_rows", "op_pattern", "source_csv" },
++  "attn_hw": { ... }
++}
++```
++
++`matched_rows` 应等于 yaml `msprof.active`（默认 **10**）。
++
++---
++
++## 7. 复现命令
++
++### 7.0 环境
++
++```bash
++cd tools/attn_microbench
++export ASCEND_RT_VISIBLE_DEVICES=<空闲卡>   # npu-smi info 查看 HBM
++source env.sh
++```
++
++### 7.1 冒烟（P1.7.1）
++
++```bash
++python -c "from attn_bench.msprof_runner import run_with_msprof, parse_op_summary; print('OK')"
++
++python -m attn_bench.bench_swa --seq-len 1024 --msprof \
++  --msprof-out ./npu_results \
++  --out results/swa_msprof_smoke.json
++
++# 自检
++test -f results/swa_msprof_smoke.json
++python -c "import json; d=json.load(open('results/swa_msprof_smoke.json')); assert d['mode']=='msprof_hardware_only'; assert d['attn_hw']['matched_rows']>=10"
++```
++
++### 7.2 三类 @32k 正式 msprof（P1.7.2）
++
++```bash
++python -m attn_bench.bench_swa  --seq-len 32768 --msprof --msprof-out ./npu_results --out results/swa_msprof.json
++python -m attn_bench.bench_csa  --seq-len 32768 --msprof --msprof-out ./npu_results --out results/csa_msprof.json
++python -m attn_bench.bench_hca  --seq-len 32768 --msprof --msprof-out ./npu_results --out results/hca_msprof.json
++
++jq 'has("indexer_hw") and has("attn_hw")' results/csa_msprof.json   # true
++```
++
++### 7.3 Python vs 硬件对比（P1.7.3）
++
++```bash
++# Event 数据（若已有 seq_32768/*.json 可跳过）
++SEQ_LEN=32768 REPEAT=1000 WARMUP=30 SANITY_FLAG="" bash run_all.sh
++
++python -m attn_bench.report --mode comparison \
++  --msprof-jsons results/swa_msprof.json results/csa_msprof.json results/hca_msprof.json \
++  --event-jsons results/seq_32768/swa.json results/seq_32768/csa.json results/seq_32768/hca.json \
++  --out results/msprof_vs_python_comparison.md
++```
++
++### 7.4 CSA seq sweep msprof（P1.7.4）
++
++```bash
++for S in 1024 4096 8192 16384 32768; do
++  python -m attn_bench.bench_csa --seq-len $S --msprof \
++    --msprof-out ./npu_results/seq_$S \
++    --out results/csa_msprof_seq_$S.json
++done
++
++python -m attn_bench.report --mode msprof-sweep \
++  --inputs results/csa_msprof_seq_1024.json results/csa_msprof_seq_4096.json \
++           results/csa_msprof_seq_8192.json results/csa_msprof_seq_16384.json \
++           results/csa_msprof_seq_32768.json \
++  --out results/msprof_seq_sweep.md
++```
++
++### 7.5 一键脚本
++
++```bash
++bash run_msprof.sh                                    # 32k 三类 + comparison
++SEQ_LEN_SWEEP="1024 4096 8192 16384 32768" bash run_msprof.sh   # 含 seq sweep
++```
++
++### 7.6 重新生成整网折算表
++
++```bash
++python scripts/summarize_network_hw.py \
++  --out results/network_hw_estimate.md
++```
++
++### 7.7 pattern 找不到时
++
++```bash
++cat npu_results/swa_attn_seq1024/op_types_seen.txt
++# 或
++python -c "
++from pathlib import Path
++from attn_bench.msprof_runner import list_op_types_in_trace
++print(list_op_types_in_trace(Path('npu_results/swa_attn_seq32768')))
++"
++# 修改 bench_*.py 中 parse_op_summary 的 pattern 后重跑
++```
++
++---
++
++## 8. 与生产 msprof 对照（只读参考）
++
++| 指标 | 生产 (token#200) | Microbench hw @32k |
++|------|------------------|---------------------|
++| SparseAttnSharedkv | 1.12 ms / 43 次 ≈ 26 µs/次 | 42 次 sparse 合计 ~1.32 ms |
++| 整步 NPU busy | ~28 ms / 43 层 forward | **仅 attention 硬件 ~2 ms** |
++
++生产报告：`doc/zh/DeepSeek-V4-Flash_eager_decode_profiling_分析报告_20260525.md`
++
++**不可直接对比的原因**：seq_len 不同、生产含 MoE/MatMul/Compressor、生产有 fusion/overlap、microbench 为 isolated 逐 op 相加。
++
++P2 目标：同 seq_len（~200）跑 microbench + in-server msprof。
++
++---
++
++## 9. 相关文档
++
++| 文件 | 说明 |
++|------|------|
++| `IMPLEMENTATION_PLAN_V4.md` §0.6 / §6 P1.7 | 设计与里程碑 |
++| `doc/zh/DeepSeek-V4-Flash_Attention_Microbench_审核报告.md` §12 | 对外结论 |
++| `config/dsv4_flash.yaml` → `msprof:` | profiler 参数 |
++| `attn_bench/msprof_runner.py` | 抓 trace + 解析 |
++| `attn_bench/report.py` | comparison / msprof-sweep 报告 |
++
++---
++
++*本文件由 P1.7 分析落盘；数据更新后请重跑 §7 命令并执行 `scripts/summarize_network_hw.py`。*
+diff --git a/tools/attn_microbench/results/README.md b/tools/attn_microbench/results/README.md
+new file mode 100644
+index 0000000..5c1a457
+--- /dev/null
++++ b/tools/attn_microbench/results/README.md
+@@ -0,0 +1,87 @@
++# Attention Microbench 分析结果索引
++
++> 工作目录：`tools/attn_microbench/`  
++> **P1.7 硬件分析主文档**：[`P1_7_analysis_guide.md`](./P1_7_analysis_guide.md)（结论、复现命令、数据位置、解析字段）
++
++---
++
++## 快速入口
++
++| 主题 | 文档 | 原始数据 |
++|------|------|----------|
++| **整网 attention 硬件折算 @32k** | [`network_hw_estimate.md`](./network_hw_estimate.md) | `*_msprof*.json` |
++| **Python launch vs NPU kernel** | [`msprof_vs_python_comparison.md`](./msprof_vs_python_comparison.md) | `swa/csa/hca_msprof.json` + `seq_32768/*.json` |
++| **CSA 硬件 seq sweep** | [`msprof_seq_sweep.md`](./msprof_seq_sweep.md) | `csa_msprof_seq_*.json` |
++| **Python Event seq sweep（平坦）** | [`summary_seq_sweep_r1000.md`](./summary_seq_sweep_r1000.md) | `seq_{S}/*.json` |
++| **P1.5 旧结论（已推翻）** | [`p1_5_floor_final.md`](./p1_5_floor_final.md) | 同上 Event 数据 |
++| **P1.1–P1.4 诊断** | `p1_1_floor_evidence.json`, `diag_*.json`, [`p1_field_diff.md`](./p1_field_diff.md) | — |
++| **P1.3 dump 阻塞** | [`p1_3_blocked.md`](./p1_3_blocked.md) | `p1_3_*.log` |
++
++---
++
++## 一键复现（P1.7）
++
++```bash
++cd tools/attn_microbench
++export ASCEND_RT_VISIBLE_DEVICES=<空闲卡>
++source env.sh
++
++# 32k 三类 msprof + Python vs hw 对比 + 整网表
++bash run_msprof.sh
++
++# CSA 硬件 seq sweep + 整网 seq 表
++SEQ_LEN_SWEEP="1024 4096 8192 16384 32768" bash run_msprof.sh
++
++# 仅从已有 JSON 重生成整网表
++python scripts/summarize_network_hw.py --out results/network_hw_estimate.md
++```
++
++---
++
++## 数据落盘位置
++
++### 进 git（`results/`）
++
++| 模式 | 文件模式 | 说明 |
++|------|----------|------|
++| msprof 硬件 | `swa_msprof.json`, `csa_msprof.json`, `hca_msprof.json` | @32k 三类 |
++| msprof seq sweep | `csa_msprof_seq_{S}.json` | CSA indexer + attn |
++| Python Event | `seq_{S}/swa.json`, `csa.json`, `hca.json` | repeat=1000 |
++| 诊断 | `diag_*.json`, `p1_*.json` | P1.1–P1.4 |
++
++### 不进 git（`./npu_results/`）
++
++msprof 原始 trace，结构：
++
++```text
++npu_results/<bench_name>/*_ascend_pt/ASCEND_PROFILER_OUTPUT/
++├── kernel_details.csv      ← 主解析目标
++├── op_statistic.csv
++├── operator_details.csv
++└── step_trace_time.csv
++```
++
++---
++
++## 应解析什么
++
++| 目标 | 文件 | 关键列 / 规则 |
++|------|------|---------------|
++| **硬件 kernel 耗时** | `kernel_details.csv` | `Step Id` 非空；`Duration(us)`；`Name` 模糊匹配 |
++| SWA/HCA/CSA attn | pattern `SparseAttnSharedkv` | CANN `npu_sparse_attn_sharedkv` |
++| CSA indexer | pattern `QuantLightningIndexer` | CANN `npu_quant_lightning_indexer` |
++| Python Event | `*.json` | `indexer_us` / `attn_us` → `mean`, `std` |
++| 聚合备用 | `op_statistic.csv` | Avg Time |
++| 旧版 CANN | `op_summary_*.csv` | `OP Type` + `Task Duration(us)` |
++
++实现：`attn_bench/msprof_runner.py` → `parse_op_summary()`
++
++---
++
++## 核心结论（P1.7）
++
++- 整网 attention **硬件 @32k ≈ 2.0 ms/token**（42 层）
++- Python Event **~11.4 ms/token** → launch overhead **~82%**
++- CSA indexer 硬件 1024→32768：**16→34 µs（2.1×）**；Python Event 仍平坦
++
++详细公式与层架构见 [`P1_7_analysis_guide.md`](./P1_7_analysis_guide.md) §2–§4。
+diff --git a/tools/attn_microbench/results/csa.json b/tools/attn_microbench/results/csa.json
+new file mode 100644
+index 0000000..dc5d0e9
+--- /dev/null
++++ b/tools/attn_microbench/results/csa.json
+@@ -0,0 +1,41 @@
++{
++  "kind": "csa",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "skip_indexer": false,
++  "attn_us": {
++    "mean": 158.80600214004517,
++    "device_mean_us": 158.80600214004517,
++    "device_p50_us": 157.1200042963028,
++    "device_p95_us": 164.75800201296806,
++    "device_p99_us": 165.60760244727135,
++    "device_max_us": 165.82000255584717,
++    "device_std_us": 3.560853088238617,
++    "host_mean_us": 270.40401473641396,
++    "mean_us": 158.80600214004517,
++    "p50_us": 157.1200042963028,
++    "p99_us": 165.60760244727135,
++    "n": 10
++  },
++  "indexer_us": {
++    "mean": 277.52200067043304,
++    "device_mean_us": 277.52200067043304,
++    "device_p50_us": 271.38999104499817,
++    "device_p95_us": 306.610007584095,
++    "device_p99_us": 309.2740097641945,
++    "device_max_us": 309.94001030921936,
++    "device_std_us": 16.163203762744217,
++    "host_mean_us": 452.385563403368,
++    "mean_us": 277.52200067043304,
++    "p50_us": 271.38999104499817,
++    "p99_us": 309.2740097641945,
++    "n": 10
++  },
++  "isolated_device_sum_us": {
++    "device_mean_us": 436.3280028104782,
++    "device_std_us": 16.550795467046512,
++    "host_mean_us": 722.789578139782,
++    "mean_us": 436.3280028104782,
++    "note": "NOT end-to-end; sum of independently timed indexer + attn"
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/csa_attn_only.json b/tools/attn_microbench/results/csa_attn_only.json
+new file mode 100644
+index 0000000..6fc08f6
+--- /dev/null
++++ b/tools/attn_microbench/results/csa_attn_only.json
+@@ -0,0 +1,19 @@
++{
++  "kind": "csa",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "skip_indexer": true,
++  "attn_us": {
++    "device_mean_us": 176.1139988899231,
++    "device_p50_us": 172.90999740362167,
++    "device_p95_us": 196.5850003063679,
++    "device_p99_us": 204.75699916481972,
++    "device_max_us": 206.79999887943268,
++    "device_std_us": 11.722501784709737,
++    "host_mean_us": 363.4059801697731,
++    "mean_us": 176.1139988899231,
++    "p50_us": 172.90999740362167,
++    "p99_us": 204.75699916481972,
++    "n": 10
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/csa_full.json b/tools/attn_microbench/results/csa_full.json
+new file mode 100644
+index 0000000..2e42ab0
+--- /dev/null
++++ b/tools/attn_microbench/results/csa_full.json
+@@ -0,0 +1,37 @@
++{
++  "kind": "csa",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "skip_indexer": false,
++  "attn_us": {
++    "device_mean_us": 270.66799998283386,
++    "device_p50_us": 267.7700072526932,
++    "device_p95_us": 281.26500248908997,
++    "device_p99_us": 284.6850121021271,
++    "device_max_us": 285.54001450538635,
++    "device_std_us": 6.202338787914381,
++    "host_mean_us": 378.88772785663605,
++    "mean_us": 270.66799998283386,
++    "p50_us": 267.7700072526932,
++    "p99_us": 284.6850121021271,
++    "n": 10
++  },
++  "indexer_us": {
++    "device_mean_us": 503.22199761867523,
++    "device_p50_us": 478.5800129175186,
++    "device_p95_us": 613.8619750738145,
++    "device_p99_us": 673.6363762617111,
++    "device_max_us": 688.5799765586853,
++    "device_std_us": 63.94629625727582,
++    "host_mean_us": 650.0950083136559,
++    "mean_us": 503.22199761867523,
++    "p50_us": 478.5800129175186,
++    "p99_us": 673.6363762617111,
++    "n": 10
++  },
++  "total_us": {
++    "device_mean_us": 773.8899976015091,
++    "host_mean_us": 1028.982736170292,
++    "mean_us": 773.8899976015091
++  }
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/csa_msprof.json b/tools/attn_microbench/results/csa_msprof.json
+new file mode 100644
+index 0000000..c2ded9d
+--- /dev/null
++++ b/tools/attn_microbench/results/csa_msprof.json
+@@ -0,0 +1,34 @@
++{
++  "kind": "csa",
++  "mode": "msprof_hardware_only",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "indexer_hw": {
++    "device_mean_us": 36.102599999999995,
++    "device_std_us": 1.6324429055865937,
++    "device_p50_us": 35.1705,
++    "device_p95_us": 38.997,
++    "device_p99_us": 39.4002,
++    "device_max_us": 39.501,
++    "device_min_us": 34.64,
++    "matched_rows": 10,
++    "op_pattern": "QuantLightningIndexer",
++    "source_csv": "kernel_details:npu_results/csa_indexer_seq32768/05d710313bd1_731931_20260526073516369_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "attn_hw": {
++    "device_mean_us": 38.8429,
++    "device_std_us": 1.323521246523833,
++    "device_p50_us": 38.3905,
++    "device_p95_us": 41.182,
++    "device_p99_us": 41.4052,
++    "device_max_us": 41.461,
++    "device_min_us": 37.341,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/csa_attn_seq32768/05d710313bd1_731931_20260526073521133_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dirs": [
++    "npu_results/csa_indexer_seq32768",
++    "npu_results/csa_attn_seq32768"
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/csa_msprof_seq_1024.json b/tools/attn_microbench/results/csa_msprof_seq_1024.json
+new file mode 100644
+index 0000000..378d7cd
+--- /dev/null
++++ b/tools/attn_microbench/results/csa_msprof_seq_1024.json
+@@ -0,0 +1,34 @@
++{
++  "kind": "csa",
++  "mode": "msprof_hardware_only",
++  "seq_len": 1024,
++  "batch_size": 1,
++  "indexer_hw": {
++    "device_mean_us": 16.1803,
++    "device_std_us": 0.8102075104564268,
++    "device_p50_us": 15.8605,
++    "device_p95_us": 17.568550000000002,
++    "device_p99_us": 17.77051,
++    "device_max_us": 17.821,
++    "device_min_us": 15.26,
++    "matched_rows": 10,
++    "op_pattern": "QuantLightningIndexer",
++    "source_csv": "kernel_details:npu_results/seq_1024/csa_indexer_seq1024/05d710313bd1_745148_20260526073708657_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "attn_hw": {
++    "device_mean_us": 30.462400000000002,
++    "device_std_us": 1.2965657098658752,
++    "device_p50_us": 30.8005,
++    "device_p95_us": 32.312,
++    "device_p99_us": 32.3984,
++    "device_max_us": 32.42,
++    "device_min_us": 28.4,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/seq_1024/csa_attn_seq1024/05d710313bd1_745148_20260526073713428_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dirs": [
++    "npu_results/seq_1024/csa_indexer_seq1024",
++    "npu_results/seq_1024/csa_attn_seq1024"
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/csa_msprof_seq_16384.json b/tools/attn_microbench/results/csa_msprof_seq_16384.json
+new file mode 100644
+index 0000000..651a786
+--- /dev/null
++++ b/tools/attn_microbench/results/csa_msprof_seq_16384.json
+@@ -0,0 +1,34 @@
++{
++  "kind": "csa",
++  "mode": "msprof_hardware_only",
++  "seq_len": 16384,
++  "batch_size": 1,
++  "indexer_hw": {
++    "device_mean_us": 27.8745,
++    "device_std_us": 0.9804622634247585,
++    "device_p50_us": 27.561,
++    "device_p95_us": 29.60655,
++    "device_p99_us": 30.37011,
++    "device_max_us": 30.561,
++    "device_min_us": 26.941,
++    "matched_rows": 10,
++    "op_pattern": "QuantLightningIndexer",
++    "source_csv": "kernel_details:npu_results/seq_16384/csa_indexer_seq16384/05d710313bd1_751850_20260526073853496_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "attn_hw": {
++    "device_mean_us": 38.4927,
++    "device_std_us": 0.7851594806152447,
++    "device_p50_us": 38.3805,
++    "device_p95_us": 39.73045,
++    "device_p99_us": 39.80209,
++    "device_max_us": 39.82,
++    "device_min_us": 37.221,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/seq_16384/csa_attn_seq16384/05d710313bd1_751850_20260526073858294_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dirs": [
++    "npu_results/seq_16384/csa_indexer_seq16384",
++    "npu_results/seq_16384/csa_attn_seq16384"
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/csa_msprof_seq_32768.json b/tools/attn_microbench/results/csa_msprof_seq_32768.json
+new file mode 100644
+index 0000000..2560c14
+--- /dev/null
++++ b/tools/attn_microbench/results/csa_msprof_seq_32768.json
+@@ -0,0 +1,34 @@
++{
++  "kind": "csa",
++  "mode": "msprof_hardware_only",
++  "seq_len": 32768,
++  "batch_size": 1,
++  "indexer_hw": {
++    "device_mean_us": 33.8926,
++    "device_std_us": 0.7115151720097059,
++    "device_p50_us": 33.900999999999996,
++    "device_p95_us": 34.92255,
++    "device_p99_us": 35.08131,
++    "device_max_us": 35.121,
++    "device_min_us": 32.961,
++    "matched_rows": 10,
++    "op_pattern": "QuantLightningIndexer",
++    "source_csv": "kernel_details:npu_results/seq_32768/csa_indexer_seq32768/05d710313bd1_753142_20260526073929204_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "attn_hw": {
++    "device_mean_us": 37.5347,
++    "device_std_us": 0.8009223495445741,
++    "device_p50_us": 37.6105,
++    "device_p95_us": 38.719,
++    "device_p99_us": 38.8486,
++    "device_max_us": 38.881,
++    "device_min_us": 36.461,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/seq_32768/csa_attn_seq32768/05d710313bd1_753142_20260526073933959_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dirs": [
++    "npu_results/seq_32768/csa_indexer_seq32768",
++    "npu_results/seq_32768/csa_attn_seq32768"
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/csa_msprof_seq_4096.json b/tools/attn_microbench/results/csa_msprof_seq_4096.json
+new file mode 100644
+index 0000000..7c6f30f
+--- /dev/null
++++ b/tools/attn_microbench/results/csa_msprof_seq_4096.json
+@@ -0,0 +1,34 @@
++{
++  "kind": "csa",
++  "mode": "msprof_hardware_only",
++  "seq_len": 4096,
++  "batch_size": 1,
++  "indexer_hw": {
++    "device_mean_us": 24.146800000000002,
++    "device_std_us": 0.7067181616457865,
++    "device_p50_us": 24.000500000000002,
++    "device_p95_us": 25.363,
++    "device_p99_us": 25.8094,
++    "device_max_us": 25.921,
++    "device_min_us": 23.261,
++    "matched_rows": 10,
++    "op_pattern": "QuantLightningIndexer",
++    "source_csv": "kernel_details:npu_results/seq_4096/csa_indexer_seq4096/05d710313bd1_747415_20260526073743354_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "attn_hw": {
++    "device_mean_us": 38.332899999999995,
++    "device_std_us": 1.085159200301965,
++    "device_p50_us": 38.461,
++    "device_p95_us": 39.82655,
++    "device_p99_us": 39.87011,
++    "device_max_us": 39.881,
++    "device_min_us": 36.641,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/seq_4096/csa_attn_seq4096/05d710313bd1_747415_20260526073748063_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dirs": [
++    "npu_results/seq_4096/csa_indexer_seq4096",
++    "npu_results/seq_4096/csa_attn_seq4096"
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/csa_msprof_seq_8192.json b/tools/attn_microbench/results/csa_msprof_seq_8192.json
+new file mode 100644
+index 0000000..d0f4d41
+--- /dev/null
++++ b/tools/attn_microbench/results/csa_msprof_seq_8192.json
+@@ -0,0 +1,34 @@
++{
++  "kind": "csa",
++  "mode": "msprof_hardware_only",
++  "seq_len": 8192,
++  "batch_size": 1,
++  "indexer_hw": {
++    "device_mean_us": 20.7243,
++    "device_std_us": 0.36129463046106775,
++    "device_p50_us": 20.75,
++    "device_p95_us": 21.211,
++    "device_p99_us": 21.2182,
++    "device_max_us": 21.22,
++    "device_min_us": 20.181,
++    "matched_rows": 10,
++    "op_pattern": "QuantLightningIndexer",
++    "source_csv": "kernel_details:npu_results/seq_8192/csa_indexer_seq8192/05d710313bd1_749636_20260526073818680_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "attn_hw": {
++    "device_mean_us": 36.2127,
++    "device_std_us": 2.0751229867166905,
++    "device_p50_us": 35.1005,
++    "device_p95_us": 39.992,
++    "device_p99_us": 39.999199999999995,
++    "device_max_us": 40.001,
++    "device_min_us": 34.321,
++    "matched_rows": 10,
++    "op_pattern": "SparseAttnSharedkv",
++    "source_csv": "kernel_details:npu_results/seq_8192/csa_attn_seq8192/05d710313bd1_749636_20260526073823540_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
++  },
++  "trace_dirs": [
++    "npu_results/seq_8192/csa_indexer_seq8192",
++    "npu_results/seq_8192/csa_attn_seq8192"
++  ]
++}
+\ No newline at end of file
+diff --git a/tools/attn_microbench/results/diag_c4_cols_sweep.json b/tools/attn_microbench/results/diag_c4_cols_sweep.json
+new file mode 100644
+index 0000000..bdb8fa0
+--- /dev/null
++++ b/tools/attn_microbench/results/diag_c4_cols_sweep.json
+@@ -0,0 +1,228 @@
++{
++  "scenario": "c4_cols_sweep",
++  "warmup": 30,
++  "repeat": 100,
++  "results": [
++    {
++      "test": "c4_cols_sweep",
++      "override_c4_cols": 4,
++      "error": "npuSynchronizeDevice:build/CMakeFiles/torch_npu.dir/compiler_depend.ts:575 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 507015\n[ERROR] 2026-05-26-05:51:17 (PID:575255, Device:0, RankID:-1) ERR00100 PTA call acl api failed\n[Error]: The aicore execution is abnormal. \n        Rectify the fault based on the error information in the ascend log.\nEZ9999: Inner Error!\nEZ9999[PID: 575255] 2026-05-26-05:51:17.508.154 (EZ9999):  The error from device(chipId:0, dieId:0), serial number is 5, there is an exception of fftsplus aicore error, core id is 9, error code = 0x800000, dump info: pc start: 0x12c081299b60, current: 0x12c08129b280, vec error info: 0, mte error info: 0x6b030000cc, ifu error info: 0x2000069d43780, ccu error info: 0xb81a9f9f00000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c140004080.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]\n        TraceBack (most recent call last):\n       The extend info: errcode:(0x800000, 0, 0) errorStr: The DDR address of the MTE instruction is out of range. fixp_error0 info: 0x30000cc, fixp_error1 info: 0x6b, fsmId:0, tslot:1, thread:0, ctxid:0, blk:0, sublk:0, subErrType:4.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:360]\n       Kernel task happen error, retCode=0x26, [aicore exception].[FUNC:PreCheckTaskErr][FILE:davinci_kernel_task.cc][LINE:1493]\n       rtDeviceSynchronizeWithTimeout execution failed, reason=aicore exception[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]\n       wait for compute device to finish failed, runtime result = 507015.[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]\n",
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": 4,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      }
++    },
++    {
++      "test": "c4_cols_sweep",
++      "override_c4_cols": 16,
++      "error": "npuSynchronizeDevice:build/CMakeFiles/torch_npu.dir/compiler_depend.ts:575 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 507015\n[ERROR] 2026-05-26-05:51:43 (PID:575507, Device:0, RankID:-1) ERR00100 PTA call acl api failed\n[Error]: The aicore execution is abnormal. \n        Rectify the fault based on the error information in the ascend log.\nEZ9999: Inner Error!\nEZ9999[PID: 575507] 2026-05-26-05:51:43.934.008 (EZ9999):  The error from device(chipId:0, dieId:0), serial number is 6, there is an exception of fftsplus aicore error, core id is 8, error code = 0x800000, dump info: pc start: 0x12c081299b60, current: 0x12c08129af84, vec error info: 0, mte error info: 0x6a0300009f, ifu error info: 0x2000069d43780, ccu error info: 0x85fb997000000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c140004080.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]\n        TraceBack (most recent call last):\n       The extend info: errcode:(0x800000, 0, 0) errorStr: The DDR address of the MTE instruction is out of range. fixp_error0 info: 0x300009f, fixp_error1 info: 0x6a, fsmId:1, tslot:1, thread:0, ctxid:0, blk:0, sublk:0, subErrType:4.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:360]\n       Kernel task happen error, retCode=0x26, [aicore exception].[FUNC:PreCheckTaskErr][FILE:davinci_kernel_task.cc][LINE:1493]\n       rtDeviceSynchronizeWithTimeout execution failed, reason=aicore exception[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]\n       wait for compute device to finish failed, runtime result = 507015.[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]\n",
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": 16,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      }
++    },
++    {
++      "test": "c4_cols_sweep",
++      "seq_len": 32768,
++      "c4_cols": 64,
++      "c4_pages": 1,
++      "seqused_kv": 32768,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": 64,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 273.0635988712311,
++        "device_mean_us": 273.0635988712311,
++        "device_p50_us": 271.6199904680252,
++        "device_p95_us": 283.20500552654266,
++        "device_p99_us": 289.05178815126425,
++        "device_max_us": 304.0800094604492,
++        "device_std_us": 6.699514937159331,
++        "host_mean_us": 379.46371361613274,
++        "mean_us": 273.0635988712311,
++        "p50_us": 271.6199904680252,
++        "p99_us": 289.05178815126425,
++        "n": 100
++      },
++      "indexer_summary": "273.1 \u00b1 6.7 (p95=283.2, n=100)",
++      "override_c4_cols": 64,
++      "swa_attn_us": {
++        "mean": 138.61340001225471,
++        "device_mean_us": 138.61340001225471,
++        "device_p50_us": 136.49000227451324,
++        "device_p95_us": 147.26199805736542,
++        "device_p99_us": 152.74899482727054,
++        "device_max_us": 159.58000719547272,
++        "device_std_us": 5.286533018400931,
++        "host_mean_us": 232.5906790792942,
++        "mean_us": 138.61340001225471,
++        "p50_us": 136.49000227451324,
++        "p99_us": 152.74899482727054,
++        "n": 100
++      },
++      "swa_summary": "138.6 \u00b1 5.3 (p95=147.3, n=100)"
++    },
++    {
++      "test": "c4_cols_sweep",
++      "seq_len": 32768,
++      "c4_cols": 256,
++      "c4_pages": 2,
++      "seqused_kv": 32768,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": 256,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 271.89039915800095,
++        "device_mean_us": 271.89039915800095,
++        "device_p50_us": 270.10001242160797,
++        "device_p95_us": 286.51301115751266,
++        "device_p99_us": 298.6930099129677,
++        "device_max_us": 301.9599914550781,
++        "device_std_us": 8.4746684083047,
++        "host_mean_us": 378.6920476704836,
++        "mean_us": 271.89039915800095,
++        "p50_us": 270.10001242160797,
++        "p99_us": 298.6930099129677,
++        "n": 100
++      },
++      "indexer_summary": "271.9 \u00b1 8.5 (p95=286.5, n=100)",
++      "override_c4_cols": 256,
++      "swa_attn_us": {
++        "mean": 142.93360024690628,
++        "device_mean_us": 142.93360024690628,
++        "device_p50_us": 140.34999907016754,
++        "device_p95_us": 153.86700257658958,
++        "device_p99_us": 159.43800121545794,
++        "device_max_us": 163.2000058889389,
++        "device_std_us": 5.908592048129008,
++        "host_mean_us": 240.62372744083405,
++        "mean_us": 142.93360024690628,
++        "p50_us": 140.34999907016754,
++        "p99_us": 159.43800121545794,
++        "n": 100
++      },
++      "swa_summary": "142.9 \u00b1 5.9 (p95=153.9, n=100)"
++    },
++    {
++      "test": "c4_cols_sweep",
++      "seq_len": 32768,
++      "c4_cols": 1024,
++      "c4_pages": 8,
++      "seqused_kv": 32768,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": 1024,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 248.43560054898262,
++        "device_mean_us": 248.43560054898262,
++        "device_p50_us": 245.65999954938889,
++        "device_p95_us": 258.3189934492111,
++        "device_p99_us": 280.0956079363829,
++        "device_max_us": 406.3799977302551,
++        "device_std_us": 17.41654591517439,
++        "host_mean_us": 358.0367472022772,
++        "mean_us": 248.43560054898262,
++        "p50_us": 245.65999954938889,
++        "p99_us": 280.0956079363829,
++        "n": 100
++      },
++      "indexer_summary": "248.4 \u00b1 17.4 (p95=258.3, n=100)",
++      "override_c4_cols": 1024,
++      "swa_attn_us": {
++        "mean": 127.31599971652031,
++        "device_mean_us": 127.31599971652031,
++        "device_p50_us": 126.13999843597412,
++        "device_p95_us": 137.17399388551712,
++        "device_p99_us": 140.24420127272606,
++        "device_max_us": 142.63999462127686,
++        "device_std_us": 4.63858230807244,
++        "host_mean_us": 223.6167062073946,
++        "mean_us": 127.31599971652031,
++        "p50_us": 126.13999843597412,
++        "p99_us": 140.24420127272606,
++        "n": 100
++      },
++      "swa_summary": "127.3 \u00b1 4.6 (p95=137.2, n=100)"
++    },
++    {
++      "test": "c4_cols_sweep",
++      "seq_len": 32768,
++      "c4_cols": 8192,
++      "c4_pages": 64,
++      "seqused_kv": 32768,
++      "diag_snapshot": {
++        "override_seqused_kv": null,
++        "override_actual_seq_lengths_key": null,
++        "override_c4_cols": 8192,
++        "page_table_unique_pages": false,
++        "page_table_seed": 42
++      },
++      "indexer_us": {
++        "mean": 261.07139974832535,
++        "device_mean_us": 261.07139974832535,
++        "device_p50_us": 259.5600038766861,
++        "device_p95_us": 271.7509999871254,
++        "device_p99_us": 282.4287876486779,
++        "device_max_us": 289.2400026321411,
++        "device_std_us": 6.941839014348408,
++        "host_mean_us": 368.7656857073307,
++        "mean_us": 261.07139974832535,
++        "p50_us": 259.5600038766861,
++        "p99_us": 282.4287876486779,
++        "n": 100
++      },
++      "indexer_summary": "261.1 \u00b1 6.9 (p95=271.8, n=100)",
++      "override_c4_cols": 8192,
++      "swa_attn_us": {
++        "mean": 136.47360056638718,
++        "device_mean_us": 136.47360056638718,
++        "device_p50_us": 134.5899999141693,
++        "device_p95_us": 145.6520028412342,
++        "device_p99_us": 153.26379522681236,
++        "device_max_us": 155.61999380588531,
++        "device_std_us": 5.200212256839269,
++        "host_mean_us": 231.73481225967407,
++        "mean_us": 136.47360056638718,
++        "p50_us": 134.5899999141693,
++        "p99_us": 153.26379522681236,
++        "n": 100
++      },
++      "swa_summary": "136.5 \u00b1 5.2 (p95=145.7, n=100)"
++    }
++  ],
++  "p1_1_floor_evidence": {
++    "indexer_min_us": 248.43560054898262,
++    "indexer_max_us": 273.0635988712311,
++    "spread_pct": 9.913232349883245,
++    "floor_confirmed": false,
++    "verdict": "floor refuted",
++    "kernel_errors": [
++      4,
++      16
++    ],
++    "successful_cols": [
++      64,
++      256,
++      1024,
++      8192
++    ]
++  }
++}
+\ No newline at end of file

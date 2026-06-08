@@ -1,0 +1,1580 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: continuation (part 3/4)
+
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/CMakeLists.txt b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/CMakeLists.txt
+new file mode 100644
+index 0000000..2e47734
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/CMakeLists.txt
+@@ -0,0 +1,160 @@
++cmake_minimum_required(VERSION 3.14)
++
++set(CMAKE_C_STANDARD 11)
++set(CMAKE_C_STANDARD_REQUIRED ON)
++
++# can be compiled for SVE256 (32) or SVE512 (64)
++set(SV_LENGTH 32) # in bytes
++
++include_directories("${PROJECT_SOURCE_DIR}")
++include_directories("${PROJECT_SOURCE_DIR}/include")
++include_directories("${PROJECT_SOURCE_DIR}/standalone")
++add_compile_options(-fPIC -fvisibility=hidden -fstack-protector-strong -march=armv8.3-a+sve+i8mm -O3)
++# add_compile_options(-Wall -Wextra -Werror)
++
++# sources are split into several groups: matmul kernels (sources are compiled multiple times),
++#                                           packing kernels (sources are compiled multiple times),
++#                                           sequential/parallel pipelines,
++#                                           interface (sources are compiled multiple times)
++set(INT_GEMM_KERNELS "")
++set(INT_PACK_KERNELS "")
++set(INT_GEMM_INTERFACE "")
++set(INT_GEMM_PARALLEL "")
++set(INT_GEMM_SEQ "")
++set(BETA_KERNELS "")
++set(POST_OPS_KERNELS "")
++set(INT_SMALL_KERNELS "")
++set(GEMM_DRIVERS "")
++
++# Supported precisions are i/u for A and B matrices (4 combinations)
++set(LHS_TYPES LHS_INT LHS_UINT)
++set(RHS_TYPES RHS_INT RHS_UINT)
++
++# compile matrix-multiplication kernels multiple times
++set(INTEGER_MM_KERNELS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/integer_gemm_kernels.c")
++set(M_SIZES 1 2 3 4)
++set(N_SIZES 1 2 3 4)
++foreach(M_SIZE ${M_SIZES})
++  foreach(N_SIZE ${N_SIZES})
++    foreach(LHS_TYPE ${LHS_TYPES})
++      foreach(RHS_TYPE ${RHS_TYPES})
++        add_library(int4_integer_gemm_kernels_${LHS_TYPE}_${RHS_TYPE}_${M_SIZE}_${N_SIZE}_${SV_LENGTH} OBJECT ${INTEGER_MM_KERNELS_SRC})
++        target_compile_options(int4_integer_gemm_kernels_${LHS_TYPE}_${RHS_TYPE}_${M_SIZE}_${N_SIZE}_${SV_LENGTH} PUBLIC -DM_SIZE=${M_SIZE} 
++          -DN_SIZE=${N_SIZE} -D${LHS_TYPE} -D${RHS_TYPE} -DCOMP_SV_LEN=${SV_LENGTH})
++        target_include_directories(int4_integer_gemm_kernels_${LHS_TYPE}_${RHS_TYPE}_${M_SIZE}_${N_SIZE}_${SV_LENGTH} PUBLIC
++          "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++        list(APPEND INT_GEMM_KERNELS $<TARGET_OBJECTS:int4_integer_gemm_kernels_${LHS_TYPE}_${RHS_TYPE}_${M_SIZE}_${N_SIZE}_${SV_LENGTH}>)
++      endforeach()
++    endforeach()
++  endforeach()
++endforeach()
++
++# compile interface multiple times
++set(INTEGER_GEMM_IFACE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/integer_gemm_interface.c")
++foreach(LHS_TYPE ${LHS_TYPES})
++  foreach(RHS_TYPE ${RHS_TYPES})
++    add_library(int4_integer_gemm_interface_${LHS_TYPE}_${RHS_TYPE}_${SV_LENGTH} OBJECT ${INTEGER_GEMM_IFACE_SRC})
++    target_compile_options(int4_integer_gemm_interface_${LHS_TYPE}_${RHS_TYPE}_${SV_LENGTH} PUBLIC -D${LHS_TYPE} -D${RHS_TYPE} -DCOMP_SV_LEN=${SV_LENGTH})
++    target_include_directories(int4_integer_gemm_interface_${LHS_TYPE}_${RHS_TYPE}_${SV_LENGTH} PUBLIC
++      "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++    list(APPEND INT_GEMM_INTERFACE $<TARGET_OBJECTS:int4_integer_gemm_interface_${LHS_TYPE}_${RHS_TYPE}_${SV_LENGTH}>)
++  endforeach()
++endforeach()
++
++# compile threading layer
++# set(INTEGER_GEMM_PAR_PIPE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/parallel_int_gemm_pipeline.c")
++# add_library(integer_gemm_par_pipe_${SV_LENGTH} OBJECT ${INTEGER_GEMM_PAR_PIPE_SRC})
++# target_compile_options(int4_integer_gemm_par_pipe_${SV_LENGTH} PUBLIC -DCOMP_SV_LEN=${SV_LENGTH})
++# target_include_directories(int4_integer_gemm_par_pipe_${SV_LENGTH} PUBLIC "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++# list(APPEND INT_GEMM_PARALLEL $<TARGET_OBJECTS:int4_integer_gemm_par_pipe_${SV_LENGTH}>)
++
++
++# compile sequential layer
++set(INTEGER_GEMMSEQ_PIPE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/sequential_int_gemm_pipeline.c")
++add_library(int4_integer_gemm_seq_pipe_${SV_LENGTH} OBJECT ${INTEGER_GEMMSEQ_PIPE_SRC})
++target_compile_options(int4_integer_gemm_seq_pipe_${SV_LENGTH} PUBLIC -DCOMP_SV_LEN=${SV_LENGTH})
++target_include_directories(int4_integer_gemm_seq_pipe_${SV_LENGTH} PUBLIC 
++  "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++list(APPEND INT_GEMM_SEQ $<TARGET_OBJECTS:int4_integer_gemm_seq_pipe_${SV_LENGTH}>)
++
++# compile packingA kernels
++set(INT_PACK_A_KERNELS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/integer_pack_a_kernels.c")
++set(TRANSA_VALS TRANSA NOTRANSA)
++foreach(LHS_TYPE ${LHS_TYPES})
++  foreach(TRANSA_VAL ${TRANSA_VALS})
++    add_library(int4_integer_gemm_pack_a_${LHS_TYPE}_${TRANSA_VAL}_${SV_LENGTH} OBJECT ${INT_PACK_A_KERNELS_SRC})
++    target_compile_options(int4_integer_gemm_pack_a_${LHS_TYPE}_${TRANSA_VAL}_${SV_LENGTH} PUBLIC -DCOMP_SV_LEN=${SV_LENGTH} -D${LHS_TYPE} -D${TRANSA_VAL})
++    target_include_directories(int4_integer_gemm_pack_a_${LHS_TYPE}_${TRANSA_VAL}_${SV_LENGTH} PUBLIC "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++    list(APPEND INT_PACK_KERNELS $<TARGET_OBJECTS:int4_integer_gemm_pack_a_${LHS_TYPE}_${TRANSA_VAL}_${SV_LENGTH}>)
++  endforeach()
++endforeach()
++
++# compile packingB kernels
++set(INT_PACK_B_KERNELS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/integer_pack_b_kernels.c")
++set(TRANSB_VALS TRANSB NOTRANSB)
++foreach(RHS_TYPE ${RHS_TYPES})
++  foreach(TRANSB_VAL ${TRANSB_VALS})
++    add_library(int4_integer_gemm_pack_b_${RHS_TYPE}_${TRANSB_VAL}_${SV_LENGTH} OBJECT ${INT_PACK_B_KERNELS_SRC})
++    target_compile_options(int4_integer_gemm_pack_b_${RHS_TYPE}_${TRANSB_VAL}_${SV_LENGTH} PUBLIC -DCOMP_SV_LEN=${SV_LENGTH} -D${RHS_TYPE} -D${TRANSB_VAL})
++    target_include_directories(int4_integer_gemm_pack_b_${RHS_TYPE}_${TRANSB_VAL}_${SV_LENGTH} PUBLIC "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++    list(APPEND INT_PACK_KERNELS $<TARGET_OBJECTS:int4_integer_gemm_pack_b_${RHS_TYPE}_${TRANSB_VAL}_${SV_LENGTH}>)
++  endforeach()
++endforeach()
++
++# compile beta kernels
++set(BETA_OPTS BETA_OPT BETA_NO_OPT)
++
++foreach(B_TYPE ${BETA_OPTS})
++  add_library(int4_beta_kernels_${B_TYPE} OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/integer_beta_kernels.c")
++  target_compile_options(int4_beta_kernels_${B_TYPE} PUBLIC -D${B_TYPE} -DCOMP_SV_LEN=${SV_LENGTH})
++  target_include_directories(int4_beta_kernels_${B_TYPE} PUBLIC "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++  list(APPEND BETA_KERNELS $<TARGET_OBJECTS:int4_beta_kernels_${B_TYPE}>)
++endforeach()
++
++# compile int gemm drivers
++foreach(B_TYPE ${BETA_OPTS})
++  add_library(int4_gemm_driver_${B_TYPE} OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/integer_gemm_driver.c")
++  target_compile_options(int4_gemm_driver_${B_TYPE} PUBLIC -D${B_TYPE} -DCOMP_SV_LEN=${SV_LENGTH})
++  target_include_directories(int4_gemm_driver_${B_TYPE} PUBLIC "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++  list(APPEND GEMM_DRIVERS $<TARGET_OBJECTS:int4_gemm_driver_${B_TYPE}>)
++endforeach()
++
++# compile post-ops kernels
++foreach(B_TYPE ${BETA_OPTS})
++  add_library(int4_post_ops_kernels_${B_TYPE} OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/integer_post_ops_kernels.c")
++  target_compile_options(int4_post_ops_kernels_${B_TYPE} PUBLIC -D${B_TYPE} -DCOMP_SV_LEN=${SV_LENGTH})
++  target_include_directories(int4_post_ops_kernels_${B_TYPE} PUBLIC "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++  list(APPEND POST_OPS_KERNELS $<TARGET_OBJECTS:int4_post_ops_kernels_${B_TYPE}>)
++endforeach()
++
++# compile matrix-multiplication small kernels multiple times
++set(SMALL_KERNELS_KERNELS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/integer_gemm_small_kernels.c")
++set(TRANSA_VALS TRANSA NOTRANSA)
++set(TRANSB_VALS TRANSB NOTRANSB)
++set(OC_TYPES OC_FIX OC_COL OC_ROW)
++
++foreach(LHS_TYPE ${LHS_TYPES})
++  foreach(RHS_TYPE ${RHS_TYPES})
++    foreach(TRANSA_VAL ${TRANSA_VALS})
++      foreach(TRANSB_VAL ${TRANSB_VALS})
++        foreach(OC_TYPE ${OC_TYPES})
++          add_library(int4_small_kernels_${LHS_TYPE}_${RHS_TYPE}_${TRANSA_VAL}_${TRANSB_VAL}_${OC_TYPE}${SV_LENGTH} OBJECT ${SMALL_KERNELS_KERNELS_SRC})
++          target_compile_options(int4_small_kernels_${LHS_TYPE}_${RHS_TYPE}_${TRANSA_VAL}_${TRANSB_VAL}_${OC_TYPE}${SV_LENGTH} PUBLIC -D${LHS_TYPE} -D${RHS_TYPE} -D${TRANSA_VAL} -D${TRANSB_VAL} -D${OC_TYPE} -DCOMP_SV_LEN=${SV_LENGTH})
++          target_include_directories(int4_small_kernels_${LHS_TYPE}_${RHS_TYPE}_${TRANSA_VAL}_${TRANSB_VAL}_${OC_TYPE}${SV_LENGTH} PUBLIC "${CMAKE_SOURCE_DIR};${BLAS_INCLUDE_DIR};${DRIVER_INCLUDE_DIR};${CMAKE_BINARY_DIR}")
++          list(APPEND INT_SMALL_KERNELS $<TARGET_OBJECTS:int4_small_kernels_${LHS_TYPE}_${RHS_TYPE}_${TRANSA_VAL}_${TRANSB_VAL}_${OC_TYPE}${SV_LENGTH}>)
++        endforeach()
++      endforeach()
++    endforeach()
++  endforeach()
++endforeach()
++
++list(APPEND OBJ_FILES_STANDALONE_DIR ${INT_GEMM_KERNELS} ${INT_GEMM_INTERFACE} ${INT_GEMM_SEQ} ${INT_PACK_KERNELS} ${BETA_KERNELS} ${POST_OPS_KERNELS} ${INT_SMALL_KERNELS} ${GEMM_DRIVERS})
++# set(OBJ_FILES_STANDALONE_DIR ${OBJ_FILES_STANDALONE_DIR} PARENT_SCOPE)
++# all compiled object files are united into one object library
++add_library(prefillint4gemm SHARED ${OBJ_FILES_STANDALONE_DIR})
++
++set_target_properties(prefillint4gemm PROPERTIES
++    ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/prefillint4gemm
++    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/prefillint4gemm
++    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/prefillint4gemm
++)
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/beta_macros.h b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/beta_macros.h
+new file mode 100644
+index 0000000..fea3916
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/beta_macros.h
+@@ -0,0 +1,25 @@
++#ifndef BETA_MACROS_H
++#define BETA_MACROS_H
++
++#if defined(OC_FIX)
++#define OC_TYPE f
++#define OC_IDX(mi, nn) 0
++#elif defined(OC_COL)
++#define OC_TYPE c
++#define OC_IDX(mi, ni) mi
++#else
++#define OC_TYPE r
++#define OC_IDX(mi, ni) ni
++#endif
++
++#if defined(BETA_OPT)
++#define BETA_SUFF(name) name##_opt
++#define LDC(m, ldc) ldc
++#define DTYPE int32_t
++#else
++#define BETA_SUFF(name) name
++#define LDC(m, ldc) m
++#define DTYPE float
++#endif
++
++#endif
+\ No newline at end of file
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/helping_macros.h b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/helping_macros.h
+new file mode 100644
+index 0000000..ed599c0
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/helping_macros.h
+@@ -0,0 +1,63 @@
++#ifndef __HELPING_MACROS_INT4_H__
++#define __HELPING_MACROS_INT4_H__
++
++#include <stdio.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++
++#if defined(LHS_INT) && defined(LHS_UINT)
++#error "Both LHS_INT and LHS_UINT are defined"
++#endif
++
++#if defined(RHS_INT) && defined(RHS_UINT)
++#error "Both RHS_INT and RHS_UINT are defined"
++#endif
++
++#ifdef LHS_INT
++#define LHS_TYPE s
++#define LHS_INT_TYPE int8_t
++#endif
++#ifdef LHS_UINT
++#define LHS_TYPE u
++#define LHS_INT_TYPE uint8_t
++#endif
++#ifdef RHS_INT
++#define RHS_TYPE s
++#define RHS_INT_TYPE int8_t
++#endif
++#ifdef RHS_UINT
++#define RHS_TYPE u
++#define RHS_INT_TYPE uint8_t
++#endif
++
++// mangling macros
++#define ADD_M_N_SIZES(name, m_size, n_size) name##_##m_size##x##n_size
++#define ADD_M_N_SIZES_MACRO(name, m_size, n_size) ADD_M_N_SIZES(name, m_size, n_size)
++#define ADD_TYPES(name, lhs_type, rhs_type) name##_##lhs_type##8##rhs_type##8s32
++#define ADD_TYPES_MACRO(name, lhs_type, rhs_type) ADD_TYPES(name, lhs_type, rhs_type)
++#define ADD_TYPES_SUFF(name) ADD_TYPES_MACRO(name, LHS_TYPE, RHS_TYPE)
++#define ADD_ONE_TYPE_TRANSP(name, type, nt) name##_##type##8_##nt
++#define ADD_ONE_TYPE_TRANSP_MACRO(name, type, nt) ADD_ONE_TYPE_TRANSP(name, type, nt)
++#define ADD_PACK_A_N_SUFF(name) ADD_ONE_TYPE_TRANSP_MACRO(name, LHS_TYPE, n)
++#define ADD_PACK_B_N_SUFF(name) ADD_ONE_TYPE_TRANSP_MACRO(name, RHS_TYPE, n)
++#define ADD_PACK_A_T_SUFF(name) ADD_ONE_TYPE_TRANSP_MACRO(name, LHS_TYPE, t)
++#define ADD_PACK_B_T_SUFF(name) ADD_ONE_TYPE_TRANSP_MACRO(name, RHS_TYPE, t)
++#define ADD_TWO_TYPES_TRANSP(name, lhs_type, rhs_type, a_t, b_t, oc_t) \
++  name##_##lhs_type##8##rhs_type##8s32##_##a_t##b_t##_##oc_t
++#define ADD_TWO_TYPES_TRANSP_MACRO(name, lhs_type, rhs_type, a_t, b_t, oc_t) \
++  ADD_TWO_TYPES_TRANSP(name, lhs_type, rhs_type, a_t, b_t, oc_t)
++#define ADD_TRANSP_MACRO(name, a_t, b_t, oc_t) ADD_TWO_TYPES_TRANSP_MACRO(name, LHS_TYPE, RHS_TYPE, a_t, b_t, oc_t)
++
++#ifdef ENABLE_THREADING
++#define ADD_THREAD_SUFF(name) name##_thread
++#else
++#define ADD_THREAD_SUFF(name) name
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+\ No newline at end of file
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_beta_kernels.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_beta_kernels.c
+new file mode 100644
+index 0000000..ae13655
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_beta_kernels.c
+@@ -0,0 +1,82 @@
++#include <stdint.h>
++#include "integer_gemm_kernels.h"
++#include "helping_macros.h"
++#include "beta_macros.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++// Column major C, Fixed C_offset
++void BETA_SUFF(beta_cf_s8)(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc) {
++    DTYPE oc_val = (DTYPE)*oc;
++    DTYPE* c_typed_ptr = (DTYPE*) c_ptr;
++    DTYPE beta_val = (DTYPE)beta;
++    for (size_t ni = 0; ni < n_block_size; ++ni) {
++        for (size_t mi = 0; mi < m_block_size; ++mi) {
++            c_typed_ptr[ldc * ni + mi] = beta_val * ((DTYPE)c_ptr[ldc * ni + mi]) + oc_val;
++        }
++    }
++}
++
++// Column major C, Column major C_offset
++void BETA_SUFF(beta_cc_s8)(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc) {
++    DTYPE* c_typed_ptr = (DTYPE*) c_ptr;
++    DTYPE beta_val = (DTYPE)beta;
++    for (size_t ni = 0; ni < n_block_size; ++ni) {
++        for (size_t mi = 0; mi < m_block_size; ++mi) {
++            c_typed_ptr[ldc * ni + mi] = beta_val * ((DTYPE)c_ptr[ldc * ni + mi]) + ((DTYPE)oc[mi]);
++        }
++    }
++}
++
++// Column major C, Row major C_offset
++void BETA_SUFF(beta_cr_s8)(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc) {
++    DTYPE* c_typed_ptr = (DTYPE*) c_ptr;
++    DTYPE beta_val = (DTYPE)beta;
++    for (size_t ni = 0; ni < n_block_size; ++ni) {
++        for (size_t mi = 0; mi < m_block_size; ++mi) {
++            c_typed_ptr[ldc * ni + mi] = beta_val * ((DTYPE)c_ptr[ldc * ni + mi]) + ((DTYPE)oc[ni]);
++        }
++    }
++}
++
++// Row major C, Fixed C_offset
++// for row-major we actually swap m and n values so we reswap it here again
++void BETA_SUFF(beta_rf_s8)(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc) {
++    DTYPE oc_val = (DTYPE)*oc;
++    DTYPE* c_typed_ptr = (DTYPE*) c_ptr;
++    DTYPE beta_val = (DTYPE)beta;
++    for (size_t mi = 0; mi < n_block_size; ++mi) {
++        for (size_t ni = 0; ni < m_block_size; ++ni) {
++            c_typed_ptr[ldc * mi + ni] = beta_val * ((DTYPE)c_ptr[ldc * mi + ni]) + oc_val;
++        }
++    }
++}
++
++// Row major C, Column major C_offset
++// for row-major we actually swap m and n values so we reswap it here again
++void BETA_SUFF(beta_rc_s8)(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc) {
++    DTYPE* c_typed_ptr = (DTYPE*) c_ptr;
++    DTYPE beta_val = (DTYPE)beta;
++    for (size_t mi = 0; mi < n_block_size; ++mi) {
++        for (size_t ni = 0; ni < m_block_size; ++ni) {
++            c_typed_ptr[ldc * mi + ni] = beta_val * ((DTYPE)c_ptr[ldc * mi + ni]) + ((DTYPE)oc[mi]);
++        }
++    }
++}
++
++// Row major C, Row major C_offset
++// for row-major we actually swap m and n values so we reswap it here again
++void BETA_SUFF(beta_rr_s8)(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc) {
++    DTYPE* c_typed_ptr = (DTYPE*) c_ptr;
++    DTYPE beta_val = (DTYPE)beta;
++    for (size_t mi = 0; mi < n_block_size; ++mi) {
++        for (size_t ni = 0; ni < m_block_size; ++ni) {
++            c_typed_ptr[ldc * mi + ni] = beta_val * ((DTYPE)c_ptr[ldc * mi + ni]) + ((DTYPE)oc[ni]);
++        }
++    }
++}
++
++#ifdef __cplusplus
++} // extern "C"
++#endif /* __cplusplus */
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_driver.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_driver.c
+new file mode 100644
+index 0000000..0178eb9
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_driver.c
+@@ -0,0 +1,121 @@
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include "integer_gemm_kernels.h"
++#include "beta_macros.h"
++
++#define OLD_N_SIZE 8
++#define PACKED_LD_STEP(n_step, k_step, ldb) (n_step * (ldb / 2) + (k_step / 2) * OLD_N_SIZE)
++
++void BETA_SUFF(gemm_driver)(int_gemm_funcs* arg, size_t m, size_t n, size_t k, float alpha,
++    const void* a, size_t lda, const BLASINT8 oa,
++    const void* b, size_t ldb, const BLASINT8 ob,
++    float beta, int32_t* c, size_t ldc, const int32_t* oc) {
++
++        void (**gemm_kernels)(const void*, const void*, int32_t*, size_t, int64_t, int64_t) = arg->gemm_kernels;
++        void (*pack_a_fun)(void*, const void*, size_t, size_t, size_t, const BLASINT8) = arg->pack_a_fun;
++        void (*pack_b_fun)(void*, const void*, size_t, size_t, size_t, const BLASINT8) = arg->pack_b_fun;
++        void (*beta_func)(int32_t*, const int32_t*, float, size_t, size_t, size_t) = arg->beta_func;
++        size_t (*a_indexing)(size_t m, size_t n, size_t ld) = arg->a_indexing;
++        size_t (*b_indexing)(size_t m, size_t n, size_t ld) = arg->b_indexing;
++
++#ifndef BETA_OPT
++        void (*post_ops_func)(float, const int32_t*, int32_t*, size_t, size_t, size_t) = arg->post_ops_func;
++#endif // BETA_OPT
++
++        const BLASINT8* a_typed = (const BLASINT8*) a;
++        const BLASINT8* b_typed = (const BLASINT8*) b;
++
++        BLASINT8* bufferA = (BLASINT8*) aligned_alloc(ALIGNMENT, sizeof(BLASINT8) * K_BLOCK * M_BLOCK);
++        BLASINT8* bufferB = (BLASINT8*) aligned_alloc(ALIGNMENT, sizeof(BLASINT8) * K_BLOCK * N_BLOCK);
++
++    // Tmp buffer is not needed when (alpha = 1 and beta = 0/1)
++#ifdef BETA_OPT
++        int32_t* bufferC = c;
++#else
++        int32_t* bufferC = (int32_t*) aligned_alloc(ALIGNMENT, sizeof(int32_t) * m * N_BLOCK);
++#endif
++
++        if (!bufferA || !bufferB || !bufferC) {
++            free(bufferA);
++            free(bufferB);
++            free(bufferC);
++            printf("Integer GEMM unsuccessful allocation");
++            return;
++        }
++        // printf("pack b beta: %f\n",beta);
++        beta_func(c, oc, beta, m, n, ldc);
++
++        for (size_t n_block = 0; n_block < n; n_block += N_BLOCK) {
++            size_t n_block_size = n - n_block;
++            if (n_block_size > N_BLOCK) {
++                n_block_size = N_BLOCK;
++            }
++        
++#ifndef BETA_OPT
++        // fill bufferC w/ zeros
++        for (size_t tmp_idx = 0; tmp_idx < (m * N_BLOCK); ++tmp_idx) {
++            bufferC[tmp_idx] = 0;
++        }
++#endif // BETA_OPT
++
++        if (alpha != 0.0f){
++            for (size_t k_block = 0; k_block < k; k_block += K_BLOCK){
++                size_t k_block_size = k - k_block;
++                if (k_block_size > K_BLOCK) {
++                    k_block_size = K_BLOCK;
++                }
++                size_t k_block_size_up = (k_block_size + KERNEL_K_STEP - 1) / KERNEL_K_STEP * KERNEL_K_STEP;
++
++                const BLASINT8* curr_b_ptr = b_typed + b_indexing(k_block, n_block, ldb);
++
++                pack_b_fun(bufferB, curr_b_ptr, n_block_size, k_block_size, ldb, ob);
++                for (size_t m_block = 0; m_block < m; m_block += M_BLOCK) {
++                    size_t m_block_size = m - m_block;
++                    if (m_block_size > M_BLOCK) {
++                        m_block_size = M_BLOCK;
++                    }
++                    const BLASINT8* curr_a_ptr = a_typed + PACKED_LD_STEP(m_block, k_block, lda);
++                    pack_a_fun(bufferA, curr_a_ptr, m_block_size, k_block_size, lda, oa);
++                    // loop over bufferB, taking parts which fit into L1
++                    for (size_t n_sub_block = 0; n_sub_block < n_block_size; n_sub_block += KERNEL_N_STEP) {
++                        size_t n_sub_block_size = n_block_size - n_sub_block;
++                        if (n_sub_block_size > KERNEL_N_STEP) {
++                            n_sub_block_size = KERNEL_N_STEP;
++                        }
++                        BLASINT8* current_bufferB_ptr = bufferB + n_sub_block * k_block_size_up;
++                        // loop over bufferA, taking parts which fit into L1
++                        for (size_t m_sub_block = 0; m_sub_block < m_block_size; m_sub_block += KERNEL_M_STEP) {
++                            size_t m_sub_block_size = m_block_size - m_sub_block;
++                            if (m_sub_block_size > KERNEL_M_STEP) {
++                                m_sub_block_size = KERNEL_M_STEP;
++                            }
++                            BLASINT8* current_bufferA_ptr = bufferA + m_sub_block * k_block_size_up;
++#ifdef BETA_OPT
++                            int32_t* current_bufferC_ptr = bufferC + n_block * ldc + n_sub_block * LDC(m, ldc) + m_sub_block + m_block;
++#else
++                            int32_t* current_bufferC_ptr = bufferC + n_sub_block * LDC(m, ldc) + m_sub_block + m_block;
++#endif
++                            // call kernel which performs loop over k_block_size
++                            gemm_kernels[(n_sub_block_size - 1) + (m_sub_block_size - 1) * KERNEL_N_STEP](current_bufferA_ptr, current_bufferB_ptr, current_bufferC_ptr,
++                            LDC(m, ldc), k_block_size_up, COMP_SV_LEN);
++                        }
++                    }
++                }
++            }
++        }
++        
++#ifndef BETA_OPT
++        // copy C data from bufferC multiplying by alpha and adding initial C data (scaled by beta)
++        int32_t* current_c_ptr = c + n_block * ldc; // col major
++        post_ops_func(alpha, bufferC, current_c_ptr, LDC(m, ldc), n_block_size, ldc);
++#endif
++    }
++
++    free(bufferA);
++    free(bufferB);
++
++#ifndef BETA_OPT
++    free(bufferC);
++#endif
++    }
+\ No newline at end of file
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_interface.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_interface.c
+new file mode 100644
+index 0000000..01f719a
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_interface.c
+@@ -0,0 +1,154 @@
++#include <stdint.h>
++#include <stdio.h>
++//#include "cblas.h"
++#include "integer_gemm_kernels.h"
++#include "helping_macros.h"
++
++
++/* matrix saved in rows or cols */
++typedef enum CBLAS_ORDER {
++    CblasRowMajor = 101,
++    CblasColMajor = 102
++} CBLAS_ORDER;
++
++/* matrix transpose or conjugate transpose */
++typedef enum CBLAS_TRANSPOSE {
++    CblasNoTrans = 111,
++    CblasTrans = 112,
++    CblasConjTrans = 113, // conjugate transpose
++    CblasConjNoTrans = 114
++} CBLAS_TRANSPOSE;
++
++typedef CBLAS_ORDER CBLAS_LAYOUT;
++
++typedef enum CBLAS_OFFSET {
++    CblasRowOffset = 171,
++    CblasColOffset = 172,
++    CblasFixOffset = 173
++} CBLAS_OFFSET;
++
++
++
++#ifdef __cplusplus
++extern "C" {
++    #endif /* __cplusplus */
++
++#define ADD_KERNEL_SUFF(name, m_size, n_size) ADD_M_N_SIZES_MACRO(ADD_TYPES_MACRO(name, LHS_TYPE, RHS_TYPE), m_size, n_size)
++
++static void (*gemm_kernels[])(const void*, const void*, int32_t*, size_t, int64_t, int64_t) = {
++    ADD_KERNEL_SUFF(gemm_kernel, 1, 1), ADD_KERNEL_SUFF(gemm_kernel, 1, 2),ADD_KERNEL_SUFF(gemm_kernel, 1, 3), ADD_KERNEL_SUFF(gemm_kernel, 1, 4),
++    ADD_KERNEL_SUFF(gemm_kernel, 2, 1), ADD_KERNEL_SUFF(gemm_kernel, 2, 2),ADD_KERNEL_SUFF(gemm_kernel, 2, 3), ADD_KERNEL_SUFF(gemm_kernel, 2, 4),
++    ADD_KERNEL_SUFF(gemm_kernel, 3, 1), ADD_KERNEL_SUFF(gemm_kernel, 3, 2),ADD_KERNEL_SUFF(gemm_kernel, 3, 3), ADD_KERNEL_SUFF(gemm_kernel, 3, 4),
++    ADD_KERNEL_SUFF(gemm_kernel, 4, 1), ADD_KERNEL_SUFF(gemm_kernel, 4, 2),ADD_KERNEL_SUFF(gemm_kernel, 4, 3), ADD_KERNEL_SUFF(gemm_kernel, 4, 4)
++};
++
++static void (*pack_b_funs[])(void*, const void*, size_t, size_t, size_t, const BLASINT8) = {
++    ADD_PACK_B_N_SUFF(pack_b),
++    ADD_PACK_B_T_SUFF(pack_b)
++};
++
++static void (*pack_a_funs[])(void*, const void*, size_t, size_t, size_t, const BLASINT8) = {
++    ADD_PACK_A_N_SUFF(pack_a),
++    ADD_PACK_A_T_SUFF(pack_a)
++};
++
++static void (*small_kernels[])(const size_t, const size_t, const size_t, const float,
++    const void *, const size_t, const BLASINT8,
++    const void *, const size_t, const BLASINT8,
++    const float, int32_t *, const size_t, const int32_t *) = {
++        ADD_TRANSP_MACRO(small_kernel, n, n, f), ADD_TRANSP_MACRO(small_kernel, n, t, f),
++        ADD_TRANSP_MACRO(small_kernel, t, n, f), ADD_TRANSP_MACRO(small_kernel, t, t, f),
++        ADD_TRANSP_MACRO(small_kernel, n, n, c), ADD_TRANSP_MACRO(small_kernel, n, t, c),
++        ADD_TRANSP_MACRO(small_kernel, t, n, c), ADD_TRANSP_MACRO(small_kernel, t, t, c),
++        ADD_TRANSP_MACRO(small_kernel, n, n, r), ADD_TRANSP_MACRO(small_kernel, n, t, r),
++        ADD_TRANSP_MACRO(small_kernel, t, n, r), ADD_TRANSP_MACRO(small_kernel, t, t, r),
++    };
++
++static void (*beta_funcs[])(int32_t*, const int32_t*, float, size_t, size_t, size_t) = {
++    beta_cf_s8, beta_cc_s8, beta_cr_s8, beta_rf_s8, beta_rc_s8, beta_rr_s8,
++    beta_cf_s8_opt, beta_cc_s8_opt, beta_cr_s8_opt, beta_rf_s8_opt, beta_rc_s8_opt, beta_rr_s8_opt
++};
++
++static void (*post_op_kernels[])(float alpha, const int32_t* bufferC, int32_t* current_c_ptr, size_t m, size_t n_block, size_t ldc) = {
++    post_ops, post_ops_opt
++};
++
++static size_t row_major_idx(size_t m, size_t n, size_t ld) {
++    return ld * m + n;
++}
++
++static size_t col_major_idx(size_t m, size_t n, size_t ld) {
++    return m + ld * n;
++}
++
++static size_t (*compute_idx[])(size_t m, size_t n, size_t ld) = {
++    col_major_idx,
++    row_major_idx
++};
++
++static size_t mov_oc_fix(size_t mi, size_t ni) {
++    UNUSED(mi);
++    UNUSED(ni);
++    return 0;
++}
++static size_t mov_oc_col(size_t mi, size_t ni){
++    UNUSED(ni);
++    return mi;
++}
++
++static size_t mov_oc_row(size_t mi, size_t ni) {
++    UNUSED(mi);
++    return ni;
++}
++
++static size_t (*move_oc[])(size_t, size_t) = {
++    mov_oc_fix, mov_oc_col, mov_oc_row
++};
++
++EXTERNAL_API void ADD_TYPES_SUFF(prefill_int4_cblas_gemm)(
++    const CBLAS_LAYOUT Layout, const CBLAS_TRANSPOSE transa, const CBLAS_TRANSPOSE transb, const CBLAS_OFFSET offsetc,
++    const size_t m, const size_t n, const size_t k, const float alpha,
++    const void *a, const size_t lda, const BLASINT8 oa,
++    const void *b, const size_t ldb, const BLASINT8 ob,
++    const float beta, int32_t *c, const size_t ldc, const int32_t *oc) {
++
++    int opt_offset = ((alpha == 1.0f) && (beta == 0.0f || beta == 1.0f)) ? 1 : 0;
++    if(Layout == CblasColMajor) {
++        int beta_offset = (offsetc == CblasFixOffset) ? 0 : (offsetc == CblasColOffset ? 1:2);
++        int_gemm_funcs arg = {
++            small_kernels[(transb == CblasTrans) + 2 * (transa == CblasTrans) + beta_offset * 4],
++            gemm_kernels,
++            pack_a_funs[transa == CblasTrans],
++            pack_b_funs[transb == CblasTrans],
++            beta_funcs[beta_offset + opt_offset * 6],
++            post_op_kernels[alpha == 1],
++            compute_idx[transa == CblasTrans],
++            compute_idx[transb == CblasTrans],
++            move_oc[beta_offset],
++        };
++        (gemm_impl_8bit(&arg, m, n, k, alpha, a, lda, oa, b, ldb, ob, beta, c, ldc, oc, 262144));
++    } else if (Layout == CblasRowMajor) {
++        int beta_offset = (offsetc == CblasFixOffset) ? 3 : (offsetc == CblasColOffset ? 4 : 5);
++        int beta_offset_small = (offsetc == CblasFixOffset) ? 0 : (offsetc == CblasColOffset ? 2 : 1);
++        int_gemm_funcs arg = {
++            small_kernels[(transa == CblasTrans) + 2 * (transb == CblasTrans) + beta_offset_small * 4],
++            gemm_kernels,
++            pack_a_funs[transb == CblasTrans],
++            pack_b_funs[transa == CblasTrans],
++            beta_funcs[beta_offset + opt_offset * 6],
++            post_op_kernels[alpha == 1],
++            compute_idx[transb == CblasTrans],
++            compute_idx[transa == CblasTrans],
++            move_oc[beta_offset_small]
++        };
++        (gemm_impl_8bit(&arg, n, m, k, alpha, b, ldb, ob, a, lda, oa, beta, c, ldc, oc, 262144));
++    }
++    else {
++        printf("Incorrect layout");
++        return;
++    }
++}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_kernels.c b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_kernels.c
+new file mode 100644
+index 0000000..c69897d
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_kernels.c
+@@ -0,0 +1,453 @@
++#include <stdint.h>
++#include "integer_gemm_kernels.h"
++#include "helping_macros.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define ADD_SUFFIX(name) ADD_M_N_SIZES_MACRO(ADD_TYPES_MACRO(name, LHS_TYPE, RHS_TYPE), M_SIZE, N_SIZE)
++
++#define LD1B_PTR(reg_name, p, ptr, idx) "ld1b {" #reg_name ".b}, " #p "/z, [%[" #ptr "], #" #idx ", MUL VL]\n"
++#define COMPUTE_ADDP(out, in1, in2) "addp " #out ".s, " #in1 ".s, " #in2 ".s\n"
++#if (defined(LHS_INT) && defined(RHS_INT)) || (defined(LHS_UINT) && defined(RHS_UINT))
++#define COMPUTE_DOT_TYPED(out, in1, in2, lhs_type, rhs_type) #lhs_type "dot " #out ".s, " #in1 ".b, " #in2 ".b\n"
++#else
++  #ifdef LHS_INT
++  #define COMPUTE_DOT_TYPED(out, in1, in2, lhs_type, rhs_type) "usdot " #out ".s, " #in2 ".b, " #in1 ".b\n"
++  #else
++  #define COMPUTE_DOT_TYPED(out, in1, in2, lhs_type, rhs_type) "usdot " #out ".s, " #in1 ".b, " #in2 ".b\n"
++  #endif
++#endif
++
++#define COMPUTE_DOT_TYPED_MACRO(out, in1, in2, LHS_TYPE, RHS_TYPE) COMPUTE_DOT_TYPED(out, in1, in2, LHS_TYPE, RHS_TYPE)
++#define COMPUTE_DOT(out, in1, in2) COMPUTE_DOT_TYPED_MACRO(out, in1, in2, LHS_TYPE, RHS_TYPE)
++
++#if (N_SIZE > 4)
++#error "N_SIZE can't be greater than 4"
++#endif
++
++#if (M_SIZE > 4)
++#error "M_SIZE can't be greater than 4"
++#endif
++
++#define LOAD_Z0(p, ptr) LD1B_PTR(z0, p, ptr, 0)
++#define LOAD_Z8(p, ptr) LD1B_PTR(z8, p, ptr, 0)
++
++#if (N_SIZE > 1)
++  #define LOAD_Z1(p, ptr) LD1B_PTR(z1, p, ptr, 1)
++  #define LOAD_Z9(p, ptr) LD1B_PTR(z9, p, ptr, 1)
++#else
++  #define LOAD_Z1(p, ptr)
++  #define LOAD_Z9(p, ptr)
++#endif
++
++#if (N_SIZE > 2)
++  #define LOAD_Z2(p, ptr) LD1B_PTR(z2, p, ptr, 2)
++  #define LOAD_Z10(p, ptr) LD1B_PTR(z10, p, ptr, 2)
++#else
++#define LOAD_Z2(p, ptr)
++#define LOAD_Z10(p, ptr)
++#endif
++
++#if (N_SIZE > 3)
++  #define LOAD_Z3(p, ptr) LD1B_PTR(z3, p, ptr, 3)
++  #define LOAD_Z11(p, ptr) LD1B_PTR(z11, p, ptr, 3)
++#else
++  #define LOAD_Z3(p, ptr)
++  #define LOAD_Z11(p, ptr)
++#endif
++
++#define LOAD_Z4(p, ptr) LD1B_PTR(z4, p, ptr, 0)
++#define LOAD_Z12(p, ptr) LD1B_PTR(z12, p, ptr, 0)
++
++#if (M_SIZE > 1)
++  #define LOAD_Z5(p, ptr) LD1B_PTR(z5, p, ptr, 1)
++  #define LOAD_Z13(p, ptr) LD1B_PTR(z13, p, ptr, 1)
++#else
++  #define LOAD_Z5(p, ptr)
++  #define LOAD_Z13(p, ptr)
++#endif
++
++#if (M_SIZE > 2)
++  #define LOAD_Z6(p, ptr) LD1B_PTR(z6, p, ptr, 2)
++  #define LOAD_Z14(p, ptr) LD1B_PTR(z14, p, ptr, 2)
++#else
++  #define LOAD_Z6(p, ptr)
++  #define LOAD_Z14(p, ptr)
++#endif
++
++#if (M_SIZE > 3)
++  #define LOAD_Z7(p, ptr) LD1B_PTR(z7, p, ptr, 3)
++  #define LOAD_Z15(p, ptr) LD1B_PTR(z15, p, ptr, 3)
++#else
++  #define LOAD_Z7(p, ptr)
++  #define LOAD_Z15(p, ptr)
++#endif
++
++// macros for dot multiplication
++#define ACCUMULATE_Z16(lhs, rhs) COMPUTE_DOT(z16, lhs, rhs)
++
++#if (N_SIZE > 1)
++  #define ACCUMULATE_Z17(lhs, rhs) COMPUTE_DOT(z17, lhs, rhs)
++#else
++  #define ACCUMULATE_Z17(lhs, rhs)
++#endif
++
++#if (N_SIZE > 2)
++  #define ACCUMULATE_Z18(lhs, rhs) COMPUTE_DOT(z18, lhs, rhs)
++#else
++  #define ACCUMULATE_Z18(lhs, rhs)
++#endif
++
++#if (N_SIZE > 3)
++  #define ACCUMULATE_Z19(lhs, rhs) COMPUTE_DOT(z19, lhs, rhs)
++#else
++  #define ACCUMULATE_Z19(lhs, rhs)
++#endif
++
++#if (M_SIZE > 1)
++  #define ACCUMULATE_Z20(lhs, rhs) COMPUTE_DOT(z20, lhs, rhs)
++  #if (N_SIZE > 1)
++    #define ACCUMULATE_Z21(lhs, rhs) COMPUTE_DOT(z21, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z21(lhs, rhs)
++  #endif
++
++  #if (N_SIZE > 2)
++    #define ACCUMULATE_Z22(lhs, rhs) COMPUTE_DOT(z22, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z22(lhs, rhs)
++  #endif
++
++  #if (N_SIZE > 3)
++    #define ACCUMULATE_Z23(lhs, rhs) COMPUTE_DOT(z23, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z23(lhs, rhs)
++  #endif
++
++#else
++  #define ACCUMULATE_Z20(lhs, rhs)
++  #define ACCUMULATE_Z21(lhs, rhs)
++  #define ACCUMULATE_Z22(lhs, rhs)
++  #define ACCUMULATE_Z23(lhs, rhs)
++#endif
++
++#if (M_SIZE > 2)
++  #define ACCUMULATE_Z24(lhs, rhs) COMPUTE_DOT(z24, lhs, rhs)
++
++  #if (N_SIZE > 1)
++    #define ACCUMULATE_Z25(lhs, rhs) COMPUTE_DOT(z25, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z25(lhs, rhs)
++  #endif
++
++  #if (N_SIZE > 2)
++    #define ACCUMULATE_Z26(lhs, rhs) COMPUTE_DOT(z26, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z26(lhs, rhs)
++  #endif
++
++  #if (N_SIZE > 3)
++    #define ACCUMULATE_Z27(lhs, rhs) COMPUTE_DOT(z27, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z27(lhs, rhs)
++  #endif
++
++#else
++  #define ACCUMULATE_Z24(lhs, rhs)
++  #define ACCUMULATE_Z25(lhs, rhs)
++  #define ACCUMULATE_Z26(lhs, rhs)
++  #define ACCUMULATE_Z27(lhs, rhs)
++#endif
++
++#if (M_SIZE > 3)
++  #define ACCUMULATE_Z28(lhs, rhs) COMPUTE_DOT(z28, lhs, rhs)
++
++  #if (N_SIZE > 1)
++    #define ACCUMULATE_Z29(lhs, rhs) COMPUTE_DOT(z29, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z29(lhs, rhs)
++  #endif
++
++  #if (N_SIZE > 2)
++    #define ACCUMULATE_Z30(lhs, rhs) COMPUTE_DOT(z30, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z30(lhs, rhs)
++  #endif
++
++  #if (N_SIZE > 3)
++    #define ACCUMULATE_Z31(lhs, rhs) COMPUTE_DOT(z31, lhs, rhs)
++  #else
++    #define ACCUMULATE_Z31(lhs, rhs)
++  #endif
++
++#else
++  #define ACCUMULATE_Z28(lhs, rhs)
++  #define ACCUMULATE_Z29(lhs, rhs)
++  #define ACCUMULATE_Z30(lhs, rhs)
++  #define ACCUMULATE_Z31(lhs, rhs)
++#endif
++
++#define MOVE_LHS_PTR(ptr) "add %[" #ptr "], %[" #ptr "], %[move_lhs]\n"
++#define MOVE_RHS_PTR(ptr) "add %[" #ptr "], %[" #ptr "], %[move_rhs]\n"
++
++#define PROCESS_ACCUM(reg_idx, z_reg_idx, tmp_reg, dst, p)                     \
++  "ldr w" #reg_idx ", [%[" #dst "]]\n"                                         \
++  "saddv d" #reg_idx ", " #p ", z" #z_reg_idx ".s\n"                           \
++  "fmov " #tmp_reg ", d" #reg_idx "\n"                                         \
++  "add x" #reg_idx ", x" #reg_idx ", " #tmp_reg "\n"                           \
++  "str w" #reg_idx ", [%[" #dst "]], #4\n"
++
++// function logic
++void ADD_SUFFIX(gemm_kernel)(const void *lhs_ptr, const void *rhs_ptr,
++                             int32_t *accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len) {
++  int64_t run_k_depth = k_depth;
++  int64_t run_sv_len = sv_len;
++  int64_t run_2sv_len = 2 * sv_len;
++  int64_t move_lhs = M_SIZE * sv_len;
++  int64_t move_rhs = N_SIZE * sv_len;
++  int32_t* dst_ptr = accum_ptr;
++  ldc -= M_SIZE;
++  ldc *= 4;
++  asm volatile(
++    // predicate for operating on lhs and rhs is always true
++    "ptrue p0.b, all\n"
++    // Clear accumulators
++    LOAD_Z0(p0, rhs_ptr)
++    "dup z16.s, #0\n"
++    LOAD_Z1(p0, rhs_ptr)
++    "dup z17.s, #0\n"
++    LOAD_Z4(p0, lhs_ptr)
++    "dup z18.s, #0\n"
++    LOAD_Z5(p0, lhs_ptr)
++    "dup z19.s, #0\n"
++    LOAD_Z6(p0, lhs_ptr)
++    "dup z20.s, #0\n"
++    LOAD_Z7(p0, lhs_ptr)
++    "dup z21.s, #0\n"
++    LOAD_Z2(p0, rhs_ptr)
++    "dup z22.s, #0\n"
++    LOAD_Z3(p0, rhs_ptr)
++    "dup z23.s, #0\n"
++    "subs %[run_k_depth], %[run_k_depth], %[run_sv_len]\n"
++    "dup z24.s, #0\n"
++    "mov x16, %[dst_ptr]\n"
++    "dup z25.s, #0\n"
++    "dup z26.s, #0\n"
++    "dup z27.s, #0\n"
++    MOVE_LHS_PTR(lhs_ptr)
++    "dup z28.s, #0\n"
++    MOVE_RHS_PTR(rhs_ptr)
++    "dup z29.s, #0\n"
++    "dup z30.s, #0\n"
++    "dup z31.s, #0\n"
++
++    "ble 1f\n"
++
++    "cmp %[run_k_depth], %[run_2sv_len]\n"
++    "blt 2f\n"
++
++    "3:\n"
++        LOAD_Z12(p0, lhs_ptr)
++        ACCUMULATE_Z16(z4,z0)
++        ACCUMULATE_Z17(z4,z1)
++        LOAD_Z13(p0, lhs_ptr)
++        ACCUMULATE_Z18(z4,z2)
++        ACCUMULATE_Z19(z4,z3)
++        LOAD_Z8(p0, rhs_ptr)
++        ACCUMULATE_Z20(z5,z0)
++        ACCUMULATE_Z21(z5,z1)
++        LOAD_Z9(p0, rhs_ptr)
++        ACCUMULATE_Z22(z5,z2)
++        ACCUMULATE_Z23(z5,z3)
++        LOAD_Z10(p0,rhs_ptr)
++        ACCUMULATE_Z24(z6,z0)
++        ACCUMULATE_Z25(z6,z1)
++        LOAD_Z11(p0,rhs_ptr)
++        ACCUMULATE_Z26(z6,z2)
++        MOVE_RHS_PTR(rhs_ptr)
++        "prfw pldl1keep, p0, [%[rhs_ptr], #4, MUL VL]\n"
++        ACCUMULATE_Z27(z6,z3)
++        LOAD_Z14(p0, lhs_ptr)
++        ACCUMULATE_Z28(z7,z0)
++        ACCUMULATE_Z29(z7,z1)
++        LOAD_Z15(p0,lhs_ptr)
++        ACCUMULATE_Z30(z7,z2)
++        MOVE_LHS_PTR(lhs_ptr)
++        "prfw pldl1keep, p0, [%[lhs_ptr], #4, MUL VL]\n"
++        ACCUMULATE_Z31(z7,z3)
++
++        LOAD_Z4(p0, lhs_ptr)
++        ACCUMULATE_Z16(z12,z8)
++        ACCUMULATE_Z17(z12,z9)
++        LOAD_Z5(p0, lhs_ptr)
++        ACCUMULATE_Z18(z12,z10)
++        ACCUMULATE_Z19(z12,z11)
++        LOAD_Z6(p0, lhs_ptr)
++        ACCUMULATE_Z20(z13,z8)
++        ACCUMULATE_Z21(z13,z9)
++        LOAD_Z0(p0, rhs_ptr)
++        "sub %[run_k_depth], %[run_k_depth], %[run_2sv_len]\n"
++        ACCUMULATE_Z22(z13,z10)
++        ACCUMULATE_Z23(z13,z11)
++        LOAD_Z1(p0, rhs_ptr)
++        ACCUMULATE_Z24(z14,z8)
++        ACCUMULATE_Z25(z14,z9)
++        LOAD_Z2(p0,rhs_ptr)
++        ACCUMULATE_Z26(z14,z10)
++        ACCUMULATE_Z27(z14,z11)
++        LOAD_Z3(p0, rhs_ptr)
++        ACCUMULATE_Z28(z15,z8)
++        MOVE_RHS_PTR(rhs_ptr)
++        "prfw pldl1keep, p0, [%[rhs_ptr], #4, MUL VL]\n"
++        ACCUMULATE_Z29(z15,z9)
++        LOAD_Z7(p0, lhs_ptr)
++        "cmp %[run_k_depth], %[run_2sv_len]\n"
++        ACCUMULATE_Z30(z15, z10)
++        MOVE_LHS_PTR(lhs_ptr)
++        "prfw pldl1keep, p0, [%[lhs_ptr], #4, MUL VL]\n"
++        ACCUMULATE_Z31(z15,z11)
++    "bge 3b\n"
++
++    "cmp %[run_k_depth], #0\n"
++    "ble 1f\n"
++
++    "2:\n"
++        "subs %[run_k_depth], %[run_k_depth], %[run_sv_len]\n"
++        ACCUMULATE_Z16(z4,z0)
++        ACCUMULATE_Z17(z4,z1)
++        ACCUMULATE_Z18(z4,z2)
++        ACCUMULATE_Z19(z4,z3)
++        LOAD_Z4(p0,lhs_ptr)
++        ACCUMULATE_Z20(z5,z0)
++        ACCUMULATE_Z21(z5,z1)
++        ACCUMULATE_Z22(z5,z2)
++        ACCUMULATE_Z23(z5,z3)
++        LOAD_Z5(p0,lhs_ptr)
++        ACCUMULATE_Z24(z6,z0)
++        ACCUMULATE_Z25(z6,z1)
++        ACCUMULATE_Z26(z6,z2)
++        ACCUMULATE_Z27(z6,z3)
++        LOAD_Z6(p0,lhs_ptr)
++        ACCUMULATE_Z28(z7,z0)
++        LOAD_Z0(p0,rhs_ptr)
++        ACCUMULATE_Z29(z7,z1)
++        LOAD_Z1(p0,rhs_ptr)
++        ACCUMULATE_Z30(z7,z2)
++        LOAD_Z2(p0,rhs_ptr)
++        ACCUMULATE_Z31(z7,z3)
++        LOAD_Z3(p0,rhs_ptr)
++        MOVE_RHS_PTR(rhs_ptr)
++        LOAD_Z7(p0,lhs_ptr)
++        MOVE_LHS_PTR(lhs_ptr)
++    "bgt 2b\n"
++
++    "1:\n"
++    ACCUMULATE_Z16(z4,z0)
++    ACCUMULATE_Z17(z4,z1)
++    ACCUMULATE_Z18(z4,z2)
++    ACCUMULATE_Z19(z4,z3)
++    ACCUMULATE_Z20(z5,z0)
++    ACCUMULATE_Z21(z5,z1)
++    ACCUMULATE_Z22(z5,z2)
++    ACCUMULATE_Z23(z5,z3)
++    ACCUMULATE_Z24(z6,z0)
++    ACCUMULATE_Z25(z6,z1)
++    ACCUMULATE_Z26(z6,z2)
++    ACCUMULATE_Z27(z6,z3)
++    ACCUMULATE_Z28(z7,z0)
++    ACCUMULATE_Z29(z7,z1)
++    ACCUMULATE_Z30(z7,z2)
++    ACCUMULATE_Z31(z7,z3)
++
++#if (N_SIZE > 0)
++#if (M_SIZE > 0)
++    PROCESS_ACCUM(0, 16, x16, dst_ptr, p0)
++#endif
++#if (M_SIZE > 1)
++    PROCESS_ACCUM(4, 20, x17, dst_ptr, p0)
++#endif
++#if (M_SIZE > 2)
++    PROCESS_ACCUM(8, 24, x18, dst_ptr, p0)
++#endif
++#if (M_SIZE > 3)
++    PROCESS_ACCUM(12, 28, x17, dst_ptr, p0)
++#endif
++#endif
++    "add %[dst_ptr], %[dst_ptr], %[ldc]\n"
++
++#if (N_SIZE > 1)
++#if (M_SIZE > 0)
++    PROCESS_ACCUM(1, 17, x16, dst_ptr, p0)
++#endif
++#if (M_SIZE > 1)
++    PROCESS_ACCUM(5, 21, x17,dst_ptr,p0)
++#endif
++#if (M_SIZE > 2)
++    PROCESS_ACCUM(9, 25, x18, dst_ptr, p0)
++#endif
++#if (M_SIZE > 3)
++    PROCESS_ACCUM(13, 29, x17, dst_ptr, p0)
++#endif
++#endif
++    "add %[dst_ptr], %[dst_ptr], %[ldc]\n"
++
++
++#if (N_SIZE > 2)
++#if (M_SIZE > 0)
++        PROCESS_ACCUM(2, 18, x16, dst_ptr, p0)
++#endif
++#if (M_SIZE > 1)
++    PROCESS_ACCUM(6, 22, x17,dst_ptr,p0)
++#endif
++#if (M_SIZE > 2)
++    PROCESS_ACCUM(10,26,x18,dst_ptr,p0)
++#endif
++#if (M_SIZE > 3)
++    PROCESS_ACCUM(14,30,x17,dst_ptr,p0)
++#endif
++#endif
++    "add %[dst_ptr], %[dst_ptr], %[ldc]\n"
++
++
++#if (N_SIZE > 3)
++#if (M_SIZE > 0)
++        PROCESS_ACCUM(3, 19, x16, dst_ptr, p0)
++#endif
++#if (M_SIZE > 1)
++    PROCESS_ACCUM(7, 23, x17,dst_ptr,p0)
++#endif
++#if (M_SIZE > 2)
++    PROCESS_ACCUM(11,27,x18,dst_ptr,p0)
++#endif
++#if (M_SIZE > 3)
++    PROCESS_ACCUM(15,31,x17,dst_ptr,p0)
++#endif
++#endif
++
++    :
++    [lhs_ptr] "+r"(lhs_ptr), [rhs_ptr] "+r"(rhs_ptr),
++    [run_k_depth] "+r"(run_k_depth),
++    [dst_ptr] "+wr"(dst_ptr)
++    :
++    [run_sv_len] "r"(run_sv_len), [run_2sv_len] "r"(run_2sv_len),
++    [move_lhs] "r"(move_lhs), [move_rhs] "r"(move_rhs), [ldc] "r"(ldc),
++    [accum_ptr] "r"(accum_ptr)
++    :
++    "cc", "memory",
++    "w0","w1","w2","w3","w4","w5","w6","w7",
++    "w8","w9","w10","w11","w12","w13","w14","w15",    
++    "x16","x17","x18","x19",
++    "z0","z1","z2","z3","z4","z5","z6","z7",
++    "z8","z9","z10","z11","z12","z13","z14","z15",
++    "z16","z17","z18","z19","z20","z21","z22","z23",
++    "z24","z25","z26","z27","z28","z29","z30","z31"
++  );
++
++}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_kernels.h b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_kernels.h
+new file mode 100644
+index 0000000..8bb3727
+--- /dev/null
++++ b/kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/prefillgemm_int4/integer_gemm_kernels.h
+@@ -0,0 +1,468 @@
++#ifndef __GEMM_INTFOUR_KERNELS_H__
++#define __GEMM_INTFOUR_KERNELS_H__
++
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include <stddef.h>
++
++typedef int8_t BLASINT8;
++typedef uint8_t BLASUINT8;
++
++typedef struct {
++  void (*small_kernel)(const size_t, const size_t, const size_t, const float, const void*, const size_t, const BLASINT8,
++                       const void*, const size_t, const BLASINT8, const float, int32_t*, const size_t, const int32_t*);
++  void (**gemm_kernels)(const void*, const void*, int32_t*, size_t, int64_t, int64_t);
++  void (*pack_a_fun)(void*, const void*, size_t, size_t, size_t, const BLASINT8);
++  void (*pack_b_fun)(void*, const void*, size_t, size_t, size_t, const BLASINT8);
++  void (*beta_func)(int32_t*, const int32_t*, float, size_t, size_t, size_t);
++  void (*post_ops_func)(float, const int32_t*, int32_t*, size_t, size_t, size_t);
++  size_t (*a_indexing)(size_t, size_t, size_t);
++  size_t (*b_indexing)(size_t, size_t, size_t);
++  size_t (*move_oc)(size_t, size_t);
++
++} int_gemm_funcs;
++
++#ifndef COMP_SV_LEN
++#error "COMP_SV_LEN is not defined"
++#endif
++
++#define KERNEL_M_STEP 4
++#define KERNEL_N_STEP 4
++#define KERNEL_K_STEP COMP_SV_LEN
++
++#define M_BLOCK 256
++#if ((M_BLOCK % KERNEL_M_STEP) != 0)
++#error "M_BLOCK % KERNEL_M_STEP != 0"
++#endif
++#define N_BLOCK 256
++#if ((N_BLOCK % KERNEL_N_STEP) != 0)
++#error "N_BLOCK % KERNEL_N_STEP != 0"
++#endif
++#define K_BLOCK 512
++#if ((K_BLOCK % KERNEL_K_STEP) != 0)
++#error "K_BLOCK % KERNEL_K_STEP != 0"
++#endif
++
++#define ALIGNMENT 4096
++
++#define EXTERNAL_API __attribute__((visibility("default")))
++#define UNUSED(arg) ((void)(arg))
++
++// general pipeline
++void gemm_impl_8bit(int_gemm_funcs* arg, size_t m, size_t n, size_t k, float alpha, const void* a, size_t lda,
++                    const BLASINT8 oa, const void* b, size_t ldb, const BLASINT8 ob, float beta, int32_t* c, size_t ldc,
++                    const int32_t* oc, size_t small_switch);
++// s8 kernel
++void pack_b_s8_n(void* bufferB, const void* curr_b_ptr, size_t n_block_size, size_t k_block_size, size_t ldb,
++                 const BLASINT8 ob);
++
++void pack_a_s8_n(void* bufferA, const void* curr_a_ptr, size_t m_block_size, size_t k_block_size, size_t lda,
++                 const BLASINT8 oa);
++
++void pack_b_s8_t(void* bufferB, const void* curr_b_ptr, size_t n_block_size, size_t k_block_size, size_t ldb,
++                 const BLASINT8 ob);
++
++void pack_a_s8_t(void* bufferA, const void* curr_a_ptr, size_t m_block_size, size_t k_block_size, size_t lda,
++                 const BLASINT8 oa);
++
++// u8 kernels
++void pack_b_u8_n(void* bufferB, const void* curr_b_ptr, size_t n_block_size, size_t k_block_size, size_t ldb,
++                 const BLASINT8 ob);
++
++void pack_a_u8_n(void* bufferA, const void* curr_a_ptr, size_t m_block_size, size_t k_block_size, size_t lda,
++                 const BLASINT8 oa);
++
++void pack_b_u8_t(void* bufferB, const void* curr_b_ptr, size_t n_block_size, size_t k_block_size, size_t ldb,
++                 const BLASINT8 ob);
++
++void pack_a_u8_t(void* bufferA, const void* curr_a_ptr, size_t m_block_size, size_t k_block_size, size_t lda,
++                 const BLASINT8 oa);
++
++// beta kernels
++void beta_cf_s8(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc);
++void beta_cc_s8(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc);
++void beta_cr_s8(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc);
++void beta_rf_s8(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc);
++void beta_rc_s8(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc);
++void beta_rr_s8(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size, size_t ldc);
++
++void beta_cf_s8_opt(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size,
++                    size_t ldc);
++void beta_cc_s8_opt(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size,
++                    size_t ldc);
++void beta_cr_s8_opt(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size,
++                    size_t ldc);
++void beta_rf_s8_opt(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size,
++                    size_t ldc);
++void beta_rc_s8_opt(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size,
++                    size_t ldc);
++void beta_rr_s8_opt(int32_t* c_ptr, const int32_t* oc, float beta, size_t m_block_size, size_t n_block_size,
++                    size_t ldc);
++
++// post-ops kernels
++void post_ops(float alpha, const int32_t* bufferC, int32_t* current_c_ptr, size_t m, size_t n_block, size_t ldc);
++void post_ops_opt(float alpha, const int32_t* bufferC, int32_t* current_c_ptr, size_t m, size_t n_block, size_t ldc);
++
++// drivers
++void gemm_driver(int_gemm_funcs* arg, size_t m, size_t n, size_t k, float alpha, const void* a, size_t lda,
++                 const BLASINT8 oa, const void* b, size_t ldb, const BLASINT8 ob, float beta, int32_t* c, size_t ldc,
++                 const int32_t* oc);
++void gemm_driver_opt(int_gemm_funcs* arg, size_t m, size_t n, size_t k, float alpha, const void* a, size_t lda,
++                     const BLASINT8 oa, const void* b, size_t ldb, const BLASINT8 ob, float beta, int32_t* c,
++                     size_t ldc, const int32_t* oc);
++
++// matrix multiplication kernels
++
++// s8s8s32 kernels
++void gemm_kernel_s8s8s32_4x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_4x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_4x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_4x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_s8s8s32_3x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_3x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_3x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_3x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_s8s8s32_2x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_2x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_2x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_2x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_s8s8s32_1x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_1x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_1x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8s8s32_1x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++// u8u8s32 kernels
++
++void gemm_kernel_u8u8s32_4x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_4x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_4x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_4x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_u8u8s32_3x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_3x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_3x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_3x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_u8u8s32_2x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_2x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_2x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_2x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_u8u8s32_1x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_1x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_1x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8u8s32_1x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++// s8u8s32 kernels
++void gemm_kernel_s8u8s32_4x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_4x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_4x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_4x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_s8u8s32_3x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_3x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_3x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_3x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_s8u8s32_2x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_2x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_2x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_2x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_s8u8s32_1x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_1x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_1x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_s8u8s32_1x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++// u8s8s32 kernels
++void gemm_kernel_u8s8s32_4x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_4x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_4x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_4x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_u8s8s32_3x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_3x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_3x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_3x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_u8s8s32_2x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_2x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_2x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_2x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++void gemm_kernel_u8s8s32_1x4(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_1x3(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_1x2(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++void gemm_kernel_u8s8s32_1x1(const void* lhs_ptr, const void* rhs_ptr, int32_t* accum_ptr, size_t ldc, int64_t k_depth,
++                             int64_t sv_len);
++
++// small kernels
++// s8s8s32 kernels
++void small_kernel_s8s8s32_nn_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_nt_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_tn_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_tt_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_nn_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_nt_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_tn_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_tt_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_nn_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_nt_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_tn_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8s8s32_tt_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++// s8u8s32 kernels
++
++void small_kernel_s8u8s32_nn_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_nt_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_tn_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_tt_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_nn_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_nt_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_tn_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_tt_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_nn_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_nt_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_tn_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_s8u8s32_tt_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++// u8s8s32 kernels
++void small_kernel_u8s8s32_nn_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_nt_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_tn_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_tt_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_nn_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_nt_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_tn_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_tt_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_nn_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_nt_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_tn_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8s8s32_tt_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++// u8u8s32 kernels
++void small_kernel_u8u8s32_nn_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_nt_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_tn_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_tt_f(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_nn_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_nt_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_tn_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_tt_c(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_nn_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_nt_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_tn_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++void small_kernel_u8u8s32_tt_r(const size_t m, const size_t n, const size_t k, const float alpha, const void* a,
++                               const size_t lda, const BLASINT8 oa, const void* b, const size_t ldb, const BLASINT8 ob,
++                               const float beta, int32_t* c, const size_t ldc, const int32_t* oc);
++
++#ifdef __cplusplus
++}
++#endif
++#endif

@@ -354,6 +354,10 @@ export PYTHONPATH="$PWD/third_party/sglang/python:$PWD/kt-kernel"
 切对 sglang 后,模型**完整加载成功**(~9 min,46 个 shard + 43 层 GGUF),但在最后的
 NPU graph 捕获阶段崩:
 
+> 注(后续):此处 ~9 min 为加载加速前的耗时。P0+P1(zero-copy + 并行重排)后,43 层 MoE
+> GGUF 加载从 ~7.9 min 降到 ~47s,整体加载段降到 ~100s。详见
+> `dsv4_single_npu/DeepSeek-V4-Flash_CPU权重加载加速_P0-P1.md`。
+
 ```
 init_device_graphs → npu_graph_runner → cuda_graph_runner.py:680
 Exception: Capture cuda graph failed: aclrtMemcpy, error code is 107030
@@ -463,5 +467,5 @@ cd /workspace/code/ktransformers-AK
 MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
 NPU_DEVICE_ID=0 KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" \
 bash tools/p27_launch_ds4flash_npu.sh
-# 等 ~9 min 加载 → curl http://127.0.0.1:8000/health → 200
+# 等 ~100s 加载(P0+P1 加载加速前为 ~9 min)→ curl http://127.0.0.1:8000/health → 200
 ```

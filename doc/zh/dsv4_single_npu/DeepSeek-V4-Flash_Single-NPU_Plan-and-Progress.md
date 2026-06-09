@@ -104,7 +104,8 @@ input → [NPU: embedding / RoPE / MLA+NSA+Indexer attention]
 
 ### 2.2 CPU 端(kt-kernel)
 - backend:LLAMAFILE(`kt-kernel/operators/llamafile/moe.hpp` → `LLAMA_MOE_TP`)。
-- 8 个 NUMA worker pool(每 NUMA 24 线程),NEON SDOT 内核。
+- 8 个 NUMA worker pool(每 NUMA 24 **核**;默认 `--kt-cpuinfer 24 --kt-threadpool-count 8` →
+  `24/8 = 3` 线程/subpool,即每 NUMA 3 线程),NEON SDOT 内核。
 - Expert layout(经 Z.2 修复后):
   - **gate/up**:`(E=256, intermediate=2048, hidden=4096)`,沿 hidden 分 Q8_0 block;
   - **down**:`(E=256, hidden=4096, intermediate=2048)`,沿 intermediate 分 block。
@@ -205,7 +206,7 @@ bash tools/p27_launch_ds4flash_npu.sh
 --dtype bfloat16 --kt-method LLAMAFILE --kt-num-gpu-experts 32 --kt-weight-path .../dsv4_layer{layer_idx}.gguf
 --kt-threadpool-count 8 --kt-cpuinfer 24 --chunked-prefill-size 2048`(**勿传 -1**,见坑⑨)。
 
-### 4.5 验证(等 ~9 min 加载)
+### 4.5 验证(等 ~100s 加载;P0+P1 加载加速前为 ~9 min)
 
 ```bash
 curl -sf http://127.0.0.1:8000/health        # 200
@@ -349,8 +350,8 @@ KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=<空闲卡> bash tools/p27_launch_ds4flash_
 | Graph capture 时间(实测 06-08) | 6.79 s(bs=1,真实权重);dummy 9.89 s |
 | Decode 吞吐 — graph(实测 06-08) | **3.46–3.89 tok/s**(`npu graph: True`) |
 | Decode 吞吐 — eager | ~1.6 tok/s |
-| 模型加载(真实权重) | Load weight 477 s(GGUF 单线程 TP 切分 + 多 GB I/O);dbg 用 `KT_DUMMY_CPU_WEIGHTS` 绕过(§6.5) |
-| HBM 占用(N=32) | ~16 GB expert + attention + KV;capture +1.08 GB |
+| 模型加载 | **~100s**(43 层 MoE GGUF ~47s〔P0+P1 加速〕+ 46 shard/建模 ~54s);旧 ~9 min,见 `DeepSeek-V4-Flash_CPU权重加载加速_P0-P1.md` |
+| HBM 占用(N=32) | ~16 GB expert + attention + KV |
 | DRAM 占用 | ~275 GB(Q8_0)/ ~555 GB(BF16) |
 
 ---

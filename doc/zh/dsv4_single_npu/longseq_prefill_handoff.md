@@ -7,6 +7,31 @@
 
 ---
 
+## 启动提示词(开新 session 时整段贴)
+
+> 你接手 **DeepSeek-V4-Flash 单卡 NPU 的"长序列(序列长度超过定义 context 长度)优化"**,两个子目标:
+> (1) **prefill 逐层流式加载权重**——长序列 prefill 计算密集(M=batch≫1,不像 decode 的 M=1 纯带宽瓶颈)→
+> 逐层流式加载专家权重、用计算掩盖加载延迟,(a) 加速长 prefill、(b) 不必全部 ~275GB 常驻、给超长 context 腾内存;
+> (2) **热专家预加载/不 evict**——用 prefill 命中保留热专家给 decode。
+>
+> **本文(这份 handoff)就是你的完整起点,从 §0 往下读。**
+>
+> 工作区:`/workspace/code/kt-C-longseq`(分支 `longseq-prefill`,独立 sglang 分支 `longseq-sglang`,
+> kt-kernel 有 llama.cpp+llamafile 可重编 + 基线 `.so`)。启动脚本自动用本 worktree 的 sglang+kt-kernel,
+> **不用 export PYTHONPATH;端口 8013**。
+>
+> ⚡ **开工第一步(别跳)**:验证子目标 1 前提——测长序列 prefill 的 CPU MoE 是不是计算密集(§3)。
+> 是 → 做流式;仍是带宽瓶颈 → 回报换思路。
+>
+> 边界:热专家标定已被 B 放弃 → **子目标 2 现在 C 独占**;B 现做 NPU/CPU 并行+MTP,会动 submit/sync/overlap
+> 编排,合并时对齐(§2)。**实时 expert cache/evict 留作后续单独 session**——C 只把 load/evict 原语 +
+> residency 钩子留干净、策略做简单版(§8)。
+>
+> 纪律:快参考/前提先实测验证(输出非零)再信;只杀自己 PID/端口、**绝不广播 `pkill -f sglang.launch_server`**;
+> 拉服务前 `npu-smi info` 选空卡 + 查端口;改 C++ 重编只动自己 worktree 的 `.so`(§6 纪律)。
+
+---
+
 ## 0. 任务(两个子目标)
 
 1. **prefill 逐层流式加载权重**:长序列 prefill 是**计算密集**(M=batch≫1 的 GEMM,不像 decode 的 M=1

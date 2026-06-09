@@ -81,6 +81,13 @@ if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
 fi
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
+# CPU MoE is memory-bandwidth-bound; the old default 24 used only 24/192 cores
+# (3/NUMA) -> ~4% of DDR bandwidth. Default is now 96 (12/NUMA), validated to give
+# real-weight decode 3.6 -> 6.12 tok/s (~1.7x), CPU MoE 215 -> 115ms/token, F2
+# coherent (accuracy preserved). 96 leaves 8 cores/NUMA headroom for NPU host
+# threads; >=128 thrashes/collapses under real load. Override with KT_CPUINFER.
+# (profiling: doc/zh/dsv4_single_npu/graph_decode_profiling_report.md, 2026-06-09)
+KT_CPUINFER="${KT_CPUINFER:-96}"
 PORT="${PORT:-8000}"
 ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 export ASCEND_TOOLKIT_HOME
@@ -171,7 +178,7 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --kt-num-gpu-experts 32 \
   --kt-weight-path "$KT_GGUF_TEMPLATE" \
   --kt-threadpool-count 8 \
-  --kt-cpuinfer 24 \
+  --kt-cpuinfer "$KT_CPUINFER" \
   --max-running-requests 1 \
   --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \
   --host 0.0.0.0 \

@@ -14,8 +14,53 @@ from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 import os
 import ctypes
+import time
 
 from kt_kernel import kt_kernel_ext
+
+
+# -----------------------------------------------------------------------------
+# Lens-1 decode profiling (env-gated, zero cost when off).
+#
+# `KT_DECODE_TIMING=1` times the CPU MoE submit->sync wall inside the NPU-graph
+# host callback (`run_pinned_forward_sync`), accumulates per layer, and prints a
+# per-decode-token total. Compare the per-token total against the server's
+# `gen throughput` (token wall = 1/throughput) to get the CPU-MoE fraction of
+# decode latency. Token boundary is detected by the layer_idx wrapping back.
+# -----------------------------------------------------------------------------
+_KT_DECODE_TIMING = os.environ.get("KT_DECODE_TIMING", "") == "1"
+_kt_dt_state = {
+    "cur_ns": 0,         # current token: total submit->sync wall
+    "cur_sync_ns": 0,    # current token: sync() blocking wall
+    "cur_cpu_ns": 0,     # current token: on-CPU thread time (this thread)
+    "cur_layers": 0,
+    "last_layer": -1,
+    "tokens": 0,
+}
+
+
+def _kt_decode_timing_record(layer_idx: int, wall_ns: int, sync_ns: int, cpu_ns: int) -> None:
+    st = _kt_dt_state
+    # New token when layer index wraps back (current <= previous).
+    if st["cur_layers"] > 0 and layer_idx <= st["last_layer"]:
+        st["tokens"] += 1
+        w = st["cur_ns"] / 1e6
+        sy = st["cur_sync_ns"] / 1e6
+        cpu = st["cur_cpu_ns"] / 1e6
+        print(
+            f"[KT_DECODE_TIMING] tok#{st['tokens']} cpu_moe_wall={w:.1f}ms "
+            f"(sync={sy:.1f}ms on_cpu={cpu:.1f}ms off_cpu={w-cpu:.1f}ms) layers={st['cur_layers']}",
+            flush=True,
+        )
+        st["cur_ns"] = 0
+        st["cur_sync_ns"] = 0
+        st["cur_cpu_ns"] = 0
+        st["cur_layers"] = 0
+    st["cur_ns"] += wall_ns
+    st["cur_sync_ns"] += sync_ns
+    st["cur_cpu_ns"] += cpu_ns
+    st["cur_layers"] += 1
+    st["last_layer"] = layer_idx
 
 
 # -----------------------------------------------------------------------------
@@ -613,6 +658,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
 
         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        if _KT_DECODE_TIMING:
+            _kt_t0 = time.perf_counter_ns()
+            _kt_c0 = time.thread_time_ns()
         immediate_task = self.moe.forward_task(
             bsz_slot_tensor.data_ptr(),
             immediate_experts_ids_cpu[current_slot].size(-1),
@@ -641,7 +689,18 @@ class BaseMoEWrapper(_MoEBase, ABC):
             self.cpu_infer.submit(deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
-        self.cpu_infer.sync(allow_pending)
+        if _KT_DECODE_TIMING:
+            _kt_presync = time.perf_counter_ns()
+            self.cpu_infer.sync(allow_pending)
+            _kt_t1 = time.perf_counter_ns()
+            _kt_decode_timing_record(
+                self.layer_idx,
+                _kt_t1 - _kt_t0,                       # total submit->sync wall
+                _kt_t1 - _kt_presync,                  # sync() blocking wall
+                time.thread_time_ns() - _kt_c0,        # on-CPU thread time
+            )
+        else:
+            self.cpu_infer.sync(allow_pending)
 
     def submit_forward(
         self,

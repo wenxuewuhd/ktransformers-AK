@@ -351,6 +351,14 @@ export PYTHONPATH="$PWD/third_party/sglang/python:$PWD/kt-kernel"
 
 ### 坑 ⑥:NPU graph 捕获崩 `aclrtMemcpy 107030`(capture 不允许同步 memcpy)
 
+> **✅ 已修复(2026-06-08)** —— graph 路径已闭合,现在**默认 graph-on 即可端到端跑通**,decode
+> `npu graph: True` ~3.5–3.9 tok/s(取代下文 eager ~1.6 回退)。真因是**两层**(都不在当时的嫌疑栈里):
+> ① `kt_ep_wrapper.py::mask_cpu_expert_routing` 里 `gpu_experts_mask.to(device)` 在 capture 期做同步 H2D;
+> ② 该函数被 `@torch.compile`→NPU torchair 编成绑定 stream 的独立子图,与外层图跨 stream 冲突
+> (`Unsupport run graph with different stream`)。详细根因/改动/实测见
+> [Plan-and-Progress §6.3](DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md)。**下文保留当时的崩溃实录与
+> eager 回退**作历史;最新「可用启动命令」见本文 §4.2(已改 graph-on)。
+
 切对 sglang 后,模型**完整加载成功**(~9 min,46 个 shard + 43 层 GGUF),但在最后的
 NPU graph 捕获阶段崩:
 
@@ -411,19 +419,37 @@ KT_FORCE_SYNC_SUBMIT=1 python3 tools/p27_cpu_moe_reference_check.py ... --gguf d
 - **graph on**:crash 在 capture 期的 `aclrtMemcpy`(坑⑥)—— 正是 KT submit 的 sync copy 撞 capture 限制;
 - **eager 默认**:async 没 flush → 全零乱码(本坑)。
 
-### 4.2 最终可用启动命令(eager + 强制同步)
+### 4.2 最终可用启动命令(graph-on,生产性能路径)
+
+> 坑⑥/⑥b 修复后(2026-06-08),**默认 graph-on 即可端到端跑通**,无需任何 `KT_FORCE_SYNC_SUBMIT`
+> / `--disable-cuda-graph`。先 `npu-smi info` 选空闲卡。
 
 ```bash
 cd /workspace/code/ktransformers-AK
 MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
-NPU_DEVICE_ID=0 \
-KT_FORCE_SYNC_SUBMIT=1 \
-EXTRA_FLAGS="--disable-cuda-graph" \
+NPU_DEVICE_ID=<空闲卡> \
+bash tools/p27_launch_ds4flash_npu.sh
+# 等加载(真实权重 GGUF 读取较慢)→ Capture npu graph end → The server is fired up
+```
+
+**eager 回退(仅对照/排障用)**:
+
+```bash
+MODEL_PATH=… NPU_DEVICE_ID=<空闲卡> \
+KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" \
 bash tools/p27_launch_ds4flash_npu.sh
 ```
 
-> graph on(生产性能路径)需让 KT 的 host-callback 异步路径在 capture 期不做同步拷贝 ——
-> 目前会崩(坑⑥),属后续优化。eager + `KT_FORCE_SYNC_SUBMIT=1` 是当前**功能正确**的可用配置。
+**dbg 期绕过 CPU MoE 慢加载(`KT_DUMMY_CPU_WEIGHTS`)**:调 graph/capture 时反复重启,真实权重
+GGUF 读取是主要时间开销。加 `KT_DUMMY_CPU_WEIGHTS=1` 会**跳过磁盘读取**、按张量元数据 fabricate
+同字节布局的零 buffer(C++ MOE/load_weights_task 路径不变,capture 与 forward 忠实执行),拉起快很多。
+
+```bash
+KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=<空闲卡> bash tools/p27_launch_ds4flash_npu.sh
+```
+> ⚠️ dummy 权重输出**无意义**,仅用于「capture / 图重放能否跑通」这类结构性调试,**严禁用于精度验收**。
+> 验收必须去掉该开关,用真实权重 + `tools/p27_curl_f2_prompts.sh` 看连贯 + `p27_cpu_moe_reference_check.py` 对账。
+> 实现见 `kt-kernel/python/utils/{loader,llamafile}.py`;细节见 [Plan-and-Progress §6.5](DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md)。
 
 ### 4.3 端到端验证(✅ 通过)
 
@@ -440,7 +466,8 @@ curl -sS http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application
 #   → "机器学习是一种让计算机通过分析大量数据中的模式来自动改进性能，而无需显式编程的方法。"  ✅
 ```
 
-**性能**:eager 模式约 **1.6 tok/s**(含 prefill;graph 基线 ~3.6 tok/s,graph 路径见坑⑥待修)。
+**性能**:graph-on(坑⑥/⑥b 修复后)decode `npu graph: True` **3.46–3.89 tok/s**(capture 6.79s);
+eager 回退约 **1.6 tok/s**。graph-on 下 F2 整网冒烟 `tools/p27_curl_f2_prompts.sh` 四 prompt 均连贯。
 
 ---
 
@@ -453,8 +480,9 @@ curl -sS http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application
 | ③ | `import kt_kernel` → `undefined symbol: iqk_mul_mat_moe_arm82` | `iqk_mul_mat_arm82.cpp` 两行 rename `#define` 被注释(WIP 未完成) | 取消注释 + 重编译 |
 | ④ | 转换 `--verify-sample` 报 `newbyteorder` removed | gguf-py NumPy 2.0 不兼容 | `git apply tools/kt_dsv4_npu_patches/llama_cpp/0001-*.patch` |
 | ⑤ | 启动崩 `quant fp8 != compressed-tensors` / `n_activated_experts` | **`third_party/sglang` 子模块切错 fork**(`kvcache-ai@c9edb75e0`,无 KT 补丁) | 切到 `dsv4_release@a347a9ad5`(从 `/workspace/code/tmp/sglang` fetch) |
-| ⑥ | graph 捕获崩 `aclrtMemcpy 107030` | KT 同步拷贝撞 NPU graph capture 限制 | 暂用 `EXTRA_FLAGS=--disable-cuda-graph`(eager);graph 路径待修 |
-| ⑦ | 服务出 token 但乱码(重复) | CPU MoE async submit 没 flush → 输出全零 | `KT_FORCE_SYNC_SUBMIT=1` |
+| ⑥ | graph 捕获崩 `aclrtMemcpy 107030` | `mask_cpu_expert_routing` 内 `gpu_experts_mask.to(device)` 在 capture 期做同步 H2D | **✅ 已修(06-08)**:`process_weights_after_loading` 内 capture 前把 mask 预搬 device(§4.2 graph-on) |
+| ⑥b | graph 重放崩 `Unsupport run graph with different stream` | `mask_cpu_expert_routing` 被 `@torch.compile`→torchair 绑定 stream 子图,跨 stream 冲突 | **✅ 已修(06-08)**:去掉该函数 `@torch.compile` 改 eager |
+| ⑦ | 服务出 token 但乱码(重复,仅 eager 路径) | CPU MoE async submit 没 flush → 输出全零 | eager 下 `KT_FORCE_SYNC_SUBMIT=1`;graph-on 走 host-callback 不涉此坑 |
 
 > 环境约束:Kunpeng 920(aarch64,无 SVE/i8mm)+ Atlas 910B,CANN 8.5.0,Python 3.11.14。
 > Handoff 旧文档关于「Q8_0 NaN / MOE_INT8 不可用」的结论**已过时**:实测 Q8_0(int8)CPU offload
@@ -464,8 +492,13 @@ curl -sS http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application
 
 ```bash
 cd /workspace/code/ktransformers-AK
+# graph-on(生产路径,坑⑥/⑥b 已修)：先 npu-smi info 选空闲卡
 MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
-NPU_DEVICE_ID=0 KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" \
+NPU_DEVICE_ID=<空闲卡> \
 bash tools/p27_launch_ds4flash_npu.sh
-# 等 ~100s 加载(P0+P1 加载加速前为 ~9 min)→ curl http://127.0.0.1:8000/health → 200
+# 等加载 → Capture npu graph end → The server is fired up → curl http://127.0.0.1:8000/health → 200
+# decode npu graph: True ~3.5–3.9 tok/s；F2 冒烟 bash tools/p27_curl_f2_prompts.sh
+
+# 备：eager 回退  NPU_DEVICE_ID=<卡> KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" bash tools/p27_launch_ds4flash_npu.sh
+# 备：dbg 跳过慢加载  KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=<卡> bash tools/p27_launch_ds4flash_npu.sh  （输出无意义，仅调图）
 ```

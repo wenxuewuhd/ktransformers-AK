@@ -200,6 +200,9 @@ bash tools/p27_launch_ds4flash_npu.sh
 MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
 NPU_DEVICE_ID=0 KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" \
 bash tools/p27_launch_ds4flash_npu.sh
+
+# (C) dbg:graph-on + 跳过 CPU MoE 慢加载(输出无意义,仅调 capture/图重放,见 §6.5)
+KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=0 bash tools/p27_launch_ds4flash_npu.sh
 ```
 
 关键 launch 参数:`--device npu --tp 1 --attention-backend ascend --quantization compressed-tensors

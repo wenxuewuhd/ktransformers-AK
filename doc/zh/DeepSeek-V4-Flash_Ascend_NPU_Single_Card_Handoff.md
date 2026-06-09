@@ -30,13 +30,21 @@
 
 **目标**：让 DeepSeek-V4-Flash（671B MoE，256 routed experts/层）在**单卡 Atlas 910B (64 GB HBM) + 鲲鹏 920 (1.5 TB DRAM, 192 cores, 8 NUMA)** 上跑起来，方式是把约 16/256 个"热"expert 留 NPU，剩 240/256 走 CPU 端 `kt-kernel`（llamafile GGUF Q8_0 backend, NEON SDOT）。
 
-**当前进度**（2026-05-19，以 git 为准）：
+> **⚡ 最新状态(2026-06-09,以总纲 + git 为准;下面 2026-05-19 段为历史存档)**:
+> - **Q8_0(int8)CPU offload 已是生产路径**(~275 GiB),离线对账 cosine 0.9999——**取代了下面"Q8_0 进行中 / BF16 生产"的旧结论**(Z.5/Z.12 的 NaN 已修:无 i8mm 时回退 `ggml_vec_dot_q8_0_q8_0`)。
+> - **NPU graph 已闭合**(2026-06-08):真实权重 graph-on 全程跑通(总纲 §6.3)。
+> - **decode 已提速**:`--kt-cpuinfer` 默认 24→**128**(CPU MoE 是内存带宽瓶颈,原默认只用 24/192 核)+ MoE GEMV prefetch → 真实权重 decode **~3.6 → ~9.5 tok/s**,精度无损(总纲 §6.6 + `dsv4_single_npu/graph_decode_bandwidth_findings.md`)。
+> - **CPU 权重加载提速**:P0 zero-copy + P1 并行重排 → 启动 MoE 加载 ~7.9min → ~47s(`dsv4_single_npu/DeepSeek-V4-Flash_CPU权重加载加速_P0-P1.md`)。
+> - 默认 expert 划分:**32 NPU / 224 CPU**(下面 §0 "16/256" 是早期设想值)。
+
+**当前进度**（2026-05-19，历史存档，部分已被上面取代）：
 - ✅ Phase 0 / 1 / 2（F1–F3）：BF16 GGUF 43 层、N=0 与 N=32 hybrid e2e、layout + `chunked_prefill_size` 等见附录 Z。
 - ✅ **任务 2（NPU Graph + KT CPU MoE）**：ACL callback worker + `kt_ep_wrapper` host callback；launch **默认开启** cuda-graph；卡 2 上 Graph capture ~7–11s、F2 四 prompt 通过（N=0 / N=32）。详 **附录 Z.14**。
-- ⏳ **任务 3（Q8_0）进行中**：aarch64 `tinyBLAS_Q0_ARM` 仍 NaN；BF16 为 regression 基线。详 Z.5 / Z.12。
-- ⏳ **后续**：mxfp4 原生权重、Graph 性能调参（`TASK_QUEUE_ENABLE`、多 `cuda_graph_bs`）、EPLB 动态 mask 等。详 Z.12。
+- ~~⏳ 任务 3（Q8_0）进行中：tinyBLAS_Q0_ARM NaN；BF16 为基线~~ → **已完成**(见上,Q8_0 生产)。
+- ⏳ **后续**:mxfp4 原生权重、热专家放置(更多专家上 NPU)、CPU MoE 带宽进一步优化(Q4 砍字节)等。
 
 **Commits（任务 2 参考）**：主仓 `29c082e`；子模块 `third_party/sglang` `db577d2e8`（`kt_ep_wrapper` graph 路径）。
+decode 提速 + 加载提速合并见主干 `dsv4_one_card_dev`(`9cfbb17` 等)。
 
 **部署前编译 kt-kernel（NPU callback 必选）**：
 
@@ -46,7 +54,7 @@ export CPUINFER_USE_ASCEND_NPU=1
 python setup.py build_ext --inplace
 ```
 
-**关键约束**：K920 无 SVE/i8mm；CPU offload 当前生产路径为 **BF16 GGUF**（~555 GiB）。Q8_0 修通后可降到 ~280 GiB。MOE_INT8/KML 在 K920 不可用。
+**关键约束**：K920 无 SVE/i8mm；CPU offload 生产路径为 **Q8_0 GGUF**（~275 GiB，已修通,见上方最新状态;BF16 ~555 GiB 仅作数值基线）。MOE_INT8/KML 在 K920 不可用。CPU MoE 是 DDR 内存带宽瓶颈,`--kt-cpuinfer` 默认 128。
 
 ---
 

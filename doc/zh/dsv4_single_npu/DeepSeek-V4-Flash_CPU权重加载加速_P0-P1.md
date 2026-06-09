@@ -82,7 +82,14 @@ sglang KTEPWrapperMethod.process_weights_after_loading
 - 开关：`KT_PARALLEL_LOAD`（默认并行；`=0` 回退串行循环，A/B + 安全兜底）。
 
 **效果**：load `~1.6s → ~1.04s/层`（串行 `KT_PARALLEL_LOAD=0` 实测 43 层累计 89s ÷ 并行 47s ≈ **1.9×**）。
-受单 NUMA 内存带宽/线程数限制（`kt-cpuinfer=24` 分到 8 个 subpool ≈ 每 NUMA 3 线程），故为 ~2× 量级而非线性。
+受单 NUMA 内存带宽/线程数限制（当时 `kt-cpuinfer=24` 分到 8 个 subpool ≈ 每 NUMA 3 线程），故为 ~2× 量级而非线性。
+
+> **2026-06-09 更新(decode 提速 merge 的连带影响)**：`tools/p27_launch_ds4flash_npu.sh` 的
+> `--kt-cpuinfer` 默认已从 24 改为 **128**(为 decode 提速,见
+> [graph_decode_bandwidth_findings.md](graph_decode_bandwidth_findings.md))。**P1 这条并行重排同样吃
+> 这个 subpool 线程数**:默认 128 → 每 NUMA 16 线程(原 3)→ B2 重排比本文的 ~1.04s/层 还快,
+> 43 层加载段会更短(此处计时是 `cpuinfer=24` 时的存档值,未按 128 重测)。两条优化共用同一个
+> `--kt-cpuinfer` 旋钮:此处管**加载期**重排并行度,decode 文档管**推理期**带宽。
 
 ### 总体效果
 
@@ -208,11 +215,13 @@ diff a.txt b.txt && echo ">>> IDENTICAL：并行 == 串行，逐字节一致 <<<
 收尾：`KT_TIME_LOAD` 计时与 `KT_ZEROCOPY_LOAD`/`KT_PARALLEL_LOAD` 开关在加速收益拿到、精度对齐并 commit 后，
 **单独一个 commit 移除**（让 zero-copy / 并行无条件生效），保留干净演进记录。本文档即为该清理前的存档。
 
-### 环境备注（沙箱）
+### 环境备注
 
-- 本仓库 `third_party/sglang` 子模块为空、`kt-kernel/python/` 无预编 `.so`；拉起服务时需 sglang 可 import +
-  对应 `.so` 就位。
-- ⚠️ `/workspace/code/ktransformers-AK`（无 `-cpu-load-accel`）是**他人活跃工作区**（NPU 7 在跑 graph
-  profiling、有未提交改动）：**只读 import 其 sglang（配 `PYTHONDONTWRITEBYTECODE=1`），切勿对其 git
-  checkout/reset/clean、勿在其内重编/覆盖 `.so`、勿用 NPU 7**。需干净子模块编译请用 worktree / 单独 clone。
-- 每次拉起服务前先 `npu-smi info` 选空闲卡、并查端口占用（冲突则换 `PORT`）。
+> 本文最初写于 `cpu-load-accel` 沙箱;P0/P1 已合入主干 `dsv4_one_card_dev`(`bb0eafe`/`2ea90d7`,
+> 经 `c6a8aa6`/`fefc399` 合并),zero-copy/并行**无条件生效**(收尾 commit 已移除 `KT_*_LOAD` 开关与计时)。
+> 主 checkout `/workspace/code/ktransformers-AK` 的子模块/`.so` 均已就位。
+
+- 多 session 并行开发时,**各用独立 git worktree**(各自的 `.so`/分支),避免重编互相覆盖、避免动主分支;
+  共享只读 import 主仓 sglang 时配 `PYTHONDONTWRITEBYTECODE=1`。
+- 每次拉起服务前先 `npu-smi info` 选空闲卡、`ss -ltnp | grep :PORT` 查端口(冲突则换 `PORT`);
+  **只按 PID / 自己端口杀进程,绝不广播 `pkill -f sglang.launch_server`**(会杀别的 session/容器)。

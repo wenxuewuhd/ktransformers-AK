@@ -30,16 +30,16 @@
 
 ---
 
-## 2. ⚠️ 与 Session B 的边界(开工前必看)
+## 2. 与 Session B 的边界(2026-06-09 更新)
 
-B 正在做**全局频次静态把热专家放 NPU**(改 `kt-kernel/python/experts_base.py` 的
-`generate_gpu_experts_masks` / sglang `kt_ep_wrapper` 的 placement)。
-**本任务子目标 2 与 B 重叠**——都是"哪些热专家常驻 NPU",只不过 B 是**静态全局频次**,你是**prefill 动态保留**。
+B **已放弃热专家标定**,改做 **NPU↔CPU 并行计算效率提升 + MTP(多 token 预测)合入**。因此:
 
-- **别和 B 各写一套打架的放置逻辑**。子目标 2 应:**复用 B 的 `gpu_experts_mask` 接口**(B 定静态基线,
-  你在其上做长序列动态保留),或**先专注子目标 1**(与 B 正交),子目标 2 等 B 收口后再接。
-- 开工前跟协调人确认 B 的进度与接口。
-- 子目标 1(prefill 流式加载)与 B 基本正交,可独立推进。
+- ✅ **子目标 2(热专家预加载/不 evict)现在归 C 独占**,**不再和 B 冲突**——热专家/常驻这条线 C 全权。
+- ⚠️ **新的(较弱)重叠**:B 的"并行计算效率"会动 **submit/sync/overlap 编排**(`kt_ep_wrapper` /
+  `kt-kernel/python/experts_base.py` 的 `submit_forward`/`sync_forward`/host-callback/dual-stream);
+  C 子目标 1 的 **prefill CPU MoE 路径**也碰这些文件 → **合并时在这些文件上对齐**(开发期 worktree
+  隔离,无即时冲突)。B 的 **MTP** 改 decode/投机路径,与 C 基本正交(但 MTP 会改每步 token 数 → 影响
+  M 大小 → 间接影响 prefill/decode 的 compute-vs-bandwidth,留意)。
 
 ---
 
@@ -88,4 +88,21 @@ B 正在做**全局频次静态把热专家放 NPU**(改 `kt-kernel/python/exper
 
 - 父仓 Python/C++ → 主 checkout `git merge --no-ff longseq-prefill`(若动了 kt-kernel C++,合后主 checkout 重编 `.so`)。
 - sglang 改动在独立 clone 的 `longseq-sglang` 分支 → 用 patch 或推到主的 sglang 子模块分支再合。
-- 子目标 2 与 B 的放置改动**合并前先对齐**,避免两套策略打架。
+- 与 B 在 `kt_ep_wrapper`/`experts_base` 的 submit/sync/overlap 编排上**合并前对齐**(见 §2)。
+
+---
+
+## 8. 后续:实时 expert cache 刷新 / evict(建议**另开 session**,在 C 收口后)
+
+规划中的"实时 expert cache 刷新 + 驱逐机制"是本线的**延伸/收口**,它直接建立在 C 的两块基础上:
+- 子目标 1 的**流式加载** = "把某个专家调入 NPU HBM"的**原语**(以及反向的"调出/释放");
+- 子目标 2 的**命中跟踪 + 常驻策略** = 一个基础的缓存决策。
+
+**建议:C 先把基础收敛并合入主干**——即**流式 load/evict 原语 + 专家命中跟踪 + 一个简单常驻/驱逐策略 +
+干净的 residency API(钩子)**;**然后另开一个 session,在这套已合入的原语之上做完整的实时缓存策略**
+(LRU/LFU、HBM 预算管理、刷新节奏、驱逐触发条件、跨请求自适应)。理由:
+1. cache 机制**依赖 C 的原语**,C 没收口前做不干净;
+2. 全塞进 C 会让这条分支**无限膨胀、难合**;
+3. 实时缓存策略本身是**独立且丰富的设计空间**,值得专注 session。
+
+⇒ **C 阶段只需把 load/evict 原语 + residency 钩子留干净、策略做简单版即可**,把"实时刷新/驱逐策略"留给后续 session。

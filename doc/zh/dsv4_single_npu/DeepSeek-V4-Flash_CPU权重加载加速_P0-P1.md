@@ -94,6 +94,19 @@ sglang KTEPWrapperMethod.process_weights_after_loading
 
 **启动 MoE 权重加载 ~7.9 分钟 → ~47 秒，约 10×。**
 
+放到整体拉起里看（实测，sglang stderr 时间戳，单卡 910B；注意 `TP MOE layer` 走 stdout、
+sglang 日志走 stderr，合并日志里顺序会被缓冲打乱，MoE 段以 Python 端直接计时为准）：
+
+| 阶段（Load weight begin → server ready） | 旧 | 现（P0+P1） |
+|---|---|---|
+| 加载段（46 safetensors shard + 建模 + 43 层 MoE GGUF） | ~9 min | **~100s** |
+| └ 其中 43 层 MoE GGUF | ~7.9 min | **~47s** |
+| └ 其中 46 shard + 建模（未优化） | ~54s | ~54s |
+| NPU graph capture | ~5–11s | ~5s |
+
+> 即：加速后“加载段”的大头从 MoE GGUF（~474s）变成了 46 个 safetensors shard + 建模（~54s）。
+> 后者走 sglang 自己的 loader、不在本次改动范围内；若还要再压加载，下一个目标是它，而非 MoE。
+
 ---
 
 ## 4. 精度对齐：验证方案与结果

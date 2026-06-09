@@ -204,7 +204,7 @@ bash tools/p27_launch_ds4flash_npu.sh
 --dtype bfloat16 --kt-method LLAMAFILE --kt-num-gpu-experts 32 --kt-weight-path .../dsv4_layer{layer_idx}.gguf
 --kt-threadpool-count 8 --kt-cpuinfer 24 --chunked-prefill-size 2048`(**勿传 -1**,见坑⑨)。
 
-### 4.5 验证(等 ~9 min 加载)
+### 4.5 验证(等 ~100s 加载;P0+P1 加载加速前为 ~9 min)
 
 ```bash
 curl -sf http://127.0.0.1:8000/health        # 200
@@ -303,7 +303,7 @@ eager 时 async 未 flush → 全零乱码(需 `KT_FORCE_SYNC_SUBMIT=1`)。头�
 | Graph capture 时间(报告值) | 7–11 s(bs=1) |
 | Decode 吞吐 — graph(基线) | ~3.6 tok/s |
 | Decode 吞吐 — eager | ~1.6 tok/s |
-| 模型加载 | ~9 min(46 shard + 43 层 GGUF) |
+| 模型加载 | **~100s**(43 层 MoE GGUF ~47s〔P0+P1 加速〕+ 46 shard/建模 ~54s);旧 ~9 min,见 `DeepSeek-V4-Flash_CPU权重加载加速_P0-P1.md` |
 | HBM 占用(N=32) | ~16 GB expert + attention + KV |
 | DRAM 占用 | ~275 GB(Q8_0)/ ~555 GB(BF16) |
 

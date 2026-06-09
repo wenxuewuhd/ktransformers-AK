@@ -1115,7 +1115,16 @@ class GGUFLoader:
         n_bytes = n_elements * type_size // block_size
 
         data_bytes = mmap_data[offset : offset + n_bytes]
-        data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8).copy())
+        # Zero-copy: the returned tensor is only ever consumed as a *read-only source* by the
+        # C++ MoE load_weights reshuffle (llamafile/moe.hpp memcpy SOURCE), which makes the
+        # single necessary copy into its NUMA-local buffers. So view the mmap directly instead
+        # of copying every layer's ~6.85GB single-threaded into anonymous RAM. The mmap stays
+        # alive in GGUFLoader.file_data_map; the wrapper pins the tensors in
+        # self.weights_to_keep until cpu_infer.sync() returns.
+        # (np.frombuffer over the memmap slice = read-only view, no copy; torch.from_numpy
+        # shares that buffer so data.data_ptr() points into the mmap. Use from_numpy, NOT
+        # torch.frombuffer — the latter is redirected to NPU by torch_npu's transfer_to_npu.)
+        data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8))
 
         return data, ggml_type
 

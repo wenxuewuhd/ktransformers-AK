@@ -103,7 +103,8 @@ input → [NPU: embedding / RoPE / MLA+NSA+Indexer attention]
 
 ### 2.2 CPU 端(kt-kernel)
 - backend:LLAMAFILE(`kt-kernel/operators/llamafile/moe.hpp` → `LLAMA_MOE_TP`)。
-- 8 个 NUMA worker pool(每 NUMA 24 线程),NEON SDOT 内核。
+- 8 个 NUMA worker pool(每 NUMA 24 **核**;默认 `--kt-cpuinfer 24 --kt-threadpool-count 8` →
+  `24/8 = 3` 线程/subpool,即每 NUMA 3 线程),NEON SDOT 内核。
 - Expert layout(经 Z.2 修复后):
   - **gate/up**:`(E=256, intermediate=2048, hidden=4096)`,沿 hidden 分 Q8_0 block;
   - **down**:`(E=256, hidden=4096, intermediate=2048)`,沿 intermediate 分 block。

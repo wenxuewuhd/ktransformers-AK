@@ -81,13 +81,19 @@ if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
 fi
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
-# CPU MoE is memory-bandwidth-bound; the old default 24 used only 24/192 cores
-# (3/NUMA) -> ~4% of DDR bandwidth. Default is now 96 (12/NUMA), validated to give
-# real-weight decode 3.6 -> 6.12 tok/s (~1.7x), CPU MoE 215 -> 115ms/token, F2
-# coherent (accuracy preserved). 96 leaves 8 cores/NUMA headroom for NPU host
-# threads; >=128 thrashes/collapses under real load. Override with KT_CPUINFER.
-# (profiling: doc/zh/dsv4_single_npu/graph_decode_profiling_report.md, 2026-06-09)
-KT_CPUINFER="${KT_CPUINFER:-96}"
+# CPU MoE is memory-bandwidth-bound; scale threads to raise effective DDR bandwidth.
+# Default is now 128 (16/NUMA). Isolated decode micro-bench (tools/p27_cpu_moe_bw_bench.py,
+# real layer3 weights, output verified) shows effective bandwidth has a KNEE at 128 then a
+# noisy plateau: 96(12/NUMA)=88, 112(14)=96, 128(16)=114, 144=109, 160(20)=110, 176=116 GB/s;
+# only 192 (24/NUMA = ALL cores) COLLAPSES (no spare core for the NumaJobDistributor spin
+# threads + NPU host callback + python/OS -> oversubscription thrash).
+# End-to-end server (single card, 32 GPU experts): 96 -> 128 cuts CPU MoE 67.7 -> 55.1
+# ms/token, decode 6.84 -> 8.52 tok/s (+24%), F2 coherent (accuracy preserved). 128 and 160
+# give IDENTICAL decode throughput (CPU MoE is ~co-equal/overlapped with NPU past 128), so 128
+# wins on safety: 8 cores/NUMA headroom vs 160's 4. The old "<=96, >=128 thrashes" note was a
+# live-server-contention artifact, not intrinsic. Override with KT_CPUINFER (160 fine too).
+# (profiling: doc/zh/dsv4_single_npu/graph_decode_bandwidth_handoff.md, 2026-06-09)
+KT_CPUINFER="${KT_CPUINFER:-128}"
 PORT="${PORT:-8000}"
 ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 export ASCEND_TOOLKIT_HOME

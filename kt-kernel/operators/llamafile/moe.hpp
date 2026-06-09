@@ -74,9 +74,20 @@ static inline bool kt_llamafile_sgemm(long m, long n, long k, const void* A, lon
     auto* c = static_cast<float*>(C);
     const auto* a = static_cast<const block_q8_0*>(A);
     const auto* b = static_cast<const block_q8_0*>(B);
+    // M=1 GEMV is DDR-bandwidth-bound; warm the head of the next weight row while
+    // dotting the current one to hide the per-row cold miss and raise memory-level
+    // parallelism. Env-gated for A/B: KT_NO_MOE_PREFETCH=1 disables.
+    static const bool prefetch_on = (std::getenv("KT_NO_MOE_PREFETCH") == nullptr);
     for (long j = 0; j < n; ++j) {
       const auto* b_col = b + ldb * j;
       for (long i = 0; i < m; ++i) {
+        if (prefetch_on && i + 1 < m) {
+          const char* nxt = reinterpret_cast<const char*>(a + lda * (i + 1));
+          __builtin_prefetch(nxt, 0, 1);
+          __builtin_prefetch(nxt + 64, 0, 1);
+          __builtin_prefetch(nxt + 128, 0, 1);
+          __builtin_prefetch(nxt + 192, 0, 1);
+        }
         float sum = 0.f;
         ggml_vec_dot_q8_0_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
         if (!std::isfinite(sum)) {

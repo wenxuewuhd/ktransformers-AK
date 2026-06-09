@@ -11,7 +11,7 @@
 > | `DeepSeek-V4-Flash_单卡910B_从0拉起服务全记录.md` | 本会话 | 从 0 拉起的最新实操 | **最新事实基准** |
 >
 > 当来源之间冲突时,**以本文为准**;本文又以「全记录」+ 实测为最新事实基准。
-> 维护分支:`dsv4_one_card_dev`。最后更新:2026-06-08(graph capture 已闭合)。
+> 维护分支:`dsv4_one_card_dev`。最后更新:2026-06-09(graph decode 提速 ~1.7×,`--kt-cpuinfer` 默认 24→96,见 §6.6)。
 
 ---
 
@@ -22,6 +22,13 @@
 **graph capture(坑⑥ `aclrtMemcpy 107030`)+ 图重放跨 stream(`Unsupport run graph`)已于
 2026-06-08 修复并闭环验证**:真实权重 graph-on 全程跑通,decode `npu graph: True` ~3.5–3.9 tok/s
 (达基线 ~3.6,取代 eager ~1.6),F2 四 prompt 连贯(§6.3)。eager 回退仍保留作对照。
+
+> **2026-06-09 更新(graph decode 提速)**:profiling 发现 CPU MoE 是**内存带宽瓶颈**,而生产
+> `--kt-cpuinfer 24` 只用了 192 核里的 24 核(~4% DDR 带宽)。把 `--kt-cpuinfer` 默认 **24→96**
+> 后,真实权重 decode **3.6 → 6.12 tok/s(~1.7×)**,CPU MoE 215→115ms/token,F2 四 prompt 连贯
+> (精度无损)。**纯配置改动**(commit `68f8556`)。≥128 线程会 thrash 崩,96 是甜点。详见 §6.6 +
+> [graph_decode_profiling_report.md](graph_decode_profiling_report.md)。带宽利用率仍只 ~13%,
+> 进一步提速见 [graph_decode_bandwidth_handoff.md](graph_decode_bandwidth_handoff.md)。
 
 ---
 
@@ -207,7 +214,8 @@ KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=0 bash tools/p27_launch_ds4flash_npu.sh
 
 关键 launch 参数:`--device npu --tp 1 --attention-backend ascend --quantization compressed-tensors
 --dtype bfloat16 --kt-method LLAMAFILE --kt-num-gpu-experts 32 --kt-weight-path .../dsv4_layer{layer_idx}.gguf
---kt-threadpool-count 8 --kt-cpuinfer 24 --chunked-prefill-size 2048`(**勿传 -1**,见坑⑨)。
+--kt-threadpool-count 8 --kt-cpuinfer 96 --chunked-prefill-size 2048`(**勿传 -1**,见坑⑨)。
+> `--kt-cpuinfer` 现默认 **96**(脚本可用 `KT_CPUINFER` 覆盖;2026-06-09 提速,见 §6.6)。**勿 ≥128**(会 thrash 崩)。
 
 ### 4.5 验证(等 ~100s 加载;P0+P1 加载加速前为 ~9 min)
 
@@ -344,6 +352,30 @@ KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=<空闲卡> bash tools/p27_launch_ds4flash_
 - ⚠️ 当前只省**磁盘 I/O**(实测最大头);C++ 单线程 TP 切分仍跑。若实测瓶颈在切分,需进一步并行化(P4)。
 - ⚠️ 生产勿长期开 `KT_DUMMY_CPU_WEIGHTS` / `KT_FORCE_SYNC_SUBMIT` / `KT_DEBUG_*` / `SGLANG_NPU_PROFILE_ENABLE`。
 
+### 6.6 ⚡ graph decode 提速:`--kt-cpuinfer 24→96`(2026-06-09,commit `68f8556`)
+
+**结论**:graph decode 真实权重 **3.6 → 6.12 tok/s(~1.7×)**,精度无损,**纯配置改动**。
+
+**根因**:decode ~280ms/token 中 ~70% 是 43 层 CPU MoE。CPU MoE 是**内存带宽瓶颈**——每层把
+~140MB(最恶劣 top-6 全落 CPU 160MB)int8 专家权重从 DDR 搬进来过一遍,int8 GEMV 算力 ~0.4ms/token
+可忽略(`AI=0.94 MAC/byte ≪ 平衡点 21`)。而生产 `--kt-cpuinfer 24` 只用了 192 核里的 **24 核**
+(3/NUMA),有效带宽仅 **31 GB/s ≈ DDR 峰值的 4%**。
+
+**修复**:`tools/p27_launch_ds4flash_npu.sh` 把 `--kt-cpuinfer` 默认 **24→96**(`KT_CPUINFER` 可覆盖)。
+
+| cpuinfer | 每 NUMA | 有效带宽 | 真实 decode | CPU MoE/token | F2 连贯 |
+|---|---|---|---|---|---|
+| 24(旧) | 3 | 31 GB/s | 3.6 tok/s | ~215 ms | ✅ |
+| **96(新默认)** | 12 | **95 GB/s** | **6.12 tok/s** | **115 ms** | ✅ |
+| 128 | 16 | — | **崩(1149ms/token)** | — | ❌ |
+
+- **≥128 会 thrash**(无余量给 NPU host 线程);96 留 8 核/NUMA,是验证过的甜点。
+- ⚠️ 经验:① "快参考"先验证输出非零(一个 no-op 幻象 `forward()` 曾误导数小时);
+  ② **扫最优线程数必须用真实权重**(dummy 路由退化、访存少,崩溃点失真:dummy 128 是峰、真实 128 崩)。
+- 完整诊断 + 纠错记录:[graph_decode_profiling_report.md](graph_decode_profiling_report.md)。
+- **仍有空间**:96 核也只用了 ~13% DDR 带宽 → kernel 访存优化 / 根治多线程崩溃 / 降 Q4 还能再榨 ~4–8×。
+  见 [graph_decode_bandwidth_handoff.md](graph_decode_bandwidth_handoff.md)。
+
 ---
 
 ## 7. 性能数据(参考,未大规模调参)
@@ -351,7 +383,8 @@ KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=<空闲卡> bash tools/p27_launch_ds4flash_
 | 项 | 值 |
 |---|---|
 | Graph capture 时间(实测 06-08) | 6.79 s(bs=1,真实权重);dummy 9.89 s |
-| Decode 吞吐 — graph(实测 06-08) | **3.46–3.89 tok/s**(`npu graph: True`) |
+| Decode 吞吐 — graph,`--kt-cpuinfer 96`(实测 06-09) | **6.12 tok/s**(真实权重,F2 连贯;§6.6) |
+| Decode 吞吐 — graph,`--kt-cpuinfer 24`(旧默认,06-08) | 3.46–3.89 tok/s(`npu graph: True`) |
 | Decode 吞吐 — eager | ~1.6 tok/s |
 | 模型加载 | **~100s**(43 层 MoE GGUF ~47s〔P0+P1 加速〕+ 46 shard/建模 ~54s);旧 ~9 min,见 `DeepSeek-V4-Flash_CPU权重加载加速_P0-P1.md` |
 | HBM 占用(N=32) | ~16 GB expert + attention + KV |

@@ -12,6 +12,14 @@
 >
 > 说明:`tools/kt_dsv4_npu_patches/readme.MD` 是「从开源裸仓用 patch 复现」的指南。本工作树 patch **已打好**,
 > 因此本文档**跳过打 patch**,只覆盖「编译 → 转权重 → 拉起 → 使用」。
+>
+> **⚡ 2026-06-09 更新(本文之后的进展,以总纲为准)**:① graph 路径已闭合(取代本文的 eager 回退);
+> ② graph decode 已提速 **3.6 → 6.12 tok/s(~1.7×)**——`tools/p27_launch_ds4flash_npu.sh` 的
+> `--kt-cpuinfer` 默认 **24→96**(CPU MoE 是内存带宽瓶颈,旧默认只用了 24/192 核;`KT_CPUINFER` 可覆盖,
+> **勿 ≥128**)。纯配置改动 commit `68f8556`,精度无损。详见
+> [DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md](DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md) §6.6
+> + [graph_decode_profiling_report.md](graph_decode_profiling_report.md)。下面正文是「从 0 拉起」的历史实录,
+> 拉起命令仍有效(脚本默认值已更新)。
 
 ---
 

@@ -67,6 +67,63 @@
 
 ---
 
+## 📐 终版 roofline 分解（2026-06-10 晚定稿，预取 kernel 后）
+
+服务端口径：256 专家/层、32 常驻 NPU（prefix）、top-6 → CPU 平均承接 **5.25 专家/层/token** = 70.3MB/层 = **3.02GB/token**。
+
+### cpu_moe_wall ≈ 27ms（median，load~150）的分解
+
+```
+ cpu_moe_wall 26.8ms median / 18.0 min
+ ├─ on_cpu  ~1.8ms        host(D2H/routing/H2D)
+ └─ off_cpu ~25ms median / ~16.5 min
+     物理底  ~9.0ms        3.02GB ÷ 42 GB/s/NUMA(kernel形态上限,实验⑤)
+     down 流重启 ~1.5ms    29.6 vs 42.8 GB/s/NUMA(-30%);三个廉价修法已证无效
+     dispatch+skew ~4.6ms  每层 forward 外 106µs(fork-join 派发+max-of-8+sync)
+     quant+merge  ~1.5ms   已最小化(merge 并行后 14µs/层)
+     邻居噪声  +8.5ms       median−min;独占机器待验证(见下方测试方案)
+```
+
+### Phase 实测（实验③，n=4300/层，预取 kernel，@128t）
+
+| 相位 | 每层/tp | 折算带宽 | 判定 |
+|---|---|---|---|
+| gateup | 156µs | 42.8 GB/s/NUMA | **≈探针形态上限 42.1（吻合 2%）—— 无泡沫** |
+| down | 113µs | 29.6 GB/s/NUMA | -30%；探针⑤ hop=1 复现（31.3 vs 42.1，-27%），三连排除后归因内存系统层 |
+| quant / merge | 21 / 15µs | — | 可忽略 |
+| forward 外 | ~106µs | — | numa-job 派发 + 8-NUMA skew + sync，结构性 |
+
+### 实验索引（复现工具全在 tools/）
+
+| # | 实验 | 工具/命令 | 关键数 |
+|---|---|---|---|
+| ① | DIMM 实配 | `dmidecode -t 17` | 24/32 槽、3/4 通道、DDR4-3200 → 真 spec **614 GB/s** |
+| ② | 加载延迟 | `bw_probe_mlp lat 0 512`（±16 线程自造邻居） | 147→195ns(+33%) → 单核带宽 ∝ MLP/延迟 |
+| ③ | phase 分解 | 微基准 + `KT_MOE_PHASE_TIMING=1` iters≥4300 | 上表 |
+| ④ | 时序对照 | v3 探针 ×6 + loadavg | load 91→151 带宽稳定 375-387 → **loadavg 不是噪声代理，看邻居打不打 DDR** |
+| ⑤ | 形态探针 | `bw_probe_mlp gemv <cpus> <mb> <s> <v1/2/3> [K] [hop]` | K4096顺序 42.1 / K256顺序 42.8 / K256+hop 31.3 GB/s @16t |
+
+### G1（邻居噪声）机理链
+
+邻居 DDR 流量 → 控制器排队 → 延迟↑(实验②) → 单核带宽↓（outstanding miss 数硬件定死）→ **max-of-8 放大**（每层等最慢 NUMA，43 层累计上尾）→ median 被抬 8.5ms。历史佐证：load-400 时代全机只读上限 121-143 vs 安静窗口 375-442（3× 摆幅）。
+
+---
+
+## 🧪 独占机器测试方案（待窗口，照此执行）
+
+**目的**：验证 8.5ms median−min 抖动归因（邻居 vs 自家 skew），并解锁更高线程数。
+
+1. **窗口确认**（5min）：`bw_probe_mlp bw "0-191" 1 8 128 2` 应 ≥400 GB/s；`lat 0 512` 应 ~130-147ns；时序 ×3 稳定。
+2. **微基准基线**（5min）：layer16 @128t ×3 次——共享机记录 median 0.38-0.42 / min 0.37；独占预期 min 不变、**median 收敛到 min+5%**。
+3. **端到端主测**（30min）：8020 拉服务（mxfp4、cpuinfer 128、`KT_DECODE_TIMING=1 KT_MOE_PHASE_TIMING=1`），跑 ≥500 token 长生成，统计 cpu_moe_wall **median/p95/min**。
+   - **判定**：median→17-18ms 且 p95−min <3ms ⇒ 8.5ms 归因邻居成立，回收兑现；
+   - 若仍有 ±4-5ms 散布 ⇒ 自家 skew 占大头（fork-join/调度），邻居归因部分推翻——届时 dispatch+skew 那 4.6ms 的结构改造（任务编排重写）的赔率就值得重估。
+4. **线程重扫**（20min）：同窗口 A/B `KT_CPUINFER` 128/144/160——共享机上 160 输在和 sglang 抢核；独占下抢核压力不同，160 可能翻盘（微基准 160 是 -13%）。
+5. **顺手**：四 prompt 连贯性回归；若 NPU 侧也要量，KT_DECODE_TIMING 的 off_cpu/on_cpu 拆分已够。
+   预期总收益（若归因成立）：cpu_moe_wall ~27→**17-18ms 稳定**，decode ~13→**15-16 tok/s**。
+
+---
+
 > **历史状态**：开放（Session D 起点）｜**日期**：2026-06-10｜**隔离 worktree**：`/workspace/code/kt-D-mxfp4`
 > **基线**：主干 `dsv4_one_card_dev` @ `22aac3d`（decode `--kt-cpuinfer 128` + GEMV prefetch → ~8.5 tok/s client；
 > CPU MoE 是 DDR 带宽瓶颈，~55ms/token，详见

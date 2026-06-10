@@ -22,6 +22,24 @@
 #include "llama.cpp/ggml.h"
 #include "llamafile/sgemm.h"
 
+// ---------------------------------------------------------------------------
+// KT_MOE_PHASE_TIMING=1 — Session D Phase-0 测量：decode (forward_one) 三段
+// (input量化 / gate+up job / down job) + TP 层 merge 的累计耗时，定位固定开销 F
+// 的构成。env 关闭时仅一次 getenv + 分支，零扰动。每 tp 每 4300 次调用
+// (=43层×100 token) 打一行均值到 stderr。
+// 线程安全性：同一 tp_part_idx 的 forward_one 在 decode 流内串行（逐层），
+// 不同 tp 并行但写不同槽位 → 无需原子。
+// ---------------------------------------------------------------------------
+static inline bool kt_phase_timing_on() {
+  static const bool on = std::getenv("KT_MOE_PHASE_TIMING") != nullptr;
+  return on;
+}
+struct KtPhaseAcc {
+  uint64_t calls = 0;
+  uint64_t quant_ns = 0, gateup_ns = 0, down_ns = 0;
+};
+inline KtPhaseAcc g_kt_phase_acc[16];
+
 inline void debug_quant(void* input, ggml_type type) {
   std::vector<float> output(ggml_blck_size(type));
   to_float(input, output.data(), ggml_blck_size(type), type);
@@ -405,6 +423,9 @@ class LLAMA_MOE_TP {
 #ifdef FORWARD_TIME_PROFILE
     auto t0 = std::chrono::high_resolution_clock::now();
 #endif
+    const bool kt_pt = kt_phase_timing_on();
+    std::chrono::high_resolution_clock::time_point kt_pt0, kt_pt1, kt_pt2;
+    if (kt_pt) kt_pt0 = std::chrono::high_resolution_clock::now();
     const void* gate_input_ptr;
     const void* up_input_ptr;
     if ((ggml_type)config_.hidden_type == kt_effective_vec_dot_type((ggml_type)config_.gate_type) &&
@@ -448,6 +469,8 @@ class LLAMA_MOE_TP {
                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
 
 #endif
+
+    if (kt_pt) kt_pt1 = std::chrono::high_resolution_clock::now();
 
     int activated_expert = 0;
     for (int i = 0; i < k; i++) {
@@ -535,6 +558,7 @@ class LLAMA_MOE_TP {
     fmt::print("numa_node: {}, gate/up time: {}\n", tp_part_idx,
                std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
 #endif
+    if (kt_pt) kt_pt2 = std::chrono::high_resolution_clock::now();
 
     nth = config_.hidden_size / config_.m_block;
     pool->do_work_stealing_job(
@@ -587,6 +611,22 @@ class LLAMA_MOE_TP {
     fmt::print("numa_node: {}, total time: {}\n", tp_part_idx,
                std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count());
 #endif
+    if (kt_pt) {
+      auto kt_pt3 = std::chrono::high_resolution_clock::now();
+      auto ns = [](auto a, auto b) {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+      };
+      auto& acc = g_kt_phase_acc[tp_part_idx & 15];
+      acc.calls++;
+      acc.quant_ns += ns(kt_pt0, kt_pt1);
+      acc.gateup_ns += ns(kt_pt1, kt_pt2);
+      acc.down_ns += ns(kt_pt2, kt_pt3);
+      if (acc.calls % 4300 == 0) {
+        fprintf(stderr, "[KT_PHASE tp%d] n=%llu avg/layer-call: quant=%.1fus gateup=%.1fus down=%.1fus\n",
+                tp_part_idx, (unsigned long long)acc.calls, acc.quant_ns / 1e3 / acc.calls,
+                acc.gateup_ns / 1e3 / acc.calls, acc.down_ns / 1e3 / acc.calls);
+      }
+    }
   }
 
   void forward_many(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
@@ -921,6 +961,9 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
 
   void merge_results(int qlen, void* output, bool incremental) {
     auto pool = this->config.pool;
+    const bool kt_pt = kt_phase_timing_on();
+    std::chrono::high_resolution_clock::time_point kt_m0;
+    if (kt_pt) kt_m0 = std::chrono::high_resolution_clock::now();
     pool->do_work_stealing_job(
         qlen, nullptr,
         [this, output, incremental](int token_nth) {
@@ -946,6 +989,17 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
                      config.hidden_size, (ggml_type)config.hidden_type);
         },
         nullptr);
+    if (kt_pt) {
+      auto kt_m1 = std::chrono::high_resolution_clock::now();
+      // 槽位 15 专用于 merge（forward_one 只用 tp 0..7）
+      auto& acc = g_kt_phase_acc[15];
+      acc.calls++;
+      acc.quant_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(kt_m1 - kt_m0).count();
+      if (acc.calls % 4300 == 0) {
+        fprintf(stderr, "[KT_PHASE merge] n=%llu avg/layer-call: merge=%.1fus (qlen=%d)\n",
+                (unsigned long long)acc.calls, acc.quant_ns / 1e3 / acc.calls, qlen);
+      }
+    }
   }
 };
 #endif

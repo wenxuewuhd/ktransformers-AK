@@ -13,9 +13,13 @@
 | P2 转换器 | ✅ | `tools/convert_mxfp4_layer_to_gguf.py`。**nibble 序（坑⑩）实锤**：原生 ckpt 是 **consecutive**（`inference/convert.py`: `stack([low,high]).flatten` → byte i = Kpos 2i/2i+1），上游 GGUF 是 **half-block**（qs[j]=Kpos j / j+16），转换器**逐 32-group 重排 nibble**（非 byte copy），e8m0 scale 字节直存。`tools/verify_mxfp4_layer.py` layer16：GGUF dequant == 原生 dequant **逐元素 bit-exact**。文件 3.42GB（Q8_0 6.85GB 的一半） |
 | P3 NEON kernel | ✅ | 移植上游 `ggml_vec_dot_mxfp4_q8_0`（vqtbl1q_s8+vdotq_s32+scalar 兜底）；`kt_llamafile_sgemm` 加 MXFP4×Q8_0 分支（复用 prefetch）。`tools/p27_cpu_moe_reference_check_mxfp4.py` layer16：**cosine=0.999939 / max_rel 1.12%**（唯一损失激活 Q8）。⚠️ 离线对账须 `KT_FORCE_SYNC_SUBMIT=1`（stream-callback 路径在孤立单层调用返回全 0，Q8_0 同样，非 kernel bug；脚本已内置） |
 | P4 微基准 | ✅ | layer16 真实权重 A/B（同窗口，norm>0+确定性签名）。@同线程 MXFP4 wall 全面低于 Q8_0；MXFP4 搬运 80.2MB/tok（Q8_0 160.4，正好一半）：<br>96t: MXFP4 1.238 / Q8 1.967 (1.59×)；112t: 1.123 / 1.565 (1.39×)；128t: 1.024 / 1.314 (1.28×)；144t: **0.926** / 1.264 (1.37×)。MXFP4 best 0.926ms≈手册 ~0.8 目标。**knee 反而右移**：字节减半后没那么吃带宽，144t 仍在涨（值得加大线程） |
-| P5 全量+端到端 | ⏳ | 待全量下载（unauthenticated 限速，~18/46 shard）。工具就绪：`tools/batch_convert_mxfp4_layers_mp.py`（多进程全 43 层）。端到端拉服务用**端口 8020** |
+| P5 全量+端到端 | ✅ | 全 43 层转换（`batch_convert_mxfp4_layers_mp.py`，并发转换曾把 layer9 写截断成 576B→已 catch 单独重转，**收尾务必逐层 audit 文件大小**）。端口 **8020** 卡 6 拉服务，四 prompt 全连贯（Fibonacci+代码/ML 解释/中文 Transformer，无 NaN/乱码）= **nibble 约定全模型级正确性闸门通过**。**cpu_moe_wall 55→~39ms（−29%），decode 吞吐 8.5→~10–11 tok/s（+20~30%）**。KT_PHASE 实测 F：gateup ~0.77ms(67%)/down ~0.36ms(31%)/merge ~98us 单核(8%)/quant ~20us(可忽略) |
+| P4.1 线程 A/B | ✅ | 端到端 `--kt-cpuinfer` 128 vs 160：**128 胜**。160 隔离微基准赢(0.93ms/层)，但端到端和 sglang scheduler/NPU callback/tokenizer 抢核(20线程/NUMA 只剩 4/NUMA)→ 吞吐不升反抖(尖峰 63ms)。**serving 保持 128** |
 
 > 复现命令见各工具 docstring。重编 `.so` 需 `apt-get install -y libhwloc-dev`（容器重启会丢，连 import 用的 libhwloc15 也会丢）。
+> 拉服务：`NPU_DEVICE_ID=<空卡> PORT=8020 KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' KT_CPUINFER=128 MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 KT_DECODE_TIMING=1 bash tools/p27_launch_ds4flash_npu.sh`
+>
+> **F-opt 后续（基于 P5 KT_PHASE 实测）**：①merge 单核 98us/层×43=4.2ms/token(~11%)→qlen=1 时按 hidden 分块并行(F-opt Phase1 #2a)；②gateup/down 已是带宽腿、字节减半到头，靠 CPU↔NPU overlap(B 线)再藏。quant 已证实可忽略。
 
 ---
 

@@ -317,31 +317,34 @@ NZ 字节直存 DDR 是最快路径(Path-1);ND 存+H2D 后 NZcast 的兜底(Path
 **2a 余项(并入 2b)**:用真实 checkpoint 一层权重 + CPU fp32 dequant 参考对数值(确认 builder 读
 checkpoint 正确);现 2a 用随机权重对"权重常驻 reference",已证流式机制忠实,语义正确性由生产精度背书。
 
-### D-2b. ✅ 子任务 2b(2026-06-10):流水设计定型——**串行单 slot 即最优**,双缓冲无收益
+### D-2b. ✅ 子任务 2b(2026-06-10):流水设计定型——**串行单 slot 即最优**(双缓冲≈持平,不值得)
 
-`tools/longseq_dbg/stream_2b_prefetch.py`(复用 2a 函数,卡4,K=6 层 NZ pinned 池实测):
+`tools/longseq_dbg/stream_2b_prefetch.py`(复用 2a 函数,卡4,K=6 层 NZ pinned 池,**均带 warmup**):
 
-| 方案 | 每层 | 43 层外推 | 备注 |
-|---|---|---|---|
-| **serial 单 slot**(default stream,H2D→compute 串行)| **305ms** | **13.1s** | = PCIe 上限,**就是最优** |
-| 双缓冲(H2D default + compute side stream)| 515ms | 22s | **更慢**:跨 stream overlap 在本 NPU 上有副作用 |
-| 双缓冲(H2D side stream)| 451ms | 19s | 更慢:side-stream H2D 只 10GB/s(半带宽)|
+| 方案 | 每层 | 43 层外推 |
+|---|---|---|
+| **serial 单 slot**(default stream,H2D→compute 串行)| **298.8ms** | **12.8s** |
+| 双缓冲(H2D default + compute side stream)| 314.3ms | 13.5s |
 
 | 多 copy stream 聚合 H2D | 带宽 |
 |---|---|
-| 1 stream | 10.1 GB/s |
-| 2 stream | 20.7 GB/s |
-| 4 stream | 22.5 GB/s(= PCIe Gen4 x16 墙)|
+| 1 stream | 21.2 GB/s |
+| 2 stream | 23.6 GB/s |
+| 4 stream | 23.5 GB/s(= PCIe Gen4 x16 墙)|
+
+> ⚠️ **测量教训(2026-06-10,重要更正)**:本节首版报过"双缓冲 515ms、side-stream H2D 只 10GB/s、
+> 多流 1 流 10GB/s",**全是 warmup/首次触碰假象**(无预热 + 迭代太少 + 新分配 buffer 首触)。
+> 受控实验(`h2d_controlled.py`:同 buffer、预热、30 迭代,只变 stream)证实:**side stream 与
+> default stream H2D 带宽基本一样(22–26 GB/s),无 2× 惩罚**;PCIe ~23.6 GB/s 才是真上限。
+> 加 warmup 重测后,双缓冲 314ms ≈ serial 299ms(差 5%,在噪声内)。**结论不变但理由更正如下。**
 
 **结论(流水设计定型)**:
-1. **串行单 slot(default stream)就是最优 ~305ms/层 → 43 层 13.1s,vs CPU ~1058s = ~81×**。
-   compute(6.7ms)只占 copy(308ms)2% → overlap 最多省 2%,不值得做双缓冲。
-2. **双缓冲反而更慢**:(a) side-stream H2D 只 10GB/s(默认 stream 21GB/s 的一半);
-   (b) 即便 H2D 放 default、compute 放 side,跨 stream overlap 在本 NPU 上有 ~副作用 → 515ms。
-   ∴ **实现就用最简单的串行单 slot 在 default stream 上 H2D→compute**(也最省 HBM:1 slot 6.4GB)。
-3. **多流打不破 PCIe 墙**:2 流即饱和 ~21GB/s,4 流 22.5 ≈ 单默认流。**PCIe ~21GB/s 是硬墙**
-   (277GB 全模型扫一遍 ~12.3s 硬地板);要再快只能多卡/Gen5(§3.4 结论坐实)。
-4. ⚠️ **集成大坑**:别用 side stream 预取(会掉到半带宽,13s→26s)。H2D 走 default stream。
+1. **串行单 slot(default stream)≈ 最优:298.8ms/层 → 43 层 12.8s,vs CPU ~1058s = ~83×**。
+2. **双缓冲 ≈ serial(不更快也不更慢)**:本质是 **copy-bound**——compute(6.7ms)只占 copy(~300ms)2%,
+   overlap 最多省 2%,还被跨 stream 同步开销吃掉 → 与 serial 持平。∴ **选 serial 单 slot**(更简单、
+   最省 HBM:1 slot 6.4GB),不是因为双缓冲"坏",而是**没必要**。
+3. **多流打不破 PCIe 墙**:1 流 21.2,2 流即饱和 23.6,4 流 23.5。**PCIe ~23.6GB/s 是硬墙**
+   (277GB 全模型扫一遍 ~11.7s 硬地板);要再快只能多卡/Gen5(§3.4 结论坐实)。
 
 **2b 余项(并入 2c/checkpoint 加载器)**:真实 checkpoint 一层 256 专家 int8+scale 读取与
 gate/up→w13 拼接顺序、CPU fp32 dequant 数值对照(本 2b 用随机权重验流水/带宽,机制已足)。
@@ -352,7 +355,8 @@ gate/up→w13 拼接顺序、CPU fp32 dequant 数值对照(本 2b 用随机权�
    累加 `count[layer][expert]` + 导出 `[43×256]` + skew 摘要(commit `d8c460d6b`)。**待补:按请求复位**。
 2. **[中] 流式权重池 + ~~双缓冲~~ 串行 H2D loop**(2a✅/2b✅ 已验流式地基与最优流水):
    DDR pinned NZ int8 专家池 + **串行单 slot**(default stream:H2D 第 L 层 → 跑算子 → 覆盖搬 L+1)。
-   ~~双缓冲预取~~ 经 2b 实测无收益反更慢(§D-2b)→ **不做**;扩 `gpu_experts_mask` 让 prefill 期 256 全上 NPU。
+   双缓冲经 2b 实测与 serial 持平(copy-bound,overlap 仅值 2%),**不做**取其简单(§D-2b)。
+   扩 `gpu_experts_mask` 让 prefill 期 256 全上 NPU。
 
    > ⚠️ **代码核实后的关键发现(2026-06-10)——现状没有可直接流式的 NPU-layout DDR 源**:
    > - GPU 专家(`NPUCompressedTensorsW8A8Int8DynamicMoE`)的 int8 `w13/w2` 在 **load 时一次性进 HBM**,

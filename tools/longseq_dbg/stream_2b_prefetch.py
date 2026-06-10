@@ -53,23 +53,27 @@ def double_buffer_stream(pool, scales, hidden, topk_ids, topk_w, top_k, dev):
     load_done = [None] * K
     compute_done = [None] * K
 
-    torch.npu.synchronize()
+    def loop():
+        last = None
+        for L in range(K):
+            buf = L % 2
+            # H2D 第 L 层进 slot[buf](default stream,全带宽)。slot[buf] 上次被 L-2 compute 用,须等其算完。
+            if L >= 2:
+                default.wait_event(compute_done[L - 2])
+            slot13[buf].copy_(pool[L][0], non_blocking=True)
+            slot2[buf].copy_(pool[L][1], non_blocking=True)
+            load_done[L] = default.record_event()
+            # compute 第 L 层(side stream),等其 H2D 完;与下一层 H2D 在 default 上并行
+            compute_stream.wait_event(load_done[L])
+            with torch.npu.stream(compute_stream):
+                last = run_experts(slot13[buf], slot2[buf], scales[L][0], scales[L][1],
+                                   hidden, topk_ids, topk_w, top_k)
+            compute_done[L] = compute_stream.record_event()
+        return last
+
+    loop(); torch.npu.synchronize()  # warmup（首次触碰 slot/DMA 队列）
     t0 = time.perf_counter()
-    last = None
-    for L in range(K):
-        buf = L % 2
-        # H2D 第 L 层进 slot[buf](default stream,全带宽)。slot[buf] 上次被 L-2 compute 用,须等其算完。
-        if L >= 2:
-            default.wait_event(compute_done[L - 2])
-        slot13[buf].copy_(pool[L][0], non_blocking=True)
-        slot2[buf].copy_(pool[L][1], non_blocking=True)
-        load_done[L] = default.record_event()
-        # compute 第 L 层(side stream),等其 H2D 完;与下一层 H2D 在 default 上并行
-        compute_stream.wait_event(load_done[L])
-        with torch.npu.stream(compute_stream):
-            last = run_experts(slot13[buf], slot2[buf], scales[L][0], scales[L][1],
-                               hidden, topk_ids, topk_w, top_k)
-        compute_done[L] = compute_stream.record_event()
+    last = loop()
     torch.npu.synchronize()
     return (time.perf_counter() - t0) * 1e3, last
 
@@ -79,11 +83,15 @@ def serial_stream(pool, scales, hidden, topk_ids, topk_w, top_k, dev):
     K = len(pool)
     slot13 = alloc_nz_slot(pool[0][0].shape, dev)
     slot2 = alloc_nz_slot(pool[0][1].shape, dev)
-    torch.npu.synchronize()
+
+    def loop():
+        for L in range(K):
+            slot13.copy_(pool[L][0]); slot2.copy_(pool[L][1])
+            run_experts(slot13, slot2, scales[L][0], scales[L][1], hidden, topk_ids, topk_w, top_k)
+
+    loop(); torch.npu.synchronize()  # warmup
     t0 = time.perf_counter()
-    for L in range(K):
-        slot13.copy_(pool[L][0]); slot2.copy_(pool[L][1])
-        run_experts(slot13, slot2, scales[L][0], scales[L][1], hidden, topk_ids, topk_w, top_k)
+    loop()
     torch.npu.synchronize()
     return (time.perf_counter() - t0) * 1e3
 
@@ -94,15 +102,22 @@ def multistream_bw(pool, dev, nstreams):
     slots = [(alloc_nz_slot(pool[i][0].shape, dev), alloc_nz_slot(pool[i][1].shape, dev)) for i in range(n)]
     streams = [torch.npu.Stream() for _ in range(n)]
     bytes_total = sum(pool[i][0].numel() + pool[i][1].numel() for i in range(n))
-    torch.npu.synchronize()
-    t0 = time.perf_counter()
-    for rep in range(2):
+
+    def once():
         for i in range(n):
             with torch.npu.stream(streams[i]):
                 slots[i][0].copy_(pool[i][0], non_blocking=True)
                 slots[i][1].copy_(pool[i][1], non_blocking=True)
+
+    for _ in range(3):  # warmup（避免首次触碰假象）
+        once()
     torch.npu.synchronize()
-    dt = (time.perf_counter() - t0) / 2
+    REPS = 10
+    t0 = time.perf_counter()
+    for _ in range(REPS):
+        once()
+    torch.npu.synchronize()
+    dt = (time.perf_counter() - t0) / REPS
     del slots; torch.npu.empty_cache()
     return bytes_total / 1e9 / dt  # GB/s aggregate
 

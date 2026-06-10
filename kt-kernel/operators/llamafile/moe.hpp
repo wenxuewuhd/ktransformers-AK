@@ -100,6 +100,37 @@ static inline bool kt_llamafile_sgemm(long m, long n, long k, const void* A, lon
     (void)precision;
     return true;
   }
+  // MXFP4 weight × Q8_0 activation (Session D CPU MoE). Same GEMV structure as the
+  // Q8_0 path: weight rows stride by sizeof(block_mxfp4)=17B (vs 34B for Q8_0), so
+  // ~half the DDR traffic. Activation is Q8_0 (MXFP4 vec_dot_type). NEON tbl+SDOT.
+  if (Atype == GGML_TYPE_MXFP4 && Btype == GGML_TYPE_Q8_0 && Ctype == GGML_TYPE_F32 && ith == 0 && nth == 1) {
+    const int ne = static_cast<int>(k * ggml_blck_size(GGML_TYPE_MXFP4));
+    const size_t bx = static_cast<size_t>(lda) * sizeof(block_mxfp4);
+    const size_t by = static_cast<size_t>(ldb) * sizeof(block_q8_0);
+    auto* c = static_cast<float*>(C);
+    const auto* a = static_cast<const block_mxfp4*>(A);
+    const auto* b = static_cast<const block_q8_0*>(B);
+    static const bool prefetch_on = (std::getenv("KT_NO_MOE_PREFETCH") == nullptr);
+    for (long j = 0; j < n; ++j) {
+      const auto* b_col = b + ldb * j;
+      for (long i = 0; i < m; ++i) {
+        if (prefetch_on && i + 1 < m) {
+          const char* nxt = reinterpret_cast<const char*>(a + lda * (i + 1));
+          __builtin_prefetch(nxt, 0, 1);
+          __builtin_prefetch(nxt + 64, 0, 1);
+        }
+        float sum = 0.f;
+        ggml_vec_dot_mxfp4_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
+        if (!std::isfinite(sum)) {
+          sum = 0.f;  // defensive; should not happen with valid weights/activations
+        }
+        c[ldc * j + i] = sum;
+      }
+    }
+    (void)task;
+    (void)precision;
+    return true;
+  }
   return llamafile_sgemm(m, n, k, A, lda, B, ldb, C, ldc, ith, nth, task, static_cast<int>(Atype),
                          static_cast<int>(Btype), static_cast<int>(Ctype), precision);
 }

@@ -1,6 +1,25 @@
 # Handoff — CPU MoE 换原生 MXFP4（Session D）：搬运字节减半，decode 再提 ~20–25%
 
-> **状态**：开放（Session D 起点）｜**日期**：2026-06-10｜**隔离 worktree**：`/workspace/code/kt-D-mxfp4`
+> **状态**：P1–P4 完成并对账通过；P5（全量+端到端）待全量下载｜**端口改 8020**（不再用 8014）
+> ｜**日期**：2026-06-10｜**隔离 worktree**：`/workspace/code/kt-D-mxfp4`
+
+---
+
+## ✅ 进度（2026-06-10，Session D 实测）
+
+| 阶段 | 状态 | 实测结论 |
+|---|---|---|
+| P1 类型注册 | ✅ | `GGML_TYPE_MXFP4=39`（block_mxfp4{e;qs[16]} blck32 size17，vec_dot_type=Q8_0）。改 vendored ggml.h/ggml-common.h/ggml-quants.{c,h}/ggml.c + kt loader.py + gguf-py。导出 patch `tools/kt_dsv4_npu_patches/llama_cpp/0002-add-ggml-type-mxfp4.patch`（对 pristine b3173 `git apply --check` 通过） |
+| P2 转换器 | ✅ | `tools/convert_mxfp4_layer_to_gguf.py`。**nibble 序（坑⑩）实锤**：原生 ckpt 是 **consecutive**（`inference/convert.py`: `stack([low,high]).flatten` → byte i = Kpos 2i/2i+1），上游 GGUF 是 **half-block**（qs[j]=Kpos j / j+16），转换器**逐 32-group 重排 nibble**（非 byte copy），e8m0 scale 字节直存。`tools/verify_mxfp4_layer.py` layer16：GGUF dequant == 原生 dequant **逐元素 bit-exact**。文件 3.42GB（Q8_0 6.85GB 的一半） |
+| P3 NEON kernel | ✅ | 移植上游 `ggml_vec_dot_mxfp4_q8_0`（vqtbl1q_s8+vdotq_s32+scalar 兜底）；`kt_llamafile_sgemm` 加 MXFP4×Q8_0 分支（复用 prefetch）。`tools/p27_cpu_moe_reference_check_mxfp4.py` layer16：**cosine=0.999939 / max_rel 1.12%**（唯一损失激活 Q8）。⚠️ 离线对账须 `KT_FORCE_SYNC_SUBMIT=1`（stream-callback 路径在孤立单层调用返回全 0，Q8_0 同样，非 kernel bug；脚本已内置） |
+| P4 微基准 | ✅ | layer16 真实权重 A/B（同窗口，norm>0+确定性签名）。@同线程 MXFP4 wall 全面低于 Q8_0；MXFP4 搬运 80.2MB/tok（Q8_0 160.4，正好一半）：<br>96t: MXFP4 1.238 / Q8 1.967 (1.59×)；112t: 1.123 / 1.565 (1.39×)；128t: 1.024 / 1.314 (1.28×)；144t: **0.926** / 1.264 (1.37×)。MXFP4 best 0.926ms≈手册 ~0.8 目标。**knee 反而右移**：字节减半后没那么吃带宽，144t 仍在涨（值得加大线程） |
+| P5 全量+端到端 | ⏳ | 待全量下载（unauthenticated 限速，~18/46 shard）。工具就绪：`tools/batch_convert_mxfp4_layers_mp.py`（多进程全 43 层）。端到端拉服务用**端口 8020** |
+
+> 复现命令见各工具 docstring。重编 `.so` 需 `apt-get install -y libhwloc-dev`（容器重启会丢，连 import 用的 libhwloc15 也会丢）。
+
+---
+
+> **历史状态**：开放（Session D 起点）｜**日期**：2026-06-10｜**隔离 worktree**：`/workspace/code/kt-D-mxfp4`
 > **基线**：主干 `dsv4_one_card_dev` @ `22aac3d`（decode `--kt-cpuinfer 128` + GEMV prefetch → ~8.5 tok/s client；
 > CPU MoE 是 DDR 带宽瓶颈，~55ms/token，详见
 > [graph_decode_bandwidth_findings.md](graph_decode_bandwidth_findings.md)——它点名的两条出路之一就是本任务）。

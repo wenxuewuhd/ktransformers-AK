@@ -187,8 +187,11 @@ git am /path/to/ktransformers-AK/tools/kt_dsv4_npu_patches/sglang/*.patch
 | Patch | Commit | 含义 |
 |-------|--------|------|
 | **0001** | `ac315ccc`（在 b3173 之上） | NumPy 2 下 `GGUFReader` 字节序视图兼容 |
+| **0002** | 在 b3173 之上 | 注册 `GGML_TYPE_MXFP4=39`（block_mxfp4{e;qs[16]}、kvalues_mxfp4、ggml_e8m0_to_fp32_half、dequantize_row_mxfp4、NEON `ggml_vec_dot_mxfp4_q8_0` + type_traits + gguf-py 枚举）——CPU MoE 吃原生 MXFP4 GGUF 的**必需** patch（Session D，搬运字节减半） |
  
-**默认**：子模块 pin **`a94e6ff`（b3173）**，**不**打此 patch。仅当读 GGUF 报错时再 `git am`。
+**默认**：子模块 pin **`a94e6ff`（b3173）**。0001 可选（读 GGUF 报错时再打）。**0002 是 MXFP4 CPU MoE
+路径的硬依赖**：用 `git apply -p1 tools/kt_dsv4_npu_patches/llama_cpp/0002-add-ggml-type-mxfp4.patch`
+（纯 `git apply`，非 git-am；已验证对 pristine b3173 clean apply），打完重编 kt-kernel `.so`。
  
 ---
  

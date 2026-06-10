@@ -129,6 +129,11 @@ static inline bool kt_llamafile_sgemm(long m, long n, long k, const void* A, lon
     const auto* a = static_cast<const block_mxfp4*>(A);
     const auto* b = static_cast<const block_q8_0*>(B);
     static const bool prefetch_on = (std::getenv("KT_NO_MOE_PREFETCH") == nullptr);
+    // Note(2026-06-10): an nrc=2 row-pair variant (shared activation, dual weight
+    // streams) was tried and measured NEUTRAL at 128 threads (0.402→0.421ms median,
+    // min identical): the in-row +512B prefetch inside ggml_vec_dot_mxfp4_q8_0
+    // already streams across contiguous short rows (down rows are 136B), so the
+    // short-row penalty it targeted is gone. Reverted to keep the kernel simple.
     for (long j = 0; j < n; ++j) {
       const auto* b_col = b + ldb * j;
       for (long i = 0; i < m; ++i) {

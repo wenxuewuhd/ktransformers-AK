@@ -365,8 +365,20 @@ compute 随 M 涨但始终 < copy:M=4096→6.7ms(占 copy 2%),M=32768→~31ms(�
    serial 还更省 HBM(1 slot 6.4GB)、更简单。
 3. **多流打不破 PCIe 墙**:2 流即饱和 23.6GB/s。**PCIe ~23.6GB/s 是硬墙**,要再快只能多卡/Gen5(§3.4 坐实)。
 
-**2b 余项(并入 2c/checkpoint 加载器)**:真实 checkpoint 一层 256 专家 int8+scale 读取与
-gate/up→w13 拼接顺序、CPU fp32 dequant 数值对照(本 2b 用随机权重验流水/带宽,机制已足)。
+### D-2c-i. ✅ 子任务 2c-i(2026-06-10):真实 checkpoint → pinned NZ 池加载器 + CPU 数值对照
+
+`tools/longseq_dbg/stream_2c_ckpt_loader.py`。checkpoint 命名(已核实):
+`layers.{L}.ffn.experts.{e}.{w1|w2|w3}.weight(+.weight_scale)`,**w1=gate int8[I,H] / w3=up int8[I,H]
+/ w2=down int8[H,I]**,scale fp32 per-out-channel。NPU layout(`fused_moe_triton/layer.py:340` 核实):
+**`w13=concat([w1(gate)上半, w3(up)下半], dim=0)` int8[E,2I,H]**,`w2`=down,scale 同理拼接;
+再 `process_after_loading`(transpose+NZ+bf16 scale)。
+
+实测(卡4,layer 21,全 256 专家):
+- 读 checkpoint 一层 6.44GB **in 5.9s**(43 层全建池外推 ~4min 一次性,可缓存优化);
+- **NPU 流式输出 vs CPU fp32 dequant 参考:cosine=0.99964,rel_err=0.0265**(int8 dynamic-quant 正常容差)。
+
+⇒ 加载器读 checkpoint 正确(gate/up 拼接、转置、NZ、scale 全对)+ 生产算子数值忠实,**2a 的 CPU 数值
+对照余项一并补齐**。**2c-i 完成**。剩 2c-ii:把串行流式 loop 接进 sglang prefill forward(碰 B 共享码,§2 对齐)。
 
 ### D-阈值. ✅ "长度阈值:短走 hybrid / 长走纯流式"——有价值,但定位是短 prompt 保护(2026-06-10)
 

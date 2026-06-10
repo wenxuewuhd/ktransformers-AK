@@ -73,7 +73,7 @@ static double now_s(void) {
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "mxfp4";
   long iters = (argc > 2 ? atol(argv[2]) : 1) * 1000000L;
-  const int K = 4096, nb = K / QK;             // one gate/up row: K=4096
+  const int K = (argc > 3 ? atoi(argv[3]) : 4096), nb = K / QK;             // one gate/up row: K=4096
   block_mxfp4* wx = aligned_alloc(64, nb * sizeof(block_mxfp4));   // 2176B  (L1)
   block_q8_0* wq = aligned_alloc(64, nb * sizeof(block_q8_0));     // 4352B  (L1)
   block_q8_0* act = aligned_alloc(64, nb * sizeof(block_q8_0));    // 4352B  (L1)

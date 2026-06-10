@@ -175,10 +175,10 @@ int main(int argc, char** argv) {
 typedef struct { uint8_t e; uint8_t qs[16]; } blk_mx;
 static const int8_t kv_mx[16] = {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
 static inline float e8m0h(uint8_t x){uint32_t b=(x<2)?(uint32_t)0x00200000<<x:(uint32_t)(x-1)<<23;float f;memcpy(&f,&b,4);return f;}
-typedef struct { int cpu; size_t rows; double secs_used; size_t rows_done; float sink; } garg_t;
+typedef struct { int cpu; size_t rows; int nb; int hop; double secs_used; size_t rows_done; float sink; } garg_t;
 static void* gemv_worker(void* p){
   garg_t* a=(garg_t*)p; pin(a->cpu);
-  const int nb=128; // K=4096
+  const int nb=a->nb;
   size_t rows=a->rows;
   blk_mx* w=aligned_alloc(4096, rows*nb*sizeof(blk_mx));
   memset(w,0x35,rows*nb*sizeof(blk_mx));
@@ -187,11 +187,18 @@ static void* gemv_worker(void* p){
   __atomic_fetch_add(&g_ready,1,__ATOMIC_SEQ_CST);
   while(!g_go){}
   double t0=now_s(); size_t done=0; float sum=0;
+  uint64_t rng=0x9e3779b97f4a7c15ull ^ (uint64_t)a->cpu;
+  size_t chunks = rows/32; if(chunks<1) chunks=1;
   while(!g_stop){
-    for(size_t r=0;r<rows && !g_stop;r++){
+    for(size_t c=0;c<chunks && !g_stop;c++){
+      size_t cbase;
+      if(a->hop){ rng^=rng<<13; rng^=rng>>7; rng^=rng<<17; cbase=(rng%chunks)*32; }
+      else cbase=c*32;
+    for(size_t r=cbase;r<cbase+32 && r<rows && !g_stop;r++){
       const blk_mx* x=w+r*nb; const int8_t* q8=act;
       float sumf=0;
       for(int ib=0;ib+1<nb;ib+=2){
+        __builtin_prefetch((const char*)&x[ib]+512,0,0);
         uint8x16_t q40=vld1q_u8(x[ib].qs), q41=vld1q_u8(x[ib+1].qs);
         int8x16_t a0=vld1q_s8(q8+ib*34+2), a1=vld1q_s8(q8+ib*34+18);
         int8x16_t a2=vld1q_s8(q8+(ib+1)*34+2), a3=vld1q_s8(q8+(ib+1)*34+18);
@@ -204,6 +211,7 @@ static void* gemv_worker(void* p){
         sumf+=e8m0h(x[ib].e)*0.25f*vaddvq_s32(p1)+e8m0h(x[ib+1].e)*0.25f*vaddvq_s32(p2);
       }
       sum+=sumf; done++;
+    }
     }
   }
   a->secs_used=now_s()-t0; a->rows_done=done; a->sink=sum;
@@ -288,17 +296,19 @@ static int run_gemv(int argc,char**argv){
   if(argc<5){fprintf(stderr,"gemv <cpus> <mb_per_thread> <secs>\n");return 2;}
   int cpus[256]; int nt=parse_cpus(argv[2],cpus,256);
   size_t mb=(size_t)atoi(argv[3]); double secs=atof(argv[4]);
-  size_t rows=(mb<<20)/(128*17);
   int variant = (argc>5)?atoi(argv[5]):1;
+  int K = (argc>6)?atoi(argv[6]):4096; int nb=K/32; if(nb<2) nb=2;
+  int hop = (argc>7)?atoi(argv[7]):0;
+  size_t rows=(mb<<20)/((size_t)nb*17);
   void* (*wfn)(void*) = (variant==3)?gemv3_worker:((variant==2)?gemv2_worker:gemv_worker);
   pthread_t th[256]; garg_t ga[256];
-  for(int i=0;i<nt;i++){ga[i]=(garg_t){.cpu=cpus[i],.rows=rows};pthread_create(&th[i],NULL,wfn,&ga[i]);}
+  for(int i=0;i<nt;i++){ga[i]=(garg_t){.cpu=cpus[i],.rows=rows,.nb=nb,.hop=hop};pthread_create(&th[i],NULL,wfn,&ga[i]);}
   while(__atomic_load_n(&g_ready,__ATOMIC_SEQ_CST)<nt){struct timespec w={0,50000000};nanosleep(&w,NULL);}
   g_go=1;
   struct timespec run={(time_t)secs,(long)((secs-(time_t)secs)*1e9)}; nanosleep(&run,NULL);
   g_stop=1;
   double tot=0,max_s=0; float sink=0;
-  for(int i=0;i<nt;i++){pthread_join(th[i],NULL);tot+=(double)ga[i].rows_done*128*17;if(ga[i].secs_used>max_s)max_s=ga[i].secs_used;sink+=ga[i].sink;}
+  for(int i=0;i<nt;i++){pthread_join(th[i],NULL);tot+=(double)ga[i].rows_done*nb*17;if(ga[i].secs_used>max_s)max_s=ga[i].secs_used;sink+=ga[i].sink;}
   printf("GEMV threads=%d  %.1f GB(w)/s aggregate (per-thread %.2f GB/s) sink=%f\n",nt,tot/max_s/1e9,tot/max_s/1e9/nt,sink);
   return 0;
 }

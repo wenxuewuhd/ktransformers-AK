@@ -321,33 +321,81 @@ checkpoint 正确);现 2a 用随机权重对"权重常驻 reference",已证流�
 
 `tools/longseq_dbg/stream_2b_prefetch.py`(复用 2a 函数,卡4,K=6 层 NZ pinned 池,**均带 warmup**):
 
-| 方案 | 每层 | 43 层外推 |
-|---|---|---|
-| **serial 单 slot**(default stream,H2D→compute 串行)| **298.8ms** | **12.8s** |
-| 双缓冲(H2D default + compute side stream)| 314.3ms | 13.5s |
+实测(均带 warmup,卡4,NZ pinned 池),**两个 M 都测**(M=每层 token 数;长序列 layer-at-a-time 时 M=S):
+
+| M | serial 单 slot/层 | 双缓冲/层 | 双缓冲 vs serial |
+|---|---|---|---|
+| 4096 | 298.8ms | 314.3ms | **+5.2%(更慢)** |
+| 32768(真实长 prefill)| 323.7ms | 353.7ms | **+9.3%(更慢)** |
 
 | 多 copy stream 聚合 H2D | 带宽 |
 |---|---|
-| 1 stream | 21.2 GB/s |
+| 1 stream | 18–21 GB/s |
 | 2 stream | 23.6 GB/s |
-| 4 stream | 23.5 GB/s(= PCIe Gen4 x16 墙)|
+| 4 stream | 23.4 GB/s(= PCIe Gen4 x16 墙)|
 
-> ⚠️ **测量教训(2026-06-10,重要更正)**:本节首版报过"双缓冲 515ms、side-stream H2D 只 10GB/s、
-> 多流 1 流 10GB/s",**全是 warmup/首次触碰假象**(无预热 + 迭代太少 + 新分配 buffer 首触)。
-> 受控实验(`h2d_controlled.py`:同 buffer、预热、30 迭代,只变 stream)证实:**side stream 与
-> default stream H2D 带宽基本一样(22–26 GB/s),无 2× 惩罚**;PCIe ~23.6 GB/s 才是真上限。
-> 加 warmup 重测后,双缓冲 314ms ≈ serial 299ms(差 5%,在噪声内)。**结论不变但理由更正如下。**
+> ⚠️ **测量教训**:本节首版报过"双缓冲 515ms、side-stream H2D 只 10GB/s",**全是 warmup/首次触碰假象**
+> (无预热 + 迭代太少 + 新 buffer 首触)。受控实验 `h2d_controlled.py`(同 buffer、预热、30 迭代,只变
+> stream)证实 side/default stream H2D 带宽一样(22–26GB/s),无 2× 惩罚;PCIe ~23.6GB/s 才是真上限。
 
-**结论(流水设计定型)**:
-1. **串行单 slot(default stream)≈ 最优:298.8ms/层 → 43 层 12.8s,vs CPU ~1058s = ~83×**。
-2. **双缓冲 ≈ serial(不更快也不更慢)**:本质是 **copy-bound**——compute(6.7ms)只占 copy(~300ms)2%,
-   overlap 最多省 2%,还被跨 stream 同步开销吃掉 → 与 serial 持平。∴ **选 serial 单 slot**(更简单、
-   最省 HBM:1 slot 6.4GB),不是因为双缓冲"坏",而是**没必要**。
-3. **多流打不破 PCIe 墙**:1 流 21.2,2 流即饱和 23.6,4 流 23.5。**PCIe ~23.6GB/s 是硬墙**
-   (277GB 全模型扫一遍 ~11.7s 硬地板);要再快只能多卡/Gen5(§3.4 结论坐实)。
+#### 为什么双缓冲不值得做(原理 + 数据)
+
+**核心原理:为什么 compute 时间相对 copy 特别少。** 一层 6.4GB int8 专家权重,三条路径搬运它:
+
+| 路径 | 带宽 | 搬 6.4GB 耗时 |
+|---|---|---|
+| **PCIe H2D**(DDR→HBM,流式必经)| 23.6 GB/s | **~271ms** ← 瓶颈 |
+| HBM 读(compute 时 cube 读权重)| 1370 GB/s | ~4.7ms |
+| 实际 matmul(M=4096)| — | ~6.7ms |
+
+**PCIe 比 HBM 慢 ~58×**(23.6 vs 1370 GB/s)→ 同一批权重,PCIe 喂进来要 271ms,NPU 读它+算它只要
+~5–7ms。这就是 compute 相对 copy 特别少的根本原因:**weight 的 arithmetic intensity 固定**(每层固定
+6.4GB 字节、FLOPs 随 M 线性),而**搬运它的两端带宽差 58×**。
+
+compute 随 M 涨但始终 < copy:M=4096→6.7ms(占 copy 2%),M=32768→~31ms(占 ~10%),交叉点(compute=copy)
+要 **M≈23 万 token**,现实 prefill(≤32k)永远 copy-bound。
+
+**双缓冲能省的理论上限 = compute 占比(2%~10%)**;但 **2b 实测双缓冲在两个 M 都比 serial 更慢**
+(+5%~+9%)——本 NPU 上**跨 stream overlap 的同步/调度开销(~30–60ms/层)超过了它能省的 compute**。
+即:理论收益(≤10%)< 实现代价(跨 stream 开销)→ **净亏**。
+
+**结论(流水定型)**:
+1. **串行单 slot(default stream)就是最优**:M=32768 时 323.7ms/层 → 43 层 **~13.9s**,vs CPU ~1058s = **~76×**。
+2. **双缓冲不做**——不是它"坏",是 copy-bound 下它能省的本就只有 ≤10%,而跨 stream 开销反吃掉更多 → 实测净亏。
+   serial 还更省 HBM(1 slot 6.4GB)、更简单。
+3. **多流打不破 PCIe 墙**:2 流即饱和 23.6GB/s。**PCIe ~23.6GB/s 是硬墙**,要再快只能多卡/Gen5(§3.4 坐实)。
 
 **2b 余项(并入 2c/checkpoint 加载器)**:真实 checkpoint 一层 256 专家 int8+scale 读取与
 gate/up→w13 拼接顺序、CPU fp32 dequant 数值对照(本 2b 用随机权重验流水/带宽,机制已足)。
+
+### D-阈值. ✅ "长度阈值:短走 hybrid / 长走纯流式"——有价值,但定位是短 prompt 保护(2026-06-10)
+
+**问题**:设一个 prefill 长度阈值 `T`,`S < T` 用现 hybrid、`S ≥ T` 用纯流式 NPU。值不值得?
+
+**数据/原理**:两条路径对 prefill(S token)的 MoE 耗时:
+- **流式**:≈ `43 × 271ms(H2D 固定)+ 43×compute(S)` ≈ **11.7s + 小量**,**几乎与 S 无关**(单遍扫全 256 专家,
+  H2D 占死)。S=512→~11.8s,S=32k→~13.9s。
+- **hybrid**:≈ `0.7ms/token/层 × 43 × S` = **随 S 线性**(实测生产 hybrid prefill ~0.7–0.78ms/token/层,
+  因静态 prefix-32 只接 13% 激活、87% 砸 CPU,≈ 全 CPU)。
+
+**交叉点**:`0.7×43×S = 11700ms` → **S* ≈ 390 token**(0.67→406,0.78→350)。
+- `S < ~400`:hybrid 更快(且越短优势越大——50 token:hybrid ~1.5s vs 流式 11.7s = **8×**);
+- `S > ~400`:hybrid > 11.7s,流式(固定 ~12s)赢,越长赢越多(32k:hybrid ~940s vs 流式 14s = **67×**)。
+
+**结论:有价值,但要看清定位**:
+1. **核心价值 = 防短 prompt 踩流式的 11.7s 固定地板**。流式不管多短都先扫一遍全模型权重(11.7s),
+   对 100-token 的请求是灾难。阈值把短请求路由回 hybrid(亚秒级)→ **混合流量服务器必须有**。
+2. **交叉点 ~400 token 不算小**——真实短请求(单轮对话、短查询)常 < 400 token,这个区间真实存在
+   → 阈值**不是没意义**(用户担心的"值很小就没意义"不成立:400 不小,且越短 hybrid 优势越大)。
+3. **但对本项目目标场景(长序列 > 定义 context,动辄 32k+)阈值几乎不触发**——长 prefill 永远走流式。
+   ∴ 阈值的定位是**通用/混合流量的安全兜底**,不是长序列本身的核心优化。
+4. **实现极便宜**:hybrid 路径就是现生产默认,"S<T 走 hybrid" = 啥都不用改;只在 MoE forward 入口加
+   一个 `if prefill_len >= T: 流式 else: 现状`。`T` 设服务器参数,默认 **512**(略高于交叉点 + page 对齐)。
+5. 附加考量(可选精化):流式还顺带产出 decode 动态热专家池(子目标 2,命中率 ~3× 静态)。若请求要
+   decode 很多 token,即便 prefill 长度略低于 400,流式的更好 decode 池也可能整体更优 → 后续可把 `T`
+   按"预期 decode 长度"微调,但**先按纯 prefill 速度的 ~512 默认**即可。
+
+⇒ **建议实现**(便宜、防灾、参数化),但文档清楚标注:长序列场景下它基本不触发,主要服务混合流量。
 
 ### D. 实现增量(建议顺序,worktree 隔离)
 
@@ -369,8 +417,10 @@ gate/up→w13 拼接顺序、CPU fp32 dequant 数值对照(本 2b 用随机权�
    >   (只 pin 几层,后台从 pageable/mmap 填充)——但 pageable→pinned memcpy 会占 CPU/DDR 带宽。
    > - **HBM slot 形状**:串行单 slot 只需 **1 层**(6.4GB,2b 实测最优);现 `[32,...]` buffer 太小,
    >   需新建一个 `[256,...]` int8 NZ 流式 weight slot。
-3. **[中] prefill 模式选择**:S≥512 走流式(单遍 layer-at-a-time)、<512 走现 hybrid;
-   解耦 attention chunk 与 MoE 单遍(累全 S hidden 再一次 MoE)。
+3. **[中] prefill 模式选择(长度阈值 `T`,见 §D-阈值)**:`S≥T` 走流式(单遍 layer-at-a-time)、
+   `S<T` 走现 hybrid;`T` 设服务器参数默认 512(交叉点 ~400)。短走 hybrid = 现状不改,只在 MoE
+   forward 入口加长度分支。解耦 attention chunk 与 MoE 单遍(累全 S hidden 再一次 MoE)。
+   定位:主要防短 prompt 踩流式 11.7s 地板(混合流量);长序列目标场景几乎总走流式。
 4. **[小] post-prefill 定池 + 1.4s 加载**:top-K 写 mask + 热专家进常驻 slot,切 decode。
 5. 全程边做边量 §3.3 剩余待验(并发互扰、pinned 上限)。
 

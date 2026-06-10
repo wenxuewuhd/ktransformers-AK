@@ -134,9 +134,14 @@ DDR 1.5TB(可用 ~1.46TB)→ GGUF Q8_0(CPU 用,~287GB)+ W8A8 专家副本(NPU �
 
 ### 3.3 ✅ 真实算子实测:NPU MoE 是 **copy-bound,不是 compute-bound**(2026-06-10)
 
-> ⚠️ **关键发现 1**:当前 `--kt-num-gpu-experts 0` → routed experts **全在 CPU**,
-> **NPU grouped-matmul 专家路径在本单卡部署里从未真正跑过**(`kt_ep_wrapper.py:584` 的
-> `if num_gpu_experts > 0` 守护一直为假)。流式方案依赖这条休眠代码路径 → 实现时要先点亮它。
+> ✅ **澄清(2026-06-10 订正,感谢用户指出)**:**生产脚本 `p27_launch_ds4flash_npu.sh`
+> 用 `--kt-num-gpu-experts 32`** → 32/256 专家常驻 HBM 走 NPU grouped-matmul、224 走 CPU,
+> **NPU W8A8 专家路径在生产里一直是活的、已验证的**(decode ~9.5 tok/s,精度保持)。
+> 我前提验证误用了 `_num_expert_0` 变体(`--kt-num-gpu-experts 0`,全 CPU,且默认 MODEL_PATH
+> 是错的——第一次启动失败的根因),所以 **§3.1 是纯 CPU baseline,不是生产形态**。
+> 含义:(a) W8A8 NPU int8 grouped_matmul **不需要从零点亮**,已在生产跑;(b) 现有路径是
+> **固定 32 常驻**,流式方案要把它从"32 常驻"扩成"prefill 期 256 个全部流经 HBM";
+> (c) `longseq` 的 launcher 应改基于 **32-expert 生产脚本**,而非 `_num_expert_0`。
 
 用**真实算子** `npu_grouped_matmul`(sglang `unquant.py:forward_npu` 同款:init_routing_v2 →
 gmm1 → swiglu → gmm2)实测每层 routed-expert FFN(H=4096/I=2048/E=256/top6,bf16,卡5)。
@@ -158,10 +163,14 @@ gmm1 → swiglu → gmm2)实测每层 routed-expert FFN(H=4096/I=2048/E=256/top6
    并行 DMA),或 prefill chunk 太小才省得下专家(但 M≥512 时 256 专家基本全激活,省不了)。
 4. **bf16 权重(12.9GB/层,H2D 546ms)更 copy-bound** → 流式源用 int8 才划算(273ms)。
 
+注:本 bench 用 bf16 grouped_matmul 测**算子速度**;生产 W8A8 路径走
+`CompressedTensorsWNA16MoE.apply` 的 int8 grouped_matmul(已在 32-expert 生产验证),
+compute 量级相近,copy-bound 结论不变(int8 H2D 273ms ≫ compute)。后续可直接量产生产路径每层耗时。
+
 **剩余待验**(实现期边做边量,不阻塞设计):(a) H2D copy 与 NPU compute 真并发时的互扰
 (同一 HBM/总线);(b) 277GB int8 能否常驻 pinned(page-locked 上限)或须 pinned 环形缓冲分段搬;
-(c) 点亮 num_gpu_experts>0 的 W8A8 NPU 路径(当前 gpu_method 硬编码 `CompressedTensorsWNA16MoE`,
-W8A8 在 NPU 上的 int8 grouped_matmul 量化/反量化路径未验)。
+(c) 把现有"32 固定常驻"扩成"prefill 期 256 全流经"——复用 `gpu_method.apply` + `gpu_experts_mask`,
+新增按层 H2D 预取 + 双缓冲 weight slot。
 
 ⚠️ 环境坑(容器重启后):`libhwloc.so.15` 会丢 → `apt-get install -y libhwloc15`
 (kt_ep_wrapper 把 ImportError 吞成 "kt_kernel is not installed");拉服务须显式传

@@ -964,29 +964,42 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
     const bool kt_pt = kt_phase_timing_on();
     std::chrono::high_resolution_clock::time_point kt_m0;
     if (kt_pt) kt_m0 = std::chrono::high_resolution_clock::now();
+    // Tile over (token, hidden-chunk) so decode (qlen=1) still spreads across the
+    // whole pool instead of running the 8-NUMA reduce + from_float on a single core.
+    // F-opt Phase 1 (Session D): merge was ~98us/layer single-core at qlen=1
+    // (~11% of cpu_moe_wall). Only chunk when hidden_type is unblocked (BF16/F16/F32,
+    // blck==1) so an arbitrary element boundary is always valid; block-quant hidden
+    // types fall back to per-token (num_chunks=1), preserving the original behavior.
+    const int H = config.hidden_size;
+    const ggml_type htype = (ggml_type)config.hidden_type;
+    const size_t hsz = ggml_type_size(htype);
+    const int hblck = ggml_blck_size(htype);
+    int num_chunks = 1;
+    if (hblck == 1) {
+      num_chunks = H / 256;
+      if (num_chunks < 1) num_chunks = 1;
+      if (num_chunks > 32) num_chunks = 32;
+    }
+    const int chunk = (H + num_chunks - 1) / num_chunks;
     pool->do_work_stealing_job(
-        qlen, nullptr,
-        [this, output, incremental](int token_nth) {
+        qlen * num_chunks, nullptr,
+        [this, output, incremental, H, htype, hsz, hblck, num_chunks, chunk](int task_id) {
+          const int token_nth = task_id / num_chunks;
+          const int c = task_id % num_chunks;
+          const int e0 = c * chunk;
+          const int e1 = std::min(H, e0 + chunk);
+          if (e0 >= e1) return;
+          float* base0 = local_output_numa[0] + token_nth * H;
           if (incremental) {
-            to_float((uint8_t*)output + token_nth * config.hidden_size * ggml_type_size((ggml_type)config.hidden_type) /
-                                            ggml_blck_size((ggml_type)config.hidden_type),
-                     local_output + token_nth * config.hidden_size, config.hidden_size, (ggml_type)config.hidden_type);
-            for (int e = 0; e < config.hidden_size; e++) {
-              local_output_numa[0][token_nth * config.hidden_size + e] +=
-                  local_output[token_nth * config.hidden_size + e];
-            }
+            to_float((uint8_t*)output + (size_t)(token_nth * H + e0) * hsz / hblck,
+                     local_output + token_nth * H + e0, e1 - e0, htype);
+            for (int e = e0; e < e1; e++) base0[e] += local_output[token_nth * H + e];
           }
-          auto& tp_count = this->tp_count;
-          for (int i = 1; i < tp_count; i++) {
-            for (int e = 0; e < config.hidden_size; e++) {
-              local_output_numa[0][token_nth * config.hidden_size + e] +=
-                  local_output_numa[i][token_nth * config.hidden_size + e];
-            }
+          for (int i = 1; i < this->tp_count; i++) {
+            const float* basei = local_output_numa[i] + token_nth * H;
+            for (int e = e0; e < e1; e++) base0[e] += basei[e];
           }
-          from_float(local_output_numa[0] + token_nth * config.hidden_size,
-                     (uint8_t*)output + token_nth * config.hidden_size * ggml_type_size((ggml_type)config.hidden_type) /
-                                            ggml_blck_size((ggml_type)config.hidden_type),
-                     config.hidden_size, (ggml_type)config.hidden_type);
+          from_float(base0 + e0, (uint8_t*)output + (size_t)(token_nth * H + e0) * hsz / hblck, e1 - e0, htype);
         },
         nullptr);
     if (kt_pt) {

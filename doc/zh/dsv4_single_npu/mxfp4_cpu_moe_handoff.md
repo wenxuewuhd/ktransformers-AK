@@ -22,12 +22,12 @@
 > 但本任务**预计不用改 sglang**；llama.cpp/llamafile 齐全可重编，基线 `.so` 已就位）。
 > 启动脚本自动用本 worktree 的 sglang+kt-kernel，**不用 export PYTHONPATH；端口 8014**。
 >
-> ⚡ **开工第一步（别跳）**：原生 MXFP4 权重正在下载到
-> `/data/public_models/DeepSeekV4/DeepSeek-V4-Flash`（已有至少 1 个 safetensors 就绪）。
-> **注意：建 worktree 的容器里 `/data` 不存在**——先确认你的环境能否看到该路径，看不到就让用户
-> 处理挂载或拷贝。能看到后，立即做 §3 的格式核验（几 KB 的事），确认张量命名/dtype 与
-> `MXFP4SafeTensorLoader`（kt-kernel/python/utils/loader.py:1277）预期一致，再往下走。
-> **单层权重就能开工**（转换器+kernel+微基准全是单层闭环），不用等全量下完。
+> ⚡ **开工状态**：原生 MXFP4 权重正在下载到
+> `/workspace/models/DeepSeekV4/DeepSeek-V4-Flash`（git-lfs 渐进式：135B 指针文件 → 真实 shard）。
+> **格式核验已完成（2026-06-10，见 §3）**：张量命名/dtype/shape 与
+> `MXFP4SafeTensorLoader`（kt-kernel/python/utils/loader.py:1277）完全吻合;分片是**每层专家
+> 独占一个 shard**;**layer 16（shard 00018）已下载完整**——直接拿 layer 16 开工 P1–P4
+> 单层闭环，**不用等全量**（全量只有 P5 端到端验收才需要）。
 >
 > 纪律：任何性能/正确性结论用真实权重 + 输出非零校验；只杀自己 PID/端口、**绝不广播
 > `pkill -f sglang.launch_server`**（内联 pkill 还会自杀 shell）；拉服务前 `npu-smi info` 选空卡
@@ -88,27 +88,31 @@
    路径）、`tools/p27_cpu_moe_reference_check.py`（cosine 对账，要加 torch 侧 mxfp4 LUT 反量化
    参考）、bandwidth handoff §5 的隔离微基准方法（`KTMoEWrapper` + 单层真实权重 + norm>0 校验）。
 
-## 3. ⚡ 开工第一步：权重格式核验（几 KB 的事，别跳）
+## 3. ✅ 权重格式核验（已完成 2026-06-10，实测事实）
 
-1. 确认 `/data/public_models/DeepSeekV4/DeepSeek-V4-Flash` 在当前容器可见（建 worktree 的容器
-   **看不到 `/data`**，必要时让用户挂载/拷贝到 `/workspace/models/` 下）。
-2. 读 `config.json` + `model.safetensors.index.json`（或已就绪 safetensors 的 8 字节头 + JSON header）：
-   - 专家张量命名是否 `…ffn.experts.{i}.w1.weight` / `.scale`（注意 V4 ckpt 可能无 `model.` 前缀，
-     loader 已兼容两种）;
-   - dtype/shape：weight I8 `[2048, 2048]`（gate/up，K=4096 packed 成 K/2）+ scale F8_E8M0
-     `[2048, 128]`；down 对应 `[4096, 1024]` + `[4096, 64]`;
-   - scale 分组沿 **K（输入维）**，group=32——与 GGUF 块方向一致（gate/up 沿 hidden 4096，
-     down 沿 intermediate 2048，同现行 Q8_0 布局 §2.2）。
-3. 任何不一致（命名/打包方向/scale dtype）→ 先报告用户再动手。
+权重目录：`/workspace/models/DeepSeekV4/DeepSeek-V4-Flash`（git-lfs clone，46 shard 渐进下载中）。
+
+| 项 | 实测值 | 与 loader 预期 |
+|---|---|---|
+| 专家张量命名 | `layers.{L}.ffn.experts.{i}.w1/w3/w2.weight` + `.scale`（**无 `model.` 前缀**） | ✅（loader 探测 stripped 形式） |
+| gate/up（w1/w3） | weight `I8 [2048, 2048]`（K=4096 nibble-packed 成 K/2）+ scale `F8_E8M0 [2048, 128]`（K/32） | ✅ |
+| down（w2） | weight `I8 [4096, 1024]` + scale `F8_E8M0 [4096, 64]` | ✅ |
+| scale 分组方向 | 沿 **K（输入维）**，group=32 | ✅ 与 GGUF 块方向一致（gate/up 沿 hidden、down 沿 intermediate，同 Q8_0 布局） |
+| config | `expert_dtype: "fp4"`；非专家权重 FP8 e4m3（NPU 侧不受影响，继续用 W8A8 ckpt） | — |
+| 分片规律 | **每层专家独占一个 shard**（如 shard 00018 = layer 16 全部 1536 个专家张量） | 单层转换只读一个文件 |
+| 已就绪 | **shard 00018（layer 16）完整**（8+header+data == 文件大小，已校验）；shard 00034（layer 32）同尺寸大概率完整 | **拿 layer 16 开工** |
+
+> 判断某 shard 是否下载完：文件 >135B（非 LFS 指针）且 `8 + header_len + max(data_offsets)
+> == 文件大小`（python struct 读前 8 字节 + json header 即可验）。新就绪的层照此自查。
 
 ## 4. 工作计划（按依赖排序，单层即可闭环 P1–P3）
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | P1 类型注册 | vendored ggml（b3173）加 `GGML_TYPE_MXFP4`：`block_mxfp4{uint8 e; uint8 qs[16]}`，`ggml.c` type_traits 表加项（blck=32, size=17, `vec_dot_type=Q8_0`, dequantize_row 供对账）；`loader.py` `GGML_QUANT_SIZES` 加 `(32, 17)`。**enum id 与上游对齐用 39**，C++/Python/转换器三处一致 | 编译过；`GGUFLoader.tensor_info` 能识别 |
-| P2 转换器 | mxfp4 safetensors → 按层 GGUF（`dsv4_layer{i}_mxfp4.gguf`）：`MXFP4SafeTensorLoader` 读 → nibble 原样 repack 成 17B 块 + e8m0 scale 直存（**无损，不过 fp32**）。gguf-py（b3173）不认 39 → 本地扩展 enum 或按 raw bytes 写。⚠️ nibble 序（lo/hi 先后）必须与 P3 kernel 的解包约定一致——坑⑩ 同类雷区 | 单层（layer 3）对账：torch LUT 反量化 GGUF vs `MXFP4SafeTensorLoader` 反量化 ckpt，**逐字节/逐元素相等**（无损所以不是 cosine 是相等） |
-| P3 NEON kernel | 移植上游 `ggml_vec_dot_mxfp4_q8_0`（NEON tbl+SDOT 路径 + scalar 兜底）进 vendored ggml-quants；`kt_llamafile_sgemm` 加 MXFP4×Q8_0 分支（复用 prefetch，行距改 17B 块）；重编 `.so` | `p27_cpu_moe_reference_check.py` layer 3：KTMoEWrapper(MXFP4 GGUF) vs torch 参考，cosine ≥ 0.999（激活 Q8 量化是唯一损失源） |
-| P4 微基准 | bandwidth handoff §5 隔离微基准：单层真实权重、norm>0 校验，扫 96/112/128/144 线程 | 单层 ms 接近减半（~1.41→~0.8ms @128）；记录带宽曲线（字节减半后 knee 可能左移，96 也许就够） |
+| P2 转换器 | mxfp4 safetensors → 按层 GGUF（`dsv4_layer{i}_mxfp4.gguf`）：`MXFP4SafeTensorLoader` 读 → nibble 原样 repack 成 17B 块 + e8m0 scale 直存（**无损，不过 fp32**）。gguf-py（b3173）不认 39 → 本地扩展 enum 或按 raw bytes 写。⚠️ nibble 序（lo/hi 先后）必须与 P3 kernel 的解包约定一致——坑⑩ 同类雷区 | 单层（**layer 16**，shard 00018 已就绪）对账：torch LUT 反量化 GGUF vs `MXFP4SafeTensorLoader` 反量化 ckpt，**逐字节/逐元素相等**（无损所以不是 cosine 是相等） |
+| P3 NEON kernel | 移植上游 `ggml_vec_dot_mxfp4_q8_0`（NEON tbl+SDOT 路径 + scalar 兜底）进 vendored ggml-quants；`kt_llamafile_sgemm` 加 MXFP4×Q8_0 分支（复用 prefetch，行距改 17B 块）；重编 `.so` | `p27_cpu_moe_reference_check.py` layer 16：KTMoEWrapper(MXFP4 GGUF) vs torch 参考，cosine ≥ 0.999（激活 Q8 量化是唯一损失源） |
+| P4 微基准 | bandwidth handoff §5 隔离微基准：layer 16 真实权重、norm>0 校验，扫 96/112/128/144 线程；**A/B 对照用同层 Q8_0**（`/workspace/models/cache/dsv4_layer16.gguf` 现成） | 单层 ms 接近减半（Q8_0 ~1.41ms→~0.8ms @128）；记录带宽曲线（字节减半后 knee 可能左移，96 也许就够） |
 | P5 全量+端到端 | 等全量下载完 → 43 层转换（`--jobs` 多进程）→ `EXTRA_FLAGS`/`KT_WEIGHT` 指向 mxfp4 GGUF 拉服务（端口 8014）→ `KT_DECODE_TIMING=1` 量 cpu_moe_wall | `PORT=8014 bash tools/p27_curl_f2_prompts.sh` 四 prompt 连贯；cpu_moe_wall ~36ms；gen throughput 报数 |
 | P6 收尾 | 文档（本文改 findings）+ commit；`KT_DUMMY_CPU_WEIGHTS` 路径确认对新类型可用（loader 注册后天然支持） | 主干合并见 §7 |
 

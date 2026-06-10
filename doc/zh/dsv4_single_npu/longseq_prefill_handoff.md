@@ -262,10 +262,36 @@ prefill 流式时 256 专家本来就全过一遍 HBM,顺手统计命中 → 直
    (decode token 的 topk 落在常驻 K 内的比例)。命中率高 = prefill→decode 局部性成立 = 方案有效。
    留 `residency` 钩子干净,真·实时刷新/evict 策略交 §8 后续 session。
 
+### C-bis. ✅ 直方图实测(2026-06-10,32-expert 生产配置 + 真实文本 ~89k token/层)
+
+`KT_PREFILL_EXPERT_HIST=1` 已实现并跑通(sglang `kt_ep_wrapper.py` commit `d8c460d6b`,
+guard 住 graph capture/decode);真实文本(repo 文档/源码,token 多样)prefill 后 dump
+`[43×256]`,`analyze_expert_hist.py` 分析:
+
+| K(常驻数)| 动态 top-K 占激活 | 静态 prefix[0:K] | 动态增益 |
+|---|---|---|---|
+| 16 | 25.7% | 6.5% | **3.9×** |
+| 32 | **39.5%** | 12.8% | **3.1×** |
+| 64 | 58.4% | 25.7% | 2.3× |
+| 96 | 71.7% | 38.0% | 1.9× |
+| 128 | 81.5% | 50.0% | 1.6× |
+
+**三个关键结论**:
+1. **冷专家/层 = 0** → 长 prefill **256 专家全激活**,坐实用户判断;流式必须每层搬全 256,省不掉。
+2. **现生产的静态 prefix-K ≈ K/256(=随机水平)**:prefix-32 仅占 12.8%≈12.5%,prefix-128=50%。
+   即**专家 0..K-1 根本不是热的,现静态放置等于没偏好** → NPU 常驻的 32 个只接到 ~13% 激活,87% 砸给 CPU。
+3. **prefill 直方图定的动态 top-K 多接 2–4×**(top-32:39.5% vs 12.8%)。这就是子目标 2 的价值:
+   **同样 32 个 HBM 常驻槽,动态放置让 NPU 命中率 ~3×**,decode 更多激活走快的 NPU、更少砸 CPU。
+   偏度温和(~3×,负载均衡训练所致),要 80% 覆盖需 128/256 常驻 → HBM 预算 vs 命中率可调。
+
+> ⚠️ 当前直方图**跨请求累加**(全局),真实现要**按请求复位**(prefill 开始清零、结束 dump 该请求池)。
+> 测试时混入过退化 filler 数据,已用真实文本多发几次冲淡(冷专家 0、偏度稳定即代表性 OK)。
+> **decode 命中率验证(下方步骤 5)仍待做** —— 这才最终确认 prefill→decode 局部性。
+
 ### D. 实现增量(建议顺序,worktree 隔离)
 
-1. **[小、先做] prefill 专家命中直方图**:`experts_base.py`/`kt_ep_wrapper.py` 加 `count[layer][expert]`
-   累加 + env 门控 + 导出 `[43×K]` 表。低风险、是 decode 准备的产物、独立可测。
+1. **[小、✅ 已做] prefill 专家命中直方图**:`kt_ep_wrapper.py` `KT_PREFILL_EXPERT_HIST=1`
+   累加 `count[layer][expert]` + 导出 `[43×256]` + skew 摘要(commit `d8c460d6b`)。**待补:按请求复位**。
 2. **[中] 流式权重池 + 双缓冲 H2D 预取器**:DDR pinned int8 专家源(或环形缓冲)+ 按层
    H2D(算 L 层时预取 L+1)+ 流式 weight slot;扩 `gpu_experts_mask` 让 prefill 期 256 全上 NPU。
 3. **[中] prefill 模式选择**:S≥512 走流式(单遍 layer-at-a-time)、<512 走现 hybrid;

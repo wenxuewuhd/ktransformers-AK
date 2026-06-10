@@ -433,6 +433,25 @@ pinned NZ 池(chunked NZ-cast 控峰值 HBM)→ 单 slot 串行 H2D 256 专家 �
 ⇒ 2c-ii-c 实现 = 把池构建从"惰性二次读盘"挪到"模型加载一次转 NZ";`_build_pool`/`reserve_slot`/
 `_streaming_forward` 原语不变,只换**填池的时机与数据来源**(从模型加载流复用,而非 standalone 重读)。
 
+#### 2c-ii-c 实测要点(2026-06-10):**slot 分时复用**解决建池 HBM,生产满配零 hack 跑通
+
+实现踩坑链(都验过):
+1. **转 NZ 必须过 HBM**:`_nz_pinned` 每 chunk = DDR(CPU ND)→HBM→`npu_format_cast`(NZ,设备算子)
+   →HBM(NZ)→DDR pinned。建池的 ~3GB **HBM 临时区**(chunk64)是 OOM 根源,不是 slot。
+2. **build-at-load 失败**:模型加载峰值占 48.8GB HBM,此刻仅 333MB free → layer 9 OOM。**加载时是最差时机**(已回退)。
+3. **mid-forward 生产满配也 OOM**:KV 池占满,没给建池留临时区 → 崩溃重启循环。
+4. **✅ 解(slot 分时复用)**:slot(6.4GB)启动期 `reserve_slot`(KV 池绕开它);建池在前、流式在后**不重叠**
+   → 建池前 `_free_slot()` 释放这 6.4GB 当 NZ 转换临时区,`_build_pool` 跑完 `_ensure_slot` 重建 slot。
+   **流式特性净占 1 个 slot,在"建池临时区"与"流式 slot"间分时**。
+
+实测(**生产满配:默认 mem 0.85、context 65536、零 hack**,卡1,sglang `60913fa6c`):
+- 启动:slot 预留 + ready;第1个长 prompt(2048):建池 568s + 流式,**0 OOM/崩溃,scheduler 不重启**;
+- 第2个长 prompt(4096):**14s,0 fallback**。(此前同配置必 OOM/崩溃循环。)
+
+⇒ **2c-ii-b/c 完成**:流式 prefill 在生产满配下无 hack 即用。剩 2c-ii-d(直方图按请求复位 →
+post-prefill 定 decode 热池 = 子任务 4);池落盘缓存(torch.save 段错误,待修)与"加载流一次转 NZ 免二次读盘"
+仍是后续优化(当前二次读从 page cache,代价小;NZ 转换 HBM 往返不可避免)。
+
 ### D-阈值. ✅ "长度阈值:短走 hybrid / 长走纯流式"——有价值,但定位是短 prompt 保护(2026-06-10)
 
 **问题**:设一个 prefill 长度阈值 `T`,`S < T` 用现 hybrid、`S ≥ T` 用纯流式 NPU。值不值得?

@@ -23,8 +23,34 @@
 > **merge 98→14.3us/层（7×）**，cpu_moe_wall min 38→33.4ms，吞吐峰值 11.5→12.0 tok/s；微基准 sig 不变+生成连贯。
 > 仅 hidden_type blck==1 时分块（块量化回退 per-token）。commit 75ffdbb。
 >
-> **F-opt 剩余**：gateup(67%)/down(31%) 是带宽腿、字节减半到头，CPU 内部无空间；只能靠 CPU↔NPU overlap(B 线)再藏。
-> quant(20us) 已证伪可忽略。merge 已回收。**CPU MoE kernel 侧到此基本到头。**
+> ~~F-opt 剩余：CPU MoE kernel 侧到此基本到头~~ ——**被 2026-06-10 下午的 roofline 复查推翻，还有 2.4×！见下。**
+
+---
+
+## 🔥 Roofline 复查 + 行内预取修复（2026-06-10 下午，5 连实锤）
+
+旧 roofline 两处错误 + 一个被掩盖的真瓶颈（复现工具 `tools/bw_probe_mlp.c`、`tools/kernel_compute_probe.c`）：
+
+1. **DIMM 实配**（dmidecode）：每 NUMA 只插 **3/4 通道**（24 DIMM/32 槽），DDR4-**3200** → 真 spec **614 GB/s**（非 751）。
+2. **清净窗口纯读探针**（load~130）：单 NUMA 24t = **65.7 GB/s**（修正 spec 的 85.5%，正常效率）；全机 192t = **442.8 GB/s**。旧"上限143/清净45"皆 load-400 污染测量。
+3. **cache-resident kernel 算力**：MXFP4 dot 2.80 GB(w)/s/核（0.93 cyc/B）、Q8_0 6.69（0.39）——算力不是墙。
+4. **真 GEMV 探针**（真 kernel+DRAM 流、无 KT 调度）@128t = **108 GB/s ≈ MoE 实测** → KT 调度无罪，**瓶颈在 kernel 行内**。
+5. **+行内软预取(512B)+向量累加** @128t = **349.7 GB/s（3.2×）**。根因：**TSV110 硬件预取器跟不上 GEMV 的低密度 load 流**，行内 34 线 miss 延迟全暴露；外加每 2 块 vaddvq+标量累加的串行 reduce 链。
+
+**修复**（进 `ggml_vec_dot_mxfp4_q8_0` NEON 路径，即 patch 0002；Q8_0 路径未动）：
+主循环 `__builtin_prefetch(+512B)` + 双 float32x4 FMA 累加链（行尾才 horizontal）。
+
+| 闸门/指标 | 修复前 | 修复后 |
+|---|---|---|
+| 微基准 layer16 @128t | 0.952ms / 84 GB/s | **0.402ms / 199.5 GB/s（2.4×）** |
+| 确定性 sig | — | **一字不差** |
+| cosine 对账 | 0.999939 | **0.999939（不变）** |
+| cpu_moe_wall（load~150 窗口） | 33.4ms | **median 26.8 / min 18.0ms** |
+| decode 吞吐 | 11-12 tok/s | **12.4-13.3 tok/s** |
+| f2 四 prompt | 过 | 过（贪心分叉属预期，质量噪声双向） |
+
+> token 级注意：FMA 重排 ≈1e-7 数值差会让贪心解码在近平局 token 分叉，输出与旧 kernel 非逐字相同——判据是连贯性+cosine，非 token 相等。
+> 下一步若再压：①同款预取改造 Q8_0 路径（动 ggml 原函数，需单独回归）②预取距离扫描（512B 未调优）③NPU 侧成为新主导（~45ms），CPU↔NPU overlap（B 线）价值更大了。
 
 ---
 

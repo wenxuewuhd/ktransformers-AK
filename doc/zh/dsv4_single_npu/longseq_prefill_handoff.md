@@ -172,7 +172,9 @@ grouped_matmul(动态 per-token 量化)。compute 量级与 bench 相近,copy-bo
 是 docstring 示例默认,**非生产路径**;生产 gpu_method 由 caller 注入。)
 
 **剩余待验**(实现期边做边量,不阻塞设计):(a) H2D copy 与 NPU compute 真并发时的互扰
-(同一 HBM/总线);(b) 277GB int8 能否常驻 pinned(page-locked 上限)或须 pinned 环形缓冲分段搬;
+(同一 HBM/总线);(b) ✅ **已验:277GB pinned 可行**——`/tmp/pin_probe.py` 在卡5 上一路 pin 到
+**320 GiB+ 无报错**(DDR 1.5TB),∴ **全 277GB int8 常驻 pinned 做流式源可行,无需环形 staging**;
+(pageable→pinned memcpy 19.1 GiB/s,备选不需要)。
 (c) 把现有"32 固定常驻"扩成"prefill 期 256 全流经"——复用 `gpu_method.apply` + `gpu_experts_mask`,
 新增按层 H2D 预取 + 双缓冲 weight slot。
 

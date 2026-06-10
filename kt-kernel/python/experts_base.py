@@ -64,6 +64,57 @@ def _kt_decode_timing_record(layer_idx: int, wall_ns: int, sync_ns: int, cpu_ns:
 
 
 # -----------------------------------------------------------------------------
+# Lens-1 PREFILL profiling (env-gated, zero cost when off).
+#
+# `KT_PREFILL_TIMING=1` times the CPU MoE submit->sync wall on the prefill path
+# (`submit_forward` records t0; `sync_forward` times `sync()` + total), records
+# the per-forward token count M (= flat batch), accumulates per layer, and prints
+# one summary line per prefill chunk (detected by layer_idx wrapping back).
+#
+# Purpose: validate sub-goal-1 premise — is long-seq prefill CPU MoE compute-bound?
+#   compute-bound  => per-layer wall grows ~linearly with M (FLOPs ∝ M, weight
+#                     bytes saturate) => compute can hide a streamed weight load.
+#   bandwidth-bound => per-layer wall ~flat in M (weight read dominates) => premise
+#                     fails, streaming adds latency it cannot hide.
+# Compare per-layer wall against NVMe layer-load time (~2.5s/layer @ 2.7GB/s).
+# -----------------------------------------------------------------------------
+_KT_PREFILL_TIMING = os.environ.get("KT_PREFILL_TIMING", "") == "1"
+_kt_pf_t0: Dict[int, int] = {}
+_kt_pf_state = {
+    "cur_ns": 0,         # current chunk: total submit->sync wall (sum over layers)
+    "cur_sync_ns": 0,    # current chunk: sync() blocking wall (sum over layers)
+    "cur_layers": 0,
+    "cur_M": 0,
+    "last_layer": -1,
+    "chunks": 0,
+}
+
+
+def _kt_prefill_timing_record(layer_idx: int, M: int, wall_ns: int, sync_ns: int) -> None:
+    st = _kt_pf_state
+    # New chunk when layer index wraps back (current <= previous).
+    if st["cur_layers"] > 0 and layer_idx <= st["last_layer"]:
+        st["chunks"] += 1
+        w = st["cur_ns"] / 1e6
+        sy = st["cur_sync_ns"] / 1e6
+        nl = st["cur_layers"]
+        per = w / nl if nl else 0.0
+        print(
+            f"[KT_PREFILL_TIMING] chunk#{st['chunks']} M={st['cur_M']} layers={nl} "
+            f"cpu_moe_wall_total={w:.1f}ms (sync={sy:.1f}ms) per_layer={per:.2f}ms",
+            flush=True,
+        )
+        st["cur_ns"] = 0
+        st["cur_sync_ns"] = 0
+        st["cur_layers"] = 0
+    st["cur_ns"] += wall_ns
+    st["cur_sync_ns"] += sync_ns
+    st["cur_layers"] += 1
+    st["cur_M"] = M
+    st["last_layer"] = layer_idx
+
+
+# -----------------------------------------------------------------------------
 # NPU stream-callback bypass.
 #
 # On Ascend NPU, `CPUInfer::submit_with_cuda_stream` calls `aclrtLaunchCallback`,
@@ -718,6 +769,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
             topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
             cuda_stream: CUDA stream for synchronization
         """
+        if _KT_PREFILL_TIMING:
+            _kt_pf_t0[self.layer_idx] = time.perf_counter_ns()
         _immediate_ids, deferred_ids, _buffers, current_slot, next_slot = (
             self._prepare_forward_cpu_buffers(hidden_states, topk_ids, topk_weights)
         )
@@ -819,6 +872,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
         bypass = _should_bypass_stream_callback(hidden_states.device)
+        _kt_pf_presync = time.perf_counter_ns() if _KT_PREFILL_TIMING else 0
         if bypass:
             self.cpu_infer.sync(allow_pending)
         else:
@@ -827,6 +881,15 @@ class BaseMoEWrapper(_MoEBase, ABC):
             ):
                 kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
             self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+        if _KT_PREFILL_TIMING:
+            _kt_pf_t1 = time.perf_counter_ns()
+            _t0 = _kt_pf_t0.pop(self.layer_idx, _kt_pf_presync)
+            _kt_prefill_timing_record(
+                self.layer_idx,
+                int(flat_hidden_states.shape[0]),
+                _kt_pf_t1 - _t0,            # total submit->sync wall
+                _kt_pf_t1 - _kt_pf_presync,  # sync() blocking wall
+            )
 
         if os.environ.get("KT_DEBUG_MOE_OUT", "") == "1":
             oc = output_cpu[current_slot]

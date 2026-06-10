@@ -20,8 +20,8 @@
 > kt-kernel 有 llama.cpp+llamafile 可重编 + 基线 `.so`)。启动脚本自动用本 worktree 的 sglang+kt-kernel,
 > **不用 export PYTHONPATH;端口 8013**。
 >
-> ⚡ **开工第一步(别跳)**:验证子目标 1 前提——测长序列 prefill 的 CPU MoE 是不是计算密集(§3)。
-> 是 → 做流式;仍是带宽瓶颈 → 回报换思路。
+> ⚡ ~~开工第一步:验证子目标 1 前提~~ **已完成(2026-06-10):compute-bound 成立,数据见 §3.1**,
+> 直接进入子目标 1(流式加载)设计实现。
 >
 > 边界:热专家标定已被 B 放弃 → **子目标 2 现在 C 独占**;B 现做 NPU/CPU 并行+MTP,会动 submit/sync/overlap
 > 编排,合并时对齐(§2)。**实时 expert cache/evict 留作后续单独 session**——C 只把 load/evict 原语 +
@@ -81,6 +81,35 @@ B **已放弃热专家标定**,改做 **NPU↔CPU 并行计算效率提升 + MTP
    - prefill **仍是 bandwidth-bound**(和 decode 一样,加载量主导)→ 前提不成立,**回报换思路**。
 
 > 纪律:之前有人没验前提、拿幻象 no-op 当"快参考",坑了数小时。**先实测前提,再动手。**
+
+### 3.1 ✅ 验证结果(2026-06-10):前提成立,prefill CPU MoE 是 compute-bound
+
+方法:`kt-kernel/python/experts_base.py` 加 `KT_PREFILL_TIMING=1` 计时桩(prefill 路径 submit→sync 每层墙钟,
+env 门控零开销);服务器须 **`KT_FORCE_SYNC_SUBMIT=1`** 拉起才能量到真实 CPU 耗时(默认 async 模式
+submit/sync 只入 NPU stream host-callback,host 不阻塞,桩量到的是 ~0.5ms/层的假数据)。
+卡5 / 端口8013 / `CHUNKED_PREFILL_SIZE=32768` / `--kt-cpuinfer 128`,逐档发 prompt(`tools/p27_curl_long_prompt_sweep.sh`)。
+
+| M (tokens) | CPU MoE 每层 | 相对上一档 |
+|---|---|---|
+| 1(decode 形态)| 32.9 ms | —(纯带宽底座)|
+| 512 | 407.9 ms | — |
+| 1024 | 761.0 ms | 1.87× |
+| 2048 | 1504.6 ms | 1.98× |
+| 4096 | 2979.9 ms | 1.98× |
+| 8192 | 6284.4 ms | 2.11× |
+
+判读:**~0.75 ms/token/层,完美线性 → compute-bound**(带宽项即 M=1 的 32.9ms 常数,M≥512 时占比 <8%)。
+对照 NVMe 每层加载 ~2.5s(@2.7GB/s):**M≈3400 交叉;chunk ≥4096 tokens 时每层计算(2.98s/6.28s)
+足以完全掩盖下一层权重的流式加载** → 子目标 1 可做。
+旁证:默认 async overlap 模式端到端比 force-sync 快 ~30%(8192 prefill:188s vs 271s),
+真实配置下"计算伞"同样存在。
+
+原始日志:`tools/longseq_dbg/prefill_premise_server3.log`(sync 模式数据)、
+`prefill_premise_server2.log`(async 模式端到端)、`sync_sweep3.log`。
+
+⚠️ 环境坑(容器重启后):`libhwloc.so.15` 会丢 → `apt-get install -y libhwloc15`
+(kt_ep_wrapper 把 ImportError 吞成 "kt_kernel is not installed");拉服务须显式传
+`MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8`(脚本默认路径错)。
 
 ---
 

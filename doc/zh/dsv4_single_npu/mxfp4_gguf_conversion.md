@@ -106,5 +106,9 @@ MODEL_PATH=/path/to/DeepSeek-V4-Flash-W8A8 \
 bash tools/p27_launch_ds4flash_npu.sh
 ```
 
+服务加载耗时参考：**~2-3.5 分钟**（page cache 热态实测）；**冷盘首启**另加 138GB 的磁盘读时间
+（NVMe ~3GB/s → +45s；SATA SSD ~500MB/s → +4-5min），首启偏慢先 `free -g` 看 cache 再判断。
+
 实测收益（K920 192 核 / 8 NUMA / DDR4-3200 3-of-4 通道，单卡 910B3）：
-cpu_moe_wall 55→~27ms，decode 8.5→~13 tok/s，CPU 权重常驻 275→137GB。
+cpu_moe_wall 55→~17ms（独占）/~27ms（共享 load~150），decode 8.5→**16 tok/s**（独占）/~13（共享），
+CPU 权重常驻 275→137GB。

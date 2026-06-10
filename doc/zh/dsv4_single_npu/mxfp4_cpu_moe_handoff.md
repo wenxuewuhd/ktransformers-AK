@@ -116,6 +116,8 @@
 1. **窗口确认**（5min）：`bw_probe_mlp bw "0-191" 1 8 128 2` 应 ≥400 GB/s；`lat 0 512` 应 ~130-147ns；时序 ×3 稳定。
 2. **微基准基线**（5min）：layer16 @128t ×3 次——共享机记录 median 0.38-0.42 / min 0.37；独占预期 min 不变、**median 收敛到 min+5%**。
 3. **端到端主测**（30min）：8020 拉服务（mxfp4、cpuinfer 128、`KT_DECODE_TIMING=1 KT_MOE_PHASE_TIMING=1`），跑 ≥500 token 长生成，统计 cpu_moe_wall **median/p95/min**。
+   服务加载实测 **~2-3.5 分钟**（2026-06-10 四次启动 1m59s-2m42s，page cache 热态；1.5TB 内存机器 138GB GGUF 全集可驻 cache）。
+   **冷盘首启另加磁盘读时间**：138GB ÷ 盘速（NVMe ~3GB/s → +45s；SATA SSD ~500MB/s → +4-5min）——新机器首启偏慢先 `free -g` 看 cache，别当回归。
    - **判定**：median→17-18ms 且 p95−min <3ms ⇒ 8.5ms 归因邻居成立，回收兑现；
    - 若仍有 ±4-5ms 散布 ⇒ 自家 skew 占大头（fork-join/调度），邻居归因部分推翻——届时 dispatch+skew 那 4.6ms 的结构改造（任务编排重写）的赔率就值得重估。
 4. **线程重扫**（20min）：同窗口 A/B `KT_CPUINFER` 128/144/160——共享机上 160 输在和 sglang 抢核；独占下抢核压力不同，160 可能翻盘（微基准 160 是 -13%）。

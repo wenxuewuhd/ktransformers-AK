@@ -476,9 +476,19 @@ safetensors。目标:**第一条 prompt 无额外建池耗时**(建在加载里)
   `process_weights` 里 `_build_pool_from_stage`(per-layer 从引用 assemble→NZ→pin)→ **免二次读**;
 - 建池在**启动里**完成(`pool built from load-capture: 43 层 in 536~607s`)→ **第一条长 prompt 2048 = 14s
   零建池开销**(达成目标 #1),短 prompt 走 hybrid 2s,0 fallback。
-- ⚠️ **目标 #2"最优"未达**:建池 ~536-607s 是 **DDR 压力 bound**(277GB stage + 277GB 池 + 287GB GGUF
-  共存),向量化 assemble + 去 per-chunk `empty_cache` **没用**。要快需**增量建池**(每层加载完即转 NZ +
-  释放该层 stage,峰值 277GB→~6GB)或**一次性预分配 277GB pinned 池**——更深重构,**暂缓**(主目标已达成)。
+- ⚠️ 初版(引用 stage)建池 ~536-607s 与重读一样慢——**根因(已定位)**:捕获的"引用"是 safetensors
+  **懒 mmap 视图**,真实读发生在 assemble 时(冷缓存)→ "免二次读"只是把读挪了位置。
+
+#### 2c-ii-c3 ✅ 增量建池(2026-06-10,sglang `31446b731`):根治——捕获即物化 + 就地 NZ
+
+- `capture_expert` **物化** memcpy 进该层**最终 pinned ND 缓冲**(shard 页正热);每层 1536 张量凑齐
+  **立即就地 NZ**(chunked ND→HBM→cast→写回**同一块** pinned 字节;单测 bitwise == 整体 cast);
+  **零 stage、零额外缓冲、建池摊进加载循环**;in-loop cast 失败(HBM 紧)defer 到 last-layer 重试。
+- **实测(生产满配 card1)**:每层 NZ 仅 **1.5-1.6s**(旧 13-14s,~9×);43 层全部 in-loop 完成;
+  **启动总 553s**(旧 ~750s);建池新增成本 600s→~400s,其中 NZ 65s,**剩余是必须的一次性 I/O**
+  (240GB 冷专家 NVMe 读 ~90s + 277GB memcpy + 277GB pinning)≈ 物理地板,再快需线程化 capture 流水(边际)。
+- **精度验证 ✓**:3637-token 流式 prefill + 32 token 生成,输出与此前已验证版本**逐字一致**
+  (temp=0 确定性 → 权重 bitwise 没变);sweep 256→hybrid 2s / 2048→20s / 8192→14s,0 fallback。
 
 剩 2c-ii-d(直方图按请求复位 → post-prefill 定 decode 热池 = 子任务 4);池落盘缓存(torch.save 段错误,待修)。
 

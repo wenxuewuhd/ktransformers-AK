@@ -9,10 +9,12 @@
 
 ## 启动提示词(开新 session 时整段贴)
 
-> 你接手 **DeepSeek-V4-Flash 单卡 NPU 的"长序列(序列长度超过定义 context 长度)优化"**,两个子目标:
-> (1) **prefill 逐层流式加载权重**——长序列 prefill 计算密集(M=batch≫1,不像 decode 的 M=1 纯带宽瓶颈)→
-> 逐层流式加载专家权重、用计算掩盖加载延迟,(a) 加速长 prefill、(b) 不必全部 ~275GB 常驻、给超长 context 腾内存;
-> (2) **热专家预加载/不 evict**——用 prefill 命中保留热专家给 decode。
+> 你接手 **DeepSeek-V4-Flash 单卡 NPU 的"长序列(序列长度超过定义 context 长度)优化"**,两个子目标
+> (2026-06-10 方向修正后):
+> (1) **prefill 专家上 NPU 算 + 按层流式 DDR→HBM**——长 prefill M≫1,NPU GEMM 远快于 CPU;每层专家
+> W8A8 ~6.4GB 按层 H2D 双缓冲流入 HBM(算 L 层时预取 L+1),MoE 部分预估 ~90×(§0/§3.2);
+> (2) **prefill 激活分布 → decode 专家池**——prefill 记录专家命中,结束后按命中率把热专家留驻 HBM,
+> decode 热走 NPU、冷走 CPU(复用 gpu_experts_mask/remap,改 post-prefill 动态)。
 >
 > **本文(这份 handoff)就是你的完整起点,从 §0 往下读。**
 >
@@ -20,8 +22,9 @@
 > kt-kernel 有 llama.cpp+llamafile 可重编 + 基线 `.so`)。启动脚本自动用本 worktree 的 sglang+kt-kernel,
 > **不用 export PYTHONPATH;端口 8013**。
 >
-> ⚡ ~~开工第一步:验证子目标 1 前提~~ **已完成(2026-06-10):compute-bound 成立,数据见 §3.1**,
-> 直接进入子目标 1(流式加载)设计实现。
+> ⚡ ~~开工第一步:验证子目标 1 前提~~ **已完成(2026-06-10)**:CPU baseline 见 §3.1,NPU 流式
+> 量化依据见 §3.2;剩一个待实测前提:**910B3 W8A8 grouped matmul 每层耗时**(须 <271ms/层才是
+> 纯 copy-bound 流水)。验完即进入流式 pipeline 设计实现。
 >
 > 边界:热专家标定已被 B 放弃 → **子目标 2 现在 C 独占**;B 现做 NPU/CPU 并行+MTP,会动 submit/sync/overlap
 > 编排,合并时对齐(§2)。**实时 expert cache/evict 留作后续单独 session**——C 只把 load/evict 原语 +
@@ -32,13 +35,19 @@
 
 ---
 
-## 0. 任务(两个子目标)
+## 0. 任务(两个子目标,2026-06-10 方向修正)
 
-1. **prefill 逐层流式加载权重**:长序列 prefill 是**计算密集**(M=batch≫1 的 GEMM,不像 decode 的 M=1
-   纯 DDR 带宽瓶颈)→ 可**逐层流式加载专家权重、用计算掩盖加载延迟**,从而 (a) 加速长 prefill、
-   (b) 不必把全部 ~275GB 权重常驻,给超长 context(KV cache)腾内存。
-2. **热专家预加载 / 不 evict**:用 prefill 阶段观察到的专家命中,**保留(不驱逐)这些热专家**,
-   让后续 decode 直接命中 NPU。
+> ⚠️ **方向修正(用户澄清)**:流式加载的目的地是 **NPU HBM**,不是 CPU/DDR。
+> 旧表述(NVMe→DDR 的 CPU 侧流式)作废;§3.1 的 CPU 数据保留,作为**要打败的 baseline**。
+
+1. **prefill 阶段专家在 NPU 上算 + 按层流式 DDR→HBM**:长 prefill 的 M=batch≫1,NPU GEMM 远快于
+   CPU MoE(baseline:0.75ms/token/层)→ 每层专家权重(W8A8 ~6.4GB/层)按层 H2D 流入 HBM
+   (算第 L 层时预取第 L+1 层,双缓冲 ~13GB HBM),算完即可让位 → (a) 长 prefill 的 MoE 部分
+   预估 ~90×(32k:~12s vs CPU ~1058s,copy-bound);(b) 专家不必常驻 HBM。
+   数字依据见 §3.2。
+2. **prefill 激活分布 → decode 专家池**:prefill 期间记录 router 的专家命中分布(本来每层专家都流经
+   HBM/NPU),prefill 结束后**按命中率把热专家留驻 HBM 形成 decode 专家池**(HBM 预算内 top-N/层),
+   decode 热专家走 NPU、冷专家走 CPU(复用 `gpu_experts_mask`/remap 机制,改为 post-prefill 动态生成)。
 
 ---
 
@@ -106,6 +115,26 @@ submit/sync 只入 NPU stream host-callback,host 不阻塞,桩量到的是 ~0.5m
 
 原始日志:`tools/longseq_dbg/prefill_premise_server3.log`(sync 模式数据)、
 `prefill_premise_server2.log`(async 模式端到端)、`sync_sweep3.log`。
+
+### 3.2 ✅ NPU 流式方案的量化依据(2026-06-10,方向修正后)
+
+模型形状(config.json):43 层全 MoE,256 routed experts/层,top-6,expert FFN 4096×2048×3
+→ **每专家 W8A8 ≈ 25.2MB,每层 ≈ 6.4GB,全模型 ≈ 277GB**。
+
+实测(卡5,torch_npu 1GiB copy ×5):**H2D pinned 23.6 GiB/s,pageable 7.9 GiB/s**(流式源必须 pinned)。
+DDR 1.5TB(可用 ~1.46TB)→ GGUF Q8_0(CPU 用,~287GB)+ W8A8 专家副本(NPU 流式源,~277GB)可双份驻留。
+
+| 量 | 值 |
+|---|---|
+| 每层专家 H2D(6.4GB pinned)| ~271 ms |
+| CPU MoE baseline(§3.1)| 0.75 ms/token/层(M=32768 → ~24.6 s/层)|
+| 交叉点 | **M ≈ 360 tokens,prefill chunk 几乎总是赢** |
+| 32k prefill 全程 MoE(43 层流水)| 流式 NPU ~12s vs CPU ~1058s ≈ **90×** |
+| NPU 计算(掩盖在 copy 下的条件)| 每层 FLOPs = M×6×2×25.2M;@32k ~10 TFLOP/层,需 >37 TFLOPS 有效(910B3 int8 量级足够,**待实测 grouped matmul**)|
+| HBM 双缓冲 | ~12.8GB(2×6.4GB),须从 KV pool 预算里让出(`mem_fraction_static` 调整)|
+
+**待实测前提(下一步)**:910B3 上 W8A8 grouped matmul 每层耗时 @ M=4096/8192/32768
+(须 <271ms 才是纯 copy-bound 流水);以及 H2D 与 NPU 计算并发时的互相干扰。
 
 ⚠️ 环境坑(容器重启后):`libhwloc.so.15` 会丢 → `apt-get install -y libhwloc15`
 (kt_ep_wrapper 把 ImportError 吞成 "kt_kernel is not installed");拉服务须显式传

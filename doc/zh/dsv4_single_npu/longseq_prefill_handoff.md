@@ -294,6 +294,29 @@ guard 住 graph capture/decode);真实文本(repo 文档/源码,token 多样)pre
 > 测试时混入过退化 filler 数据,已用真实文本多发几次冲淡(冷专家 0、偏度稳定即代表性 OK)。
 > **decode 命中率验证(下方步骤 5)仍待做** —— 这才最终确认 prefill→decode 局部性。
 
+### D-2a. ✅ 子任务 2a 验证通过(2026-06-10):流式 round-trip 地基成立
+
+`tools/longseq_dbg/stream_2a_roundtrip.py`(自包含,inline 生产算子避 sglang 循环 import)。
+复刻 `NPUW8A8Int8DynamicMoEMethod` 的权重 layout(`w13` int8 [E,2I,H]→transpose→
+`npu_format_cast` FRACTAL_NZ;scale squeeze→bf16)+ prefill 算子 `npu_fused_experts`,
+全 256 专家单层实测(卡4):
+
+| 验证项 | 结果 |
+|---|---|
+| **NZ 字节经 pinned DDR round-trip** | ✅ H2D 后 `npu_format=29`(NZ 存活),**无需每层 reformat** |
+| **流式输出 vs 权重常驻 reference** | ✅ `max_abs_diff=0.000e+00`(bitwise 一致) |
+| **整层 H2D** | 6.44GB = **308ms(20.9GB/s)** ≈ §3.4 预测 |
+| **compute(M=4096)** | **6.7ms/层**(int8 比 bf16 bench 的 11ms 更快)|
+| **节拍** | max(308,6.7)=308ms → **copy-bound 46×**,坐实 §3.4 |
+
+结论:**流式地基全通**——DDR 源格式对、H2D 对、生产算子吃得下、数值 bitwise 一致、copy-bound 成立。
+NZ 字节直存 DDR 是最快路径(Path-1);ND 存+H2D 后 NZcast 的兜底(Path-2)也对但 reformat ~61ms/层,不需要。
+⚠️ 踩坑:E=256 权重 6.4GB,进程硬崩(ERR99999)会**泄漏 HBM 不释放**(卡5 被 dead PID 占 58GB),
+换空卡跑;`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` 减碎片。
+
+**2a 余项(并入 2b)**:用真实 checkpoint 一层权重 + CPU fp32 dequant 参考对数值(确认 builder 读
+checkpoint 正确);现 2a 用随机权重对"权重常驻 reference",已证流式机制忠实,语义正确性由生产精度背书。
+
 ### D. 实现增量(建议顺序,worktree 隔离)
 
 1. **[小、✅ 已做] prefill 专家命中直方图**:`kt_ep_wrapper.py` `KT_PREFILL_EXPERT_HIST=1`

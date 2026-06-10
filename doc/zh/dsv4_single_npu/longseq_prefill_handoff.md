@@ -378,7 +378,30 @@ compute 随 M 涨但始终 < copy:M=4096→6.7ms(占 copy 2%),M=32768→~31ms(�
 - **NPU 流式输出 vs CPU fp32 dequant 参考:cosine=0.99964,rel_err=0.0265**(int8 dynamic-quant 正常容差)。
 
 ⇒ 加载器读 checkpoint 正确(gate/up 拼接、转置、NZ、scale 全对)+ 生产算子数值忠实,**2a 的 CPU 数值
-对照余项一并补齐**。**2c-i 完成**。剩 2c-ii:把串行流式 loop 接进 sglang prefill forward(碰 B 共享码,§2 对齐)。
+对照余项一并补齐**。**2c-i 完成**。
+
+### D-2c-ii-a. ✅ 子任务 2c-ii-a(2026-06-10):流式接入 sglang,端到端跑通
+
+实现:新模块 `third_party/sglang/.../layers/moe/kt_stream_prefill.py`(sglang commit `d8535b16e`)+
+`kt_ep_wrapper.apply` 顶部 3 行分流(histogram 后,early-return,hybrid 路径 645-707 不动)。
+`KT_PREFILL_STREAM=1` 门控;长 prefill(M≥`KT_PREFILL_STREAM_THRESHOLD`,默认 512)惰性建 277GB
+pinned NZ 池(chunked NZ-cast 控峰值 HBM)→ 单 slot 串行 H2D 256 专家 → 跑生产 `npu_fused_experts`。
+任何失败 `try/except` 回退 hybrid;env off = 零改变。
+
+**端到端实测(卡4)**:
+- 短 prompt(256<512)→ 走 hybrid,无 `[KT_STREAM]`,4s ✓(阈值门控对);
+- 长 prompt(3712 token 真实文本)→ 建池(43 层 592s 一次性,无 OOM)+ 流式,**0 fallback**,
+  **生成连贯中文**(续写 repo 文档,非乱码)→ 流式 prefill 数值正确;
+- 第 2 个长 prompt(4096)→ **池复用不重建,17s,0 fallback**。**vs hybrid ~137s = ~8×**
+  (32k 外推 ~13s vs ~940s ≈ 70×);坐实 §3.4 的 ~13s H2D 地板。
+
+**回退验证**:首测 mem 0.85 时 KV 池占满 → slot OOM → **优雅回退 hybrid,请求仍 200**(安全机制对)。
+
+⚠️ **2c-ii-b 待解(内存预算)**:流式 slot(6.4GB)与 KV 池争 HBM。生产 mem-fraction 0.85 下 KV 池占
+57.7GB,slot OOM。测试用 `--max-total-tokens 49152` 压小 KV 池(留 15GB)绕过;**生产需在启动期把 slot
+预留进内存预算**(KV 池按 61-6.4-model 算),而非惰性争抢。另:池建 ~10min 需落盘缓存;直方图按请求复位。
+
+剩 2c-ii-b/c/d(内存预算正解、池缓存、模式参数化、post-prefill 定池→子任务 4)。
 
 ### D-阈值. ✅ "长度阈值:短走 hybrid / 长走纯流式"——有价值,但定位是短 prompt 保护(2026-06-10)
 

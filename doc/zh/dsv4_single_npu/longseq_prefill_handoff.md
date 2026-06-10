@@ -172,9 +172,106 @@ compute 量级相近,copy-bound 结论不变(int8 H2D 273ms ≫ compute)。后�
 (c) 把现有"32 固定常驻"扩成"prefill 期 256 全流经"——复用 `gpu_method.apply` + `gpu_experts_mask`,
 新增按层 H2D 预取 + 双缓冲 weight slot。
 
+### 3.4 ✅ 三带宽反推 + 交叉验证(2026-06-10,用户驱动)
+
+用 **E-sweep**(固定 M=256 使 compute 极小,扫专家数 E)反推:NPU 每层耗时**完美正比于 E
+(=权重字节)**,跨 E 反推的 HBM 带宽恒定 → 证明小 M 下算子是**读专家权重的 HBM 带宽 bound**,
+不是固定开销。脚本 `/tmp/hbm_probe.py`(逻辑同 `npu_grouped_matmul_bench.py`)。
+
+| E | 每层 ms @M=256 | 权重 GB(bf16)| 反推 HBM |
+|---|---|---|---|
+| 64 | 2.34 | 3.2 | 1378 GB/s |
+| 128 | 4.71 | 6.4 | 1369 GB/s |
+| 192 | 7.06 | 9.7 | 1369 GB/s |
+| 256 | 9.46 | 12.9 | 1362 GB/s |
+
+**三带宽(全部实测,落在 910B3 标称合理效率区间)**:
+
+| 带宽 | 反推方法 | 值 | 对标 910B3 | 效率 |
+|---|---|---|---|---|
+| **HBM 读** | E-sweep,time∝E | **~1.37 TB/s** | 标称 ~1.6 TB/s HBM2e | 86% |
+| **算力 bf16** | M-sweep 线性段斜率 1.15µs/token | **~260 TFLOPS** | 标称 ~376 TFLOPS | 70% |
+| **PCIe H2D** | 6.45GB/273ms;直测 pinned 23.6 GiB/s | **~24–25 GB/s** | PCIe Gen4 x16(理论 31.5)| 80% |
+
+**核心比值:HBM : PCIe ≈ 1370 : 25 ≈ 55×。** 同一层 6.45GB int8 专家:从 HBM 读进 cube 仅
+**4.7ms**,经 PCIe 搬进 HBM 要 **~260ms**。NPU 消化权重比 PCIe 喂权重快 ~55 倍 → **这是流式
+永远 copy-bound 的根因**。compute 追平 copy 需 M≈45 万 token,现实 prefill(≤32k)恒 copy-bound。
+
+**架构结论**:
+1. **全模型权重过一遍 PCIe = 277GB / 25GB/s ≈ 11.1s,是长 prefill MoE 的硬地板**(与序列长度无关);
+   vs 纯 CPU ~1058s → ~90×,但本质被 **PCIe 带宽**锁死,不是算力。
+2. NPU 流式期间 ~98% 空闲 → 最优调度 = **逐层流式 + 每层把整条序列全部 token 一次算完再换层**
+   (layer-at-a-time over full sequence),把 260ms H2D 摊到尽量多 token(加 token 近乎免费);
+   与"小 token-chunk × 多层"相反。
+3. 再快只能动 PCIe 侧:多卡并行搬 / Gen5 / 或**热专家常驻 HBM 不重复搬**(= 子目标 2;
+   decode 决不能每 token 付 260ms,必须靠常驻池)。
+
 ⚠️ 环境坑(容器重启后):`libhwloc.so.15` 会丢 → `apt-get install -y libhwloc15`
 (kt_ep_wrapper 把 ImportError 吞成 "kt_kernel is not installed");拉服务须显式传
 `MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8`(脚本默认路径错)。
+
+---
+
+## 3.5 ✅ 实施方案细化:prefill 模式选择(hybrid vs 流式)+ 热专家方案(2026-06-10)
+
+### A. 两种 prefill MoE 执行模式的代价模型(每层)
+
+| 模式 | 每层耗时 | 随 M | 说明 |
+|---|---|---|---|
+| **Hybrid**(现状:32 常驻 NPU + 224 CPU)| `≈ 0.67 ms/token × M` | **线性** | CPU 担 224/256≈87.5% 工作(0.767×0.875),NPU 32 个并行被掩盖;无 H2D |
+| **流式**(256 全部按层 H2D→NPU)| `≈ 260 ms`(固定)| **常数** | int8 6.45GB/层 PCIe 搬运,copy-bound;compute(≤42ms)藏在伞下 |
+
+> 流式 260ms/层只在**单遍扫层**(该层一次算完所有 token)时成立。若内存逼着小 chunk 多遍扫,
+> H2D 要重复 → 流式代价 = `11.2s × ceil(S / M_chunk)`。**∴ 流式必须配大 chunk / layer-at-a-time。**
+
+### B. 划算交叉点(单遍流式,全程 prefill = S tokens)
+
+每层交叉:`0.67·M = 260` → **M* ≈ 388 token**。全程(43 层):
+
+| S (prefill 长度) | Hybrid `0.67·S·43` | 流式 `43×260ms` | 赢家 |
+|---|---|---|---|
+| 256 | 7.4 s | 11.2 s | **hybrid** |
+| 512 | 14.7 s | 11.2 s | 流式(1.3×)|
+| 1024 | 29.5 s | 11.2 s | 流式 2.6× |
+| 4096 | 118 s | 11.2 s | 流式 10× |
+| 8192 | 236 s | 11.2 s | 流式 21× |
+| 32768 | 944 s | 11.2 s | **流式 84×** |
+
+**结论(prefill-only 策略)**:
+- **S ≲ 500 token(短 prompt)→ hybrid**(现状 32 常驻 + CPU);流式的 11.2s 固定扫层不划算。
+- **S ≳ 500 token(长序列,本项目目标场景)→ 流式 + 单遍 layer-at-a-time**;越长越赢。
+- 阈值取整 **512 token** 作为切换点(也对齐 page_size)。
+- **CPU 在流式期一起算?** 流式每层 260ms 内 CPU 至多再消化 ~350 个 assignment(0.26s/0.75ms),
+  vs M×6=20 万 → 贡献 <0.2%,长序列不值得;保持流式=纯 NPU,实现简单。
+
+### C. 热专家分布输出 + decode 加载方案(子目标 2,接 §8 后续 cache session)
+
+**为什么必须有**:decode(M=1)若走流式要付 260ms/层 → 荒谬;必须**热专家常驻 HBM**。
+prefill 流式时 256 专家本来就全过一遍 HBM,顺手统计命中 → 直接定 decode 常驻池。
+
+1. **统计(prefill 期)**:每层维护 `count[layer][expert]`(router topk_ids 累加,zero-copy 计数,
+   按 token 加权)。开销可忽略(一次 scatter-add)。env 门控 `KT_PREFILL_EXPERT_HIST=1`。
+2. **定池(prefill 末)**:每层取 `count` 的 **top-K**(K = 现 HBM 预算的常驻数,当前 32)→
+   写进现有 `gpu_experts_mask` / `logical_to_gpu_index`(本来 init 时按 prefix/frequency 静态定,
+   现改为 **post-prefill 动态**,prompt 自适应)。
+3. **加载**:top-K×43 个热专家从流式 pinned 源 H2D 进**常驻 HBM slot**(复用现 32-slot buffer)
+   = 32×43×25.2MB = 34.6GB / 25GB/s ≈ **1.4s 一次性**,prefill→decode 切换时做。
+4. **产物(为后续 session)**:导出 `[43 × K]` 热专家 id+count 表 + 分布偏度(top-32 占总激活的 %)。
+   偏度高 → 常驻命中率高、residency 划算;偏度平 → 提示后续做更细的 LRU/LFU(§8)。
+5. **验证(子目标 2 的前提,实现期测)**:用 prefill 定的常驻集,量 **decode 阶段命中率**
+   (decode token 的 topk 落在常驻 K 内的比例)。命中率高 = prefill→decode 局部性成立 = 方案有效。
+   留 `residency` 钩子干净,真·实时刷新/evict 策略交 §8 后续 session。
+
+### D. 实现增量(建议顺序,worktree 隔离)
+
+1. **[小、先做] prefill 专家命中直方图**:`experts_base.py`/`kt_ep_wrapper.py` 加 `count[layer][expert]`
+   累加 + env 门控 + 导出 `[43×K]` 表。低风险、是 decode 准备的产物、独立可测。
+2. **[中] 流式权重池 + 双缓冲 H2D 预取器**:DDR pinned int8 专家源(或环形缓冲)+ 按层
+   H2D(算 L 层时预取 L+1)+ 流式 weight slot;扩 `gpu_experts_mask` 让 prefill 期 256 全上 NPU。
+3. **[中] prefill 模式选择**:S≥512 走流式(单遍 layer-at-a-time)、<512 走现 hybrid;
+   解耦 attention chunk 与 MoE 单遍(累全 S hidden 再一次 MoE)。
+4. **[小] post-prefill 定池 + 1.4s 加载**:top-K 写 mask + 热专家进常驻 slot,切 decode。
+5. 全程边做边量 §3.3 剩余待验(并发互扰、pinned 上限)。
 
 ---
 

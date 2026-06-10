@@ -448,9 +448,39 @@ pinned NZ 池(chunked NZ-cast 控峰值 HBM)→ 单 slot 串行 H2D 256 专家 �
 - 启动:slot 预留 + ready;第1个长 prompt(2048):建池 568s + 流式,**0 OOM/崩溃,scheduler 不重启**;
 - 第2个长 prompt(4096):**14s,0 fallback**。(此前同配置必 OOM/崩溃循环。)
 
-⇒ **2c-ii-b/c 完成**:流式 prefill 在生产满配下无 hack 即用。剩 2c-ii-d(直方图按请求复位 →
-post-prefill 定 decode 热池 = 子任务 4);池落盘缓存(torch.save 段错误,待修)与"加载流一次转 NZ 免二次读盘"
-仍是后续优化(当前二次读从 page cache,代价小;NZ 转换 HBM 往返不可避免)。
+⇒ **2c-ii-b/c 完成**:流式 prefill 在生产满配下无 hack 即用。
+
+#### 建池 568s 耗时拆解(2026-06-10,`/tmp/profile_build.py`,单层 warm)
+
+| 子步骤 | 耗时/层 | 说明 |
+|---|---|---|
+| **safetensors 读** | **~3.0s** | 1536 个 per-tensor `get_tensor`(256 专家×3 权重×2)的**调用开销**(非带宽);server 上 page cache 被挤掉还要命中磁盘 |
+| DDR→HBM `.to(dev)` | ~1.3s | pageable H2D |
+| transpose+contiguous | ~0.9s | HBM 重排 |
+| `npu_format_cast`(ND→NZ)| **~0.02s 稳态** | **首次 ~6s 是 TBE kernel 编译(一次性),非瓶颈** |
+| HBM→pinned | ~0.6s | 回写 |
+
+单机干净 ~5.7s/层,server ~13s/层(多出的是 page cache 被挤→磁盘读 + 已 pin 277GB 下再 pin 变慢)。
+**结论:大头是"读 checkpoint",NZ 转换可忽略。** ∴ 把 NZ 转换搬进**模型加载流**(捕获加载时已读的 int8,
+免二次读)是正解优化 → 见 2c-ii-c2。
+
+#### 2c-ii-c2(进行中):NZ 转换搬进加载流,免二次读盘
+
+模型加载的 load 循环本就读了全 256 专家 int8(224 个 CPU 专家的 safetensors 读后被丢弃)。
+做法:load 循环里**捕获**每个专家 int8 进 per-layer DDR staging(memcpy,廉价),加载末(last-layer
+`process_weights_after_loading`)从 staging **一次性建 NZ 池**(slot 分时复用做 HBM 临时区),免再读
+safetensors。目标:**第一条 prompt 无额外建池耗时**(建在加载里)+ **加载流最优**(无二次读)。
+
+**✅ 实测(2026-06-10,sglang `929295453`,生产满配 card0)**:
+- `capture_expert`(`deepseek_v4.py` load 循环)捕获全 256 专家 int8+scale 引用;last-layer
+  `process_weights` 里 `_build_pool_from_stage`(per-layer 从引用 assemble→NZ→pin)→ **免二次读**;
+- 建池在**启动里**完成(`pool built from load-capture: 43 层 in 536~607s`)→ **第一条长 prompt 2048 = 14s
+  零建池开销**(达成目标 #1),短 prompt 走 hybrid 2s,0 fallback。
+- ⚠️ **目标 #2"最优"未达**:建池 ~536-607s 是 **DDR 压力 bound**(277GB stage + 277GB 池 + 287GB GGUF
+  共存),向量化 assemble + 去 per-chunk `empty_cache` **没用**。要快需**增量建池**(每层加载完即转 NZ +
+  释放该层 stage,峰值 277GB→~6GB)或**一次性预分配 277GB pinned 池**——更深重构,**暂缓**(主目标已达成)。
+
+剩 2c-ii-d(直方图按请求复位 → post-prefill 定 decode 热池 = 子任务 4);池落盘缓存(torch.save 段错误,待修)。
 
 ### D-阈值. ✅ "长度阈值:短走 hybrid / 长走纯流式"——有价值,但定位是短 prompt 保护(2026-06-10)
 

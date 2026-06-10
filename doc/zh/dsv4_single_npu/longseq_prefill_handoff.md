@@ -163,9 +163,13 @@ gmm1 → swiglu → gmm2)实测每层 routed-expert FFN(H=4096/I=2048/E=256/top6
    并行 DMA),或 prefill chunk 太小才省得下专家(但 M≥512 时 256 专家基本全激活,省不了)。
 4. **bf16 权重(12.9GB/层,H2D 546ms)更 copy-bound** → 流式源用 int8 才划算(273ms)。
 
-注:本 bench 用 bf16 grouped_matmul 测**算子速度**;生产 W8A8 路径走
-`CompressedTensorsWNA16MoE.apply` 的 int8 grouped_matmul(已在 32-expert 生产验证),
-compute 量级相近,copy-bound 结论不变(int8 H2D 273ms ≫ compute)。后续可直接量产生产路径每层耗时。
+注:本 bench 用 bf16 grouped_matmul 测**算子速度**;✅ **已查清生产 W8A8 NPU 专家路径
+(2026-06-10 代码核实)**:`fused_moe_triton/layer.py:274` `quant_config.get_quant_method()`
+为本 W8A8 模型选 **`NPUCompressedTensorsW8A8Int8DynamicMoE`**(`compressed_tensors_w8a8_int8_moe.py`),
+权重 = **int8 `w13_weight`[E,...] / `w2_weight`[E,...] + bf16 `*_weight_scale`**,走 NPU int8
+grouped_matmul(动态 per-token 量化)。compute 量级与 bench 相近,copy-bound 结论不变
+(int8 H2D 273ms ≫ compute)。(`kt_ep_wrapper.py:315` 硬编码的 `CompressedTensorsWNA16MoE`/Marlin
+是 docstring 示例默认,**非生产路径**;生产 gpu_method 由 caller 注入。)
 
 **剩余待验**(实现期边做边量,不阻塞设计):(a) H2D copy 与 NPU compute 真并发时的互扰
 (同一 HBM/总线);(b) 277GB int8 能否常驻 pinned(page-locked 上限)或须 pinned 环形缓冲分段搬;
@@ -294,6 +298,18 @@ guard 住 graph capture/decode);真实文本(repo 文档/源码,token 多样)pre
    累加 `count[layer][expert]` + 导出 `[43×256]` + skew 摘要(commit `d8c460d6b`)。**待补:按请求复位**。
 2. **[中] 流式权重池 + 双缓冲 H2D 预取器**:DDR pinned int8 专家源(或环形缓冲)+ 按层
    H2D(算 L 层时预取 L+1)+ 流式 weight slot;扩 `gpu_experts_mask` 让 prefill 期 256 全上 NPU。
+
+   > ⚠️ **代码核实后的关键发现(2026-06-10)——现状没有可直接流式的 NPU-layout DDR 源**:
+   > - GPU 专家(`NPUCompressedTensorsW8A8Int8DynamicMoE`)的 int8 `w13/w2` 在 **load 时一次性进 HBM**,
+   >   host 副本随后释放;buffer 形状**固定 `[num_gpu_experts=32, ...]`**(`create_weights` 时定死)。
+   > - CPU 专家在 DDR 但是 **GGUF Q8_0 / AMX llamafile 布局,非 NPU grouped_matmul 可直接消费**。
+   > - ∴ 流式需**新建一个 DDR pinned 池**,存全 256 专家/层的 **NPU int8 布局**(w13/w2 int8 + scale)。
+   >   **好消息**:safetensors checkpoint(`...W8A8`)本就是 int8,转换量小(对齐
+   >   `NPUCompressedTensorsW8A8Int8DynamicMoE.create_weights` 的 layout 即可)。
+   > - **关键待验**:277GB pinned page-locked 上限(§3.3 待验 b);或退而用 pinned 环形 staging
+   >   (只 pin 几层,后台从 pageable/mmap 填充)——但 pageable→pinned memcpy 会占 CPU/DDR 带宽。
+   > - **HBM slot 形状**:prefill 流式不需 256 同时常驻,只要**双缓冲 ~2 层**(2×6.4GB);但现
+   >   `[32,...]` buffer 太小,需新建流式 weight slot(或把 num_gpu_experts 提到双缓冲宽度)。
 3. **[中] prefill 模式选择**:S≥512 走流式(单遍 layer-at-a-time)、<512 走现 hybrid;
    解耦 attention chunk 与 MoE 单遍(累全 S hidden 再一次 MoE)。
 4. **[小] post-prefill 定池 + 1.4s 加载**:top-K 写 mask + 热专家进常驻 slot,切 decode。

@@ -403,6 +403,36 @@ pinned NZ 池(chunked NZ-cast 控峰值 HBM)→ 单 slot 串行 H2D 256 专家 �
 
 剩 2c-ii-b/c/d(内存预算正解、池缓存、模式参数化、post-prefill 定池→子任务 4)。
 
+### D-2c-ii-b. ✅ 内存预算正解(2026-06-10):启动期预留 slot,KV 池绕着它配
+
+`_profile_available_bytes`(`model_runner_kv_cache_mixin.py:65`)按**模型加载后实测的空闲 HBM**算 KV 池。
+∴ 把 6.4GB 流式 slot **在模型加载期就 `reserve_slot`**(`kt_ep_wrapper.process_weights_after_loading`
+调 `kt_stream_prefill.maybe_reserve_slot`),KV 池 profiling 时这 6.4GB 已不在空闲里 → **KV 自动绕开它配**,
+不再惰性争抢/OOM。实测:**生产配置(默认 mem 0.85、context 65536、无任何 hack)直接 `ready to roll`**
++ 启动日志 `reserved streaming slot (6.44GB) at model-load time`。`--max-total-tokens` hack 弃用。
+另:`KT_PREFILL_STREAM_POOL_CACHE=<dir>` 池落盘缓存(每层 .pt),重启从缓存加载免重建。**2c-ii-b 完成**。
+
+### D-2c-ii-c. 设计定调(2026-06-10,用户):NPU 侧统一 NZ,CPU 侧用 GGUF —— 双引擎双布局
+
+**结论**:NZ(FRACTAL_NZ)只有 NPU cube 能吃,GGUF/AMX 只有 CPU AMX/AVX 能吃,**collapse 不成一份**——
+它们服务两个不同计算引擎。但 **NPU 侧应统一成一份 NZ DDR 池**:
+
+| DDR 副本 | 布局 | 服务谁 | 何时建 |
+|---|---|---|---|
+| **NZ int8 池** | FRACTAL_NZ | **所有 NPU 侧**:prefill 流式 + decode 常驻热池(子目标 2) + 启动 32 常驻 | **模型加载时一次转**(下方) |
+| GGUF/AMX | Q8_0/AMX | decode **冷专家的 CPU 计算**(M=1 带宽 bound,流式/全驻都不行) | 现状 |
+
+**改进(替代当前"惰性建池 + 二次读盘")**:当前实现启动读一遍 checkpoint(转 32 HBM-NZ + 224 CPU-GGUF),
+建池**又读第二遍**——冗余。正解:**在模型加载读 checkpoint 那一遍,顺手把全 256 专家转 NZ stash 进 DDR 池**
+(钩 FusedMoE expert 加载 / `process_weights_after_loading`),一次读盘、一份 NZ、prefill+decode-resident
++32-resident 全复用,省第二次读盘 + ~22min 建池。GGUF 那份因 CPU 引擎需要而保留(DDR 共存 ~560GB,放得下)。
+
+为什么 decode 冷专家不能也用 NZ:① 流式进 NPU = 273ms/层×43 ≈ 11.7s/token(荒谬);② 全 256 常驻
+= 277GB 装不下 64GB HBM;③ CPU 跑不了 NZ(AMX 要自己的 packed 布局,逐帧转太贵)→ 只能 CPU+GGUF。
+
+⇒ 2c-ii-c 实现 = 把池构建从"惰性二次读盘"挪到"模型加载一次转 NZ";`_build_pool`/`reserve_slot`/
+`_streaming_forward` 原语不变,只换**填池的时机与数据来源**(从模型加载流复用,而非 standalone 重读)。
+
 ### D-阈值. ✅ "长度阈值:短走 hybrid / 长走纯流式"——有价值,但定位是短 prompt 保护(2026-06-10)
 
 **问题**:设一个 prefill 长度阈值 `T`,`S < T` 用现 hybrid、`S ≥ T` 用纯流式 NPU。值不值得?

@@ -22,9 +22,17 @@ DeepSeek-V4-Flash 官方发布了原生 MXFP4 专家权重（E2M1 nibble + ue8m0
 
 ## 1. 前置
 
-- **代码**：本仓库 `mxfp4-cpu-moe` 分支。vendored `third_party/llama.cpp`（b3173）需打
-  `tools/kt_dsv4_npu_patches/llama_cpp/0002-add-ggml-type-mxfp4.patch`
-  （`git apply -p1`，对 pristine b3173 验证 clean；含 C 侧类型注册 + NEON kernel + gguf-py 枚举）。
+- **代码**：本仓库 `mxfp4-cpu-moe` 分支。vendored `third_party/llama.cpp`（b3173，commit `a94e6ff`）打 patch：
+
+  ```bash
+  cd third_party/llama.cpp   # 干净的 b3173
+  git apply -p1 ../../tools/kt_dsv4_npu_patches/llama_cpp/0001-fix-gguf-NumPy-2-GGUFReader.patch
+  git apply -p1 ../../tools/kt_dsv4_npu_patches/llama_cpp/0002-add-ggml-type-mxfp4.patch
+  ```
+
+  两个 patch 改动文件**不相交**（0001 仅 gguf_reader.py；0002 是 ggml C 侧 + constants.py），顺序无关、均对
+  pristine b3173 clean apply。**0002 永远必须**（MXFP4 类型+NEON kernel 硬依赖）；**0001 在 NumPy≥2 环境必须**
+  （本指南的 L3 校验/转换工具用 GGUFReader 读 GGUF 会触发；serving 本身不依赖它——kt-kernel 自带 GGUF 解析）。
 - **权重**：`huggingface.co/deepseek-ai/DeepSeek-V4-Flash`（46 shard，**逐 shard 验完整**：
   文件 >135B 且 `8 + header_len + max(data_offsets) == 文件大小`；git-lfs 渐进下载常见半截文件）。
   注意 shard 可能**整个缺失**（不是指针文件），用 `model.safetensors.index.json` 对名单。

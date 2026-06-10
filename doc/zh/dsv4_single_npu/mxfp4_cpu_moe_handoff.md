@@ -19,7 +19,12 @@
 > 复现命令见各工具 docstring。重编 `.so` 需 `apt-get install -y libhwloc-dev`（容器重启会丢，连 import 用的 libhwloc15 也会丢）。
 > 拉服务：`NPU_DEVICE_ID=<空卡> PORT=8020 KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' KT_CPUINFER=128 MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 KT_DECODE_TIMING=1 bash tools/p27_launch_ds4flash_npu.sh`
 >
-> **F-opt 后续（基于 P5 KT_PHASE 实测）**：①merge 单核 98us/层×43=4.2ms/token(~11%)→qlen=1 时按 hidden 分块并行(F-opt Phase1 #2a)；②gateup/down 已是带宽腿、字节减半到头，靠 CPU↔NPU overlap(B 线)再藏。quant 已证实可忽略。
+> **F-opt Phase 1 已做（2026-06-10）**：merge_results 按 (token,hidden-chunk) 分块，qlen=1 也铺满 pool。
+> **merge 98→14.3us/层（7×）**，cpu_moe_wall min 38→33.4ms，吞吐峰值 11.5→12.0 tok/s；微基准 sig 不变+生成连贯。
+> 仅 hidden_type blck==1 时分块（块量化回退 per-token）。commit 75ffdbb。
+>
+> **F-opt 剩余**：gateup(67%)/down(31%) 是带宽腿、字节减半到头，CPU 内部无空间；只能靠 CPU↔NPU overlap(B 线)再藏。
+> quant(20us) 已证伪可忽略。merge 已回收。**CPU MoE kernel 侧到此基本到头。**
 
 ---
 

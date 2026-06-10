@@ -317,12 +317,42 @@ NZ 字节直存 DDR 是最快路径(Path-1);ND 存+H2D 后 NZcast 的兜底(Path
 **2a 余项(并入 2b)**:用真实 checkpoint 一层权重 + CPU fp32 dequant 参考对数值(确认 builder 读
 checkpoint 正确);现 2a 用随机权重对"权重常驻 reference",已证流式机制忠实,语义正确性由生产精度背书。
 
+### D-2b. ✅ 子任务 2b(2026-06-10):流水设计定型——**串行单 slot 即最优**,双缓冲无收益
+
+`tools/longseq_dbg/stream_2b_prefetch.py`(复用 2a 函数,卡4,K=6 层 NZ pinned 池实测):
+
+| 方案 | 每层 | 43 层外推 | 备注 |
+|---|---|---|---|
+| **serial 单 slot**(default stream,H2D→compute 串行)| **305ms** | **13.1s** | = PCIe 上限,**就是最优** |
+| 双缓冲(H2D default + compute side stream)| 515ms | 22s | **更慢**:跨 stream overlap 在本 NPU 上有副作用 |
+| 双缓冲(H2D side stream)| 451ms | 19s | 更慢:side-stream H2D 只 10GB/s(半带宽)|
+
+| 多 copy stream 聚合 H2D | 带宽 |
+|---|---|
+| 1 stream | 10.1 GB/s |
+| 2 stream | 20.7 GB/s |
+| 4 stream | 22.5 GB/s(= PCIe Gen4 x16 墙)|
+
+**结论(流水设计定型)**:
+1. **串行单 slot(default stream)就是最优 ~305ms/层 → 43 层 13.1s,vs CPU ~1058s = ~81×**。
+   compute(6.7ms)只占 copy(308ms)2% → overlap 最多省 2%,不值得做双缓冲。
+2. **双缓冲反而更慢**:(a) side-stream H2D 只 10GB/s(默认 stream 21GB/s 的一半);
+   (b) 即便 H2D 放 default、compute 放 side,跨 stream overlap 在本 NPU 上有 ~副作用 → 515ms。
+   ∴ **实现就用最简单的串行单 slot 在 default stream 上 H2D→compute**(也最省 HBM:1 slot 6.4GB)。
+3. **多流打不破 PCIe 墙**:2 流即饱和 ~21GB/s,4 流 22.5 ≈ 单默认流。**PCIe ~21GB/s 是硬墙**
+   (277GB 全模型扫一遍 ~12.3s 硬地板);要再快只能多卡/Gen5(§3.4 结论坐实)。
+4. ⚠️ **集成大坑**:别用 side stream 预取(会掉到半带宽,13s→26s)。H2D 走 default stream。
+
+**2b 余项(并入 2c/checkpoint 加载器)**:真实 checkpoint 一层 256 专家 int8+scale 读取与
+gate/up→w13 拼接顺序、CPU fp32 dequant 数值对照(本 2b 用随机权重验流水/带宽,机制已足)。
+
 ### D. 实现增量(建议顺序,worktree 隔离)
 
 1. **[小、✅ 已做] prefill 专家命中直方图**:`kt_ep_wrapper.py` `KT_PREFILL_EXPERT_HIST=1`
    累加 `count[layer][expert]` + 导出 `[43×256]` + skew 摘要(commit `d8c460d6b`)。**待补:按请求复位**。
-2. **[中] 流式权重池 + 双缓冲 H2D 预取器**:DDR pinned int8 专家源(或环形缓冲)+ 按层
-   H2D(算 L 层时预取 L+1)+ 流式 weight slot;扩 `gpu_experts_mask` 让 prefill 期 256 全上 NPU。
+2. **[中] 流式权重池 + ~~双缓冲~~ 串行 H2D loop**(2a✅/2b✅ 已验流式地基与最优流水):
+   DDR pinned NZ int8 专家池 + **串行单 slot**(default stream:H2D 第 L 层 → 跑算子 → 覆盖搬 L+1)。
+   ~~双缓冲预取~~ 经 2b 实测无收益反更慢(§D-2b)→ **不做**;扩 `gpu_experts_mask` 让 prefill 期 256 全上 NPU。
 
    > ⚠️ **代码核实后的关键发现(2026-06-10)——现状没有可直接流式的 NPU-layout DDR 源**:
    > - GPU 专家(`NPUCompressedTensorsW8A8Int8DynamicMoE`)的 int8 `w13/w2` 在 **load 时一次性进 HBM**,
@@ -333,8 +363,8 @@ checkpoint 正确);现 2a 用随机权重对"权重常驻 reference",已证流�
    >   `NPUCompressedTensorsW8A8Int8DynamicMoE.create_weights` 的 layout 即可)。
    > - **关键待验**:277GB pinned page-locked 上限(§3.3 待验 b);或退而用 pinned 环形 staging
    >   (只 pin 几层,后台从 pageable/mmap 填充)——但 pageable→pinned memcpy 会占 CPU/DDR 带宽。
-   > - **HBM slot 形状**:prefill 流式不需 256 同时常驻,只要**双缓冲 ~2 层**(2×6.4GB);但现
-   >   `[32,...]` buffer 太小,需新建流式 weight slot(或把 num_gpu_experts 提到双缓冲宽度)。
+   > - **HBM slot 形状**:串行单 slot 只需 **1 层**(6.4GB,2b 实测最优);现 `[32,...]` buffer 太小,
+   >   需新建一个 `[256,...]` int8 NZ 流式 weight slot。
 3. **[中] prefill 模式选择**:S≥512 走流式(单遍 layer-at-a-time)、<512 走现 hybrid;
    解耦 attention chunk 与 MoE 单遍(累全 S hidden 再一次 MoE)。
 4. **[小] post-prefill 定池 + 1.4s 加载**:top-K 写 mask + 热专家进常驻 slot,切 decode。

@@ -492,6 +492,33 @@ safetensors。目标:**第一条 prompt 无额外建池耗时**(建在加载里)
 
 剩 2c-ii-d(直方图按请求复位 → post-prefill 定 decode 热池 = 子任务 4);池落盘缓存(torch.save 段错误,待修)。
 
+### D-目标2(2026-06-10,进行中):动态 decode 常驻池——机制已通,real-topK 退化待根因
+
+实现(sglang `468ea4662`+`df220520f`,`KT_DYNAMIC_RESIDENT=1`):流式 prefill 期 device bincount
+计每层激活;末层把静态 prefix-32 换成本请求每层 top-32:权重从 DDR NZ 池 host-gather 进 pinned
+staging → 整张量 copy 进 `layer.w13_weight/w2_weight`(**per-slot NZ 切片 copy 字节错误,已验证;
+staging 整张量路径 bitwise == fresh cast**),scale device 索引,三处路由结构**原地**改写
+(KTEP device mask+l2g;kt_kernel pinned CPU mask——C++ 持指针 live 读)。切换 ~21s/请求(可优化)。
+
+**证据链(三次判别实验,全部已提交)**:
+| 实验 | 长 prompt decode | 结论 |
+|---|---|---|
+| `KT_DYN_FORCE_PREFIX=1`(0..31)| ✅ 干净 | **切换机制全对**(权重/双 mask/l2g/graph 原地可见性)|
+| `KT_DYN_FORCE_SET=shift1`(1..32)| ✅ 干净(64 token)| **decode graph 吃非 prefix 集没问题** |
+| 真 top-K(每层异集,id 跨全域)| ✗ ~15 token 后 `_lame` 循环 | **唯一遗留异常** |
+
+**重要方法论结论**:
+1. `readback==False` 但 force-prefix 干净 → param `copy_` 非对称(H2D raw 字节、D2H 格式转换),
+   **权重落位正确**,raw 回读比对不是有效校验。
+2. **短 prompt 输出不可作判据**:CPU(GGUF Q8_0)与 NPU(W8A8)是同一权重两种量化,换常驻集=换量化
+   混合 → 欠定 prompt 贪心天然漂移(force-prefix 的短答案同样答非所问)。判质量须强上下文或定量指标。
+3. prefill top-K share:真 top-K 0.559(单请求局部性强于聚合分布的 0.395!),prefix 0.133 ✓ 自洽。
+
+**下一步(按性价比)**:(a) `FORCE_SET=224..255`(纯高 chunk 固定集)判"高 id 专家提取"嫌疑;
+(b) 每层不同 set 但固定(如 layer L 取 (L*8..L*8+31)%256)判"每层异集"嫌疑;(c) 用 teacher-forced
+logprob(/generate return_logprob)做定量精度指标替代肉眼;(d) 若全过 → real-topK 退化可能是量化混合
+漂移撞上重复吸引子 → 评估接受/缓解(如限制常驻切换比例)。诊断开关:`KT_DYN_FORCE_PREFIX/_FORCE_SET/_SKIP_WEIGHTS`。
+
 ### D-阈值. ✅ "长度阈值:短走 hybrid / 长走纯流式"——有价值,但定位是短 prompt 保护(2026-06-10)
 
 **问题**:设一个 prefill 长度阈值 `T`,`S < T` 用现 hybrid、`S ≥ T` 用纯流式 NPU。值不值得?

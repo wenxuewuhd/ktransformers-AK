@@ -43,3 +43,22 @@ out = path.replace(".pt", f"_top{K}.pt")
 torch.save({"resident_expert_ids": topk_ids, "K": K, "num_experts": E}, out)
 print(f"# proposed decode-resident top{K} table -> {out}  (shape {tuple(topk_ids.shape)})")
 print("# sample layer0 resident ids:", topk_ids[0].tolist()[:16], "...")
+
+# Machine-readable summary sidecar (metadata + conclusions) for durable record.
+import json
+summary = {
+    "source_pt": path,
+    "num_layers": int(L), "num_experts": int(E),
+    "total_hits": int(total), "tokens_per_layer_mean": int(tokens.float().mean()),
+    "K": K,
+    "dynamic_topK_share": {"mean": round(share_per_layer.mean().item(), 4),
+                            "min": round(share_per_layer.min().item(), 4),
+                            "max": round(share_per_layer.max().item(), 4)},
+    "static_prefix_share": round(prefix_share.item(), 4),
+    "dynamic_gain": round((share_per_layer.mean() - prefix_share).item(), 4),
+    "cold_experts_per_layer_mean": round(cold_per_layer.float().mean().item(), 2),
+    "skew_ratio_vs_even": round((share_per_layer.mean() / (K / E)).item(), 2),
+}
+jout = path.replace(".pt", f"_summary_top{K}.json")
+json.dump(summary, open(jout, "w"), indent=2)
+print(f"# summary json -> {jout}")

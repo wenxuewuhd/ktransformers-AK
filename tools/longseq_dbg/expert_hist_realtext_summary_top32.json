@@ -1,0 +1,17 @@
+{
+  "source_pt": "tools/longseq_dbg/expert_hist_realtext.pt",
+  "num_layers": 43,
+  "num_experts": 256,
+  "total_hits": 23033984,
+  "tokens_per_layer_mean": 89279,
+  "K": 32,
+  "dynamic_topK_share": {
+    "mean": 0.3945,
+    "min": 0.3177,
+    "max": 0.4687
+  },
+  "static_prefix_share": 0.1284,
+  "dynamic_gain": 0.2662,
+  "cold_experts_per_layer_mean": 0.0,
+  "skew_ratio_vs_even": 3.16
+}

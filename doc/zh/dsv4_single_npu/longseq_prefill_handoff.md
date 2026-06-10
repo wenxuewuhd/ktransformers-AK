@@ -126,15 +126,42 @@ DDR 1.5TB(可用 ~1.46TB)→ GGUF Q8_0(CPU 用,~287GB)+ W8A8 专家副本(NPU �
 
 | 量 | 值 |
 |---|---|
-| 每层专家 H2D(6.4GB pinned)| ~271 ms |
+| 每层专家 H2D(6.4GB int8 pinned)| ~273 ms |
 | CPU MoE baseline(§3.1)| 0.75 ms/token/层(M=32768 → ~24.6 s/层)|
-| 交叉点 | **M ≈ 360 tokens,prefill chunk 几乎总是赢** |
-| 32k prefill 全程 MoE(43 层流水)| 流式 NPU ~12s vs CPU ~1058s ≈ **90×** |
-| NPU 计算(掩盖在 copy 下的条件)| 每层 FLOPs = M×6×2×25.2M;@32k ~10 TFLOP/层,需 >37 TFLOPS 有效(910B3 int8 量级足够,**待实测 grouped matmul**)|
-| HBM 双缓冲 | ~12.8GB(2×6.4GB),须从 KV pool 预算里让出(`mem_fraction_static` 调整)|
+| 交叉点(NPU 流式 vs CPU)| **M ≈ 360 tokens**:流式每层固定 ~273ms(copy)vs CPU 0.75×M;chunk≥512 总赢 |
+| 32k prefill 全程 MoE(43 层流水)| 流式 NPU ~11.7s(43×273ms,copy-bound)vs CPU ~1058s ≈ **90×** |
+| HBM 双缓冲 | int8 ~12.8GB(2×6.4GB),须从 KV pool 预算里让出(`mem_fraction_static`)|
 
-**待实测前提(下一步)**:910B3 上 W8A8 grouped matmul 每层耗时 @ M=4096/8192/32768
-(须 <271ms 才是纯 copy-bound 流水);以及 H2D 与 NPU 计算并发时的互相干扰。
+### 3.3 ✅ 真实算子实测:NPU MoE 是 **copy-bound,不是 compute-bound**(2026-06-10)
+
+> ⚠️ **关键发现 1**:当前 `--kt-num-gpu-experts 0` → routed experts **全在 CPU**,
+> **NPU grouped-matmul 专家路径在本单卡部署里从未真正跑过**(`kt_ep_wrapper.py:584` 的
+> `if num_gpu_experts > 0` 守护一直为假)。流式方案依赖这条休眠代码路径 → 实现时要先点亮它。
+
+用**真实算子** `npu_grouped_matmul`(sglang `unquant.py:forward_npu` 同款:init_routing_v2 →
+gmm1 → swiglu → gmm2)实测每层 routed-expert FFN(H=4096/I=2048/E=256/top6,bf16,卡5)。
+脚本 `tools/longseq_dbg/npu_grouped_matmul_bench.py`:
+
+| M | NPU MoE 每层 | TFLOPS | vs int8 H2D 273ms |
+|---|---|---|---|
+| 512 | 9.55 ms | 16 | copy 比它慢 28× |
+| 4096 | 10.95 ms | 113 | copy 慢 25× |
+| 8192 | 15.95 ms | 155 | copy 慢 17× |
+| 16384 | 24.05 ms | 206 | copy 慢 11× |
+| 32768 | 41.62 ms | 238 | copy 慢 6.6× |
+
+**判读(前提成立,但重新定性)**:NPU 计算(@32k 仅 41.6ms/层)**远快于 H2D copy(273ms/层)**
+→ 流式 prefill 是 **copy(H2D 带宽)-bound**,NPU 在等权重时 ~85% 空闲。结论:
+1. **"用计算掩盖加载"反过来成立**:计算稳稳藏在 copy 伞下,流水节拍 = max(273ms copy, 42ms 计算)= **273ms/层**;
+2. 全 32k prefill 的 MoE ≈ **11.7s**(43×273ms),vs CPU ~1058s → **~90× 站得住**;
+3. **下一个优化瓶颈是 H2D 带宽本身**(已 pinned 23.6GiB/s)——要再快得提升有效 H2D(多 copy stream/
+   并行 DMA),或 prefill chunk 太小才省得下专家(但 M≥512 时 256 专家基本全激活,省不了)。
+4. **bf16 权重(12.9GB/层,H2D 546ms)更 copy-bound** → 流式源用 int8 才划算(273ms)。
+
+**剩余待验**(实现期边做边量,不阻塞设计):(a) H2D copy 与 NPU compute 真并发时的互扰
+(同一 HBM/总线);(b) 277GB int8 能否常驻 pinned(page-locked 上限)或须 pinned 环形缓冲分段搬;
+(c) 点亮 num_gpu_experts>0 的 W8A8 NPU 路径(当前 gpu_method 硬编码 `CompressedTensorsWNA16MoE`,
+W8A8 在 NPU 上的 int8 grouped_matmul 量化/反量化路径未验)。
 
 ⚠️ 环境坑(容器重启后):`libhwloc.so.15` 会丢 → `apt-get install -y libhwloc15`
 (kt_ep_wrapper 把 ImportError 吞成 "kt_kernel is not installed");拉服务须显式传

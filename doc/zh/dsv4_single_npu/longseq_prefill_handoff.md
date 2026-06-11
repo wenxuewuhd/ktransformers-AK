@@ -528,11 +528,18 @@ baseline(32 GPU experts,不流式)**也做 NZ 转换**,但没这延迟,两个原
 | 读 + NZ 数据量 | 34.6GB(32×25.2MB×43)| **277GB(8×)** |
 | 那 224 个 CPU 专家从哪加载 | **GGUF**(Q8_0,kt-kernel **C++ 并行 ~6 GB/s,~47s**)| 我又从 safetensors **重读(Python ~1 GB/s)** |
 
-**判读**:① baseline 的 NZ 转换只 34.6GB(1/8 数据)+ 几秒,折进 ~150s 启动里,无感;② **baseline 其实
-也加载了全 256 专家**——32 个走 safetensors→NZ→HBM,**224 个走 GGUF→C++ 快路径**;③ 流式池本质是**把那
-224 个 CPU 专家再加载一遍、但转成 NZ 给 NPU 流式用**,数据量 8× + 读路径比 GGUF C++ 慢 ~6×(Python 1 vs
-C++ 6 GB/s)→ 这两个因子相乘 = ~330s。⇒ **C++ reader 是终极解**:让 safetensors→NZ 也走 GGUF loader 那种
-C++ 并行路径(6 GB/s),8× 数据 / 6× 快路径 ≈ 抵消,建池可压到 ~50s 量级。
+**判读**:① baseline 的 NZ 转换只 34.6GB(1/8 数据)+ 几秒,折进 ~150s 启动里,无感;② 流式池要读 8× 数据;
+③ 我的 Python 读路径(~1 GB/s)比 baseline 的并行 safetensors loader 慢 ~3×。两因子相乘 = ~330s。
+
+> ⚠️ **硬约束(2026-06-11,用户)**:**NPU 只能用 safetensors 的 int8,绝不用 GGUF**。后续 CPU 权重要切
+> **MXFP4**(GGUF 里就没有 NPU 要的 int8 了)→ NPU 流式池**必须**从 safetensors 建。**这点不能违反。**
+> ∴ 之前"像 GGUF loader"的说法要更正:**重点是"并行读 safetensors"这个技术,不是复用 GGUF 数据**。
+
+**正确的优化方向**:**baseline 本来就并行加载 safetensors 到 NPU**(sglang loader 的 executor 多 worker,
+读 ~32 专家 + attn/shared 约 60-75GB 折进 150s,等效 ~3 GB/s)。所以 safetensors 读**能并行也快**——我的
+~1 GB/s 是 **Python 实现问题**。⇒ 终极解 = **让 safetensors→NZ 的读达到 baseline 并行 loader 的 ~3 GB/s**
+(C++ 或复用 sglang loader 的并行机制),配合干掉 Python per-expert rearrange,建池可压到 ~100s 量级。
+**不碰 GGUF。**
 
 - **实测(生产满配 card1)**:每层 NZ 仅 **1.5-1.6s**(旧 13-14s,~9×);43 层全部 in-loop 完成;
   **启动总 553s**(旧 ~750s);建池新增成本 600s→~400s,其中 NZ 65s,**剩余是必须的一次性 I/O**

@@ -635,9 +635,24 @@ H2D 0.18s、D2H 0.22s、**format_cast 0.01s(可忽略)**。chunk 64=35s < 128=40
 `layer.w13_weight.data[s].copy_(slot13[e])`(NPU 切片 format-aware 正确)。验证:`KT_DYN_DIFF` 下 `cos(gpu,ref_res)=1.0000`
 全层;生产配置(图开、无 diff)real-topK decode **完全连贯**(`_layers=1`/`num_layers=43`/`qk_rope_head_dim=64`…无重复)。
 
-**意义**:Goal-2 动态热专家常驻现在**精度正确**。decode 提速(命中 0.13→0.56,预期 ~2×)现在可拿——下一步用
-`paired_decode.py` 同负载配对实测真实倍数。诊断开关 `KT_DYN_DIFF` / `KT_DYN_PROBE`(`maybe_dyn_diff`)、
+**意义**:Goal-2 动态热专家常驻现在**精度正确**。诊断开关 `KT_DYN_DIFF` / `KT_DYN_PROBE`(`maybe_dyn_diff`)、
 算子测 `kernel_decode_vs_prefill.py` / `nz_gather_test.py` 全保留。
+
+**decode 提速实测(2026-06-11,配对同负载,双服务交替长 prompt 120tok,读 gen-throughput 稳态窗口)**:
+| 配置 | decode 稳态 tok/s(8 窗口) | 中位 |
+|---|---|---|
+| A prefix-32(13% 命中)| 3.40/3.89/3.22/3.96/2.35/3.20/2.44/3.62 | **3.31** |
+| B real-topK(share 0.559)| 4.94/4.90/3.82/3.62/4.00/3.81/3.72/3.85 | **3.83** |
+
+**提速 = ratio 中位 1.16× / 均值 1.25×**,远低于 CPU-bound 模型预测的 ~2×。原因(诚实):
+1. **争用压缩**:两服务都在 ~3.3–4 tok/s(远低于安静时 ~9.7),DDR 被邻居容器抢,两条路都饿 → CPU/NPU 专家分割
+   的差异被压扁,ratio 趋近 1。**故 1.2× 是下界**,安静/独占机上预计更高(1.2×~2× 之间),要专机才能定准。
+2. **decode 实际命中率可能 < 0.56**:0.559 是 prefill share,decode(config 列举那种 token)路由未必全落常驻热集。
+3. 固定开销(attention/routing/NPU/H2D)占比比模型设的大。
+
+**成本回归(我的修复引入)**:常驻切换从 ~21s 涨到 ~160s(争用下)——device-gather 每层整池 H2D(43×6.4GB=277GB)。
+一次性/每长 prefill,可优化(只搬常驻、或复用 streaming 已 H2D 的 slot),但当前是真 cost。**净评估:Goal-2 现在
+正确,但单卡当前量化配置下 decode 提速仅 ~1.2×(争用下界)且切换变贵——值不值得上,取决于解码长度与独占带宽。**
 
 ---
 **(以下为修复前的调查记录,保留备查)**

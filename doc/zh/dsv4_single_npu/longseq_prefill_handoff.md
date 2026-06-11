@@ -923,3 +923,11 @@ decode 保持连贯,OOM 安全(失败回退静态集)。
 **代价**:全程 unpin 使流式 prefill H2D 大幅变慢(首请求 237s vs pinned ~14s)。
 **正解**:prefill 期 pin(H2D 快)→ 切换后 unpin(decode 快,~16)→ 下次 prefill 前再 pin;或大池 unpin + 小 pinned bounce buffer 做 H2D。
 两者都能同时拿到 **快 prefill + ~16 decode + 热专家上 NPU**——这才让 MXFP4+热专家 > 16 成立。
+
+### D-B(bounce)不可行(2026-06-11):unpinned→pinned memcpy 太慢,反而更糟
+KT_POOL_BOUNCE=1(池 unpinned + 6.4GB pinned bounce 做 H2D)实测:switch profile **H2D(whole-pool)=235.3s**
+(无 bounce 时 12.6s,~19× 退化),整请求 e2e 730s,decode 仍 ~7。unpinned→pinned 的 host memcpy 走了慢路径
+(+ c3 争用放大),比"直接 unpinned H2D"(237s,KT_POOL_NO_PIN)还慢。**bounce 死路**,代码留作 env-gated(默认 off,
+默认行为=pinned 不变)备查,不再推。
+对比三态(quiet):pinned=prefill 14s/decode 8(税);全 unpinned=prefill 237s/decode 15;bounce=prefill 730s/decode 7(坏)。
+**真正的解是 MXFP4 流式消池(agent ① 已证无损 + 1.8× 快 + 省 277GB,缺 fused 转换 kernel —— agent ② 在探路)。**

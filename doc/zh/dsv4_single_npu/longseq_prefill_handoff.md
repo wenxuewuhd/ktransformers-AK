@@ -864,3 +864,21 @@ per-token 命中率校正)。**教训**:共享机器单测 decode 绝对值无�
 3. 实时缓存策略本身是**独立且丰富的设计空间**,值得专注 session。
 
 ⇒ **C 阶段只需把 load/evict 原语 + residency 钩子留干净、策略做简单版即可**,把"实时刷新/驱逐策略"留给后续 session。
+
+### D-MXFP4合入测试(2026-06-11,✅ 通过):CPU MXFP4 + Goal-2 动态常驻 合一版本
+
+**合入**:`mxfp4-cpu-moe` 干净 merge 进 `longseq-prefill` → 分支 `longseq-mxfp4`(commit 213bf34,无冲突;
+两者正交:MXFP4=kt-kernel `moe.hpp`+GGUF,Goal-2=sglang)。sglang submodule 指针 bump 到 c850eea7e(real-topK fix)。
+MXFP4 .so 复用 kt-D 已构建件(本分支 merge-base 后无 kt-kernel C++ 改动,二进制兼容;手册 §2.4 认可 cp .so 换格式)。
+43 层 MXFP4 GGUF 已就绪。
+
+**组合配置**:`KT_GGUF_TEMPLATE=...dsv4_layer{L}_mxfp4.gguf`(CPU 4-bit MXFP4)+ `KT_PREFILL_STREAM=1`(NPU W8A8 流式)
++ `KT_DYNAMIC_RESIDENT=1`(热专家动态常驻,带修复)。
+
+**测试结果(端到端通过)**:
+- ✅ **连贯**:dynres prompt 解码结构化连贯无重复(`_layers=43`/`qk_rope_head_dim=64`/`qk_norm="l2"`…)。
+- ✅ **事实正确**:acc2 prompt 正确复述"Aurora 官方支持**四种**后端"(=4,正确),连贯续写文档。
+- 切换 share=0.559 fired,decode ~6.86 tok/s(单窗口,与 Q8_0 real-topK ~7–9 同量级)。
+
+**结论:MXFP4-CPU + Goal-2 动态常驻 合一可用、精度正确。** 待办:MXFP4 vs Q8_0 decode 同负载配对实测(MXFP4 半字节,
+预期 CPU MoE decode 更快~30%);切换 ~157s 成本同前(可优化:批量化 gather)。

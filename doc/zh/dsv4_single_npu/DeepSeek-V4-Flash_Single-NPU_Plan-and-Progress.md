@@ -1,34 +1,43 @@
 # DeepSeek-V4-Flash 单卡 910B + K920 CPU MoE —— 总体方案与当前进展（整合版）
 
-> **文档定位**：本文是 DeepSeek-V4-Flash「单卡 Ascend 910B + Kunpeng-920 CPU MoE offload」方案的**唯一现行总纲**,
-> 整合了以下 4 份来源,并对其中**已过时的结论做了显式标注与取代**:
+> **文档定位**：本文是 DeepSeek-V4-Flash「单卡 Ascend 910B + Kunpeng-920 CPU MoE offload」方案的**唯一现行总纲**。
+> 当各来源冲突时**以本文为准**。维护分支：`dsv4_one_card_dev`。
+> **最后更新：2026-06-11**（CPU MoE 换原生 **MXFP4**，搬运字节减半，decode ~8.5→~13–16 tok/s，
+> DRAM 275→137 GiB；Session D 已合入主干 commit `91b9c92`）。
 >
 > | 来源 | 时间 | 角色 | 现状 |
 > |---|---|---|---|
-> | `DeepSeek-V4-Flash-K920-Single-NPU-Spec.md` | 2026-05-12 | 盲写阶段规格书(实施方契约) | 架构/接口仍有效;**量化结论已过时** |
-> | `DeepSeek-V4-Flash-K920-Single-NPU-Handoff.md` | 2026-05-12 | Phase 计划与红线 | 红线仍有效;**Q8_0/KML 结论已过时** |
-> | `DeepSeek-V4-Flash_Ascend_NPU_Single_Card_Handoff.md` | 2026-05-19 | Phase 0/1/2 完成实录 | 大部分现行;graph 状态见 §6.3 |
-> | `DeepSeek-V4-Flash_单卡910B_从0拉起服务全记录.md` | 本会话 | 从 0 拉起的最新实操 | **最新事实基准** |
->
-> 当来源之间冲突时,**以本文为准**;本文又以「全记录」+ 实测为最新事实基准。
-> 维护分支:`dsv4_one_card_dev`。最后更新:2026-06-09(graph decode 提速 ~1.7×,`--kt-cpuinfer` 默认 24→96,见 §6.6)。
+> | `DeepSeek-V4-Flash-K920-Single-NPU-Spec.md` | 05-12 | 盲写规格书 | 架构/接口有效;**量化结论已过时** |
+> | `DeepSeek-V4-Flash-K920-Single-NPU-Handoff.md` | 05-12 | Phase 计划与红线 | 红线有效;**Q8_0/KML 结论已过时** |
+> | `DeepSeek-V4-Flash_单卡910B_从0拉起服务全记录.md` | — | 从 0 拉起实操 | 现行（已刷新为 MXFP4 主线） |
+> | `mxfp4_cpu_moe_handoff.md` / `mxfp4_gguf_conversion.md` | 06-10 | **Session D：CPU MXFP4** | **CPU 侧最新事实基准** |
 
 ---
 
 ## 0. 一句话现状
 
-单卡 910B + K920 的 DeepSeek-V4-Flash(W8A8)推理**已可端到端拉起并输出连贯文本,且 NPU graph
-性能路径已闭合**。当前生产配置:**Q8_0 GGUF(~275 GiB)+ CPU MoE offload + NPU attention + graph-on**。
-**graph capture(坑⑥ `aclrtMemcpy 107030`)+ 图重放跨 stream(`Unsupport run graph`)已于
-2026-06-08 修复并闭环验证**:真实权重 graph-on 全程跑通,decode `npu graph: True` ~3.5–3.9 tok/s
-(达基线 ~3.6,取代 eager ~1.6),F2 四 prompt 连贯(§6.3)。eager 回退仍保留作对照。
+单卡 910B + K920 的 DeepSeek-V4-Flash 推理**已端到端拉起、输出连贯、NPU graph 性能路径闭合**。
+**当前生产配置（2026-06-11）**：
 
-> **2026-06-09 更新(graph decode 提速)**:profiling 发现 CPU MoE 是**内存带宽瓶颈**,而生产
-> `--kt-cpuinfer 24` 只用了 192 核里的 24 核(~4% DDR 带宽)。把 `--kt-cpuinfer` 默认 **24→96**
-> 后,真实权重 decode **3.6 → 6.12 tok/s(~1.7×)**,CPU MoE 215→115ms/token,F2 四 prompt 连贯
-> (精度无损)。**纯配置改动**(commit `68f8556`)。≥128 线程会 thrash 崩,96 是甜点。详见 §6.6 +
-> [graph_decode_profiling_report.md](graph_decode_profiling_report.md)。带宽利用率仍只 ~13%,
-> 进一步提速见 [graph_decode_bandwidth_handoff.md](graph_decode_bandwidth_handoff.md)。
+> **NPU 侧 W8A8**（attention MLA+NSA+Indexer / shared expert / router / 前 32 个常驻 routed expert）
+> **＋ CPU offload 侧原生 MXFP4 GGUF**（其余 224 专家/层，~137 GiB）**＋ graph-on**。
+
+这是「两份权重」混合方案（对标 R1/V3 Ascend 教程的 Q4+W8A8 合并思路）：NPU 吃 W8A8 safetensors，
+CPU 吃由**官方原生 MXFP4 checkpoint** 无损 repack 出来的 GGUF。
+
+**演进账**（decode，真实权重，graph-on）：
+
+| 里程碑 | decode | CPU MoE/token | 备注 |
+|---|---|---|---|
+| eager 基线 | ~1.6 tok/s | — | 功能对照 |
+| graph + `kt-cpuinfer 24` | ~3.6 | ~215 ms | 06-08 graph 闭合 |
+| graph + `kt-cpuinfer 96→128` | ~6.1→8.5 | ~115→55 ms | 06-09 带宽瓶颈定位 |
+| **graph + CPU MXFP4 + 行内预取 kernel** | **~13–16 tok/s** | **~17–27 ms** | **06-11 现行**（清净窗口 ~16，中等争抢 ~13–14，独占实测） |
+
+> 瓶颈定性（不变）：CPU MoE 深度 **memory-bound**（`AI=0.94 MAC/byte ≪ 平衡点 21`），decode 时间
+> 主要花在把专家权重从 DDR 搬一遍。MXFP4 把搬运字节**精确减半**（Q8_0 1.0625 → MXFP4 0.53125 B/元素），
+> 是这一版提速的主因；叠加 kernel 行内软预取（2.4×，根治 TSV110 硬件预取器跟不上 GEMV 低密度 load 流）。
+> 详见 [mxfp4_cpu_moe_handoff.md](mxfp4_cpu_moe_handoff.md) + [graph_decode_bandwidth_findings.md](graph_decode_bandwidth_findings.md)。
 
 ---
 
@@ -40,355 +49,311 @@
 |---|---|
 | **CPU** | Kunpeng-920 5250,4 socket × 48 core = **192 物理核**,8 NUMA(每 NUMA 24 核 ~192 GB),**1.5 TB DRAM** |
 | **CPU ISA** | ARMv8.2-A + `asimddp`(NEON SDOT)+ `asimdhp`/`fphp`(FP16);**无 SVE / 无 BF16 / 无 I8MM / 无 SME** |
-| **NUMA 距离** | 同 die(0,1)/(2,3)…=11;跨 die=24–25;跨 socket=32 |
-| **NPU** | 8 × Atlas 910B1(每张 64 GB HBM);**项目只用 1 张** |
-| **CANN** | 8.5.0,`/usr/local/Ascend/ascend-toolkit/latest` → `/usr/local/Ascend/cann-8.5.0` |
+| **DDR** | 每 NUMA 实插 **3/4 通道**（24 DIMM/32 槽）DDR4-**3200** → 真 spec **614 GB/s**；清净独占聚合 ~442 GB/s |
+| **NPU** | 8 × Atlas 910B（每张 64 GB HBM）;**项目只用 1 张** |
+| **CANN** | 8.5.0,`/usr/local/Ascend/ascend-toolkit/latest` |
 
-> **ISA 红线(R1)**:任何 SVE / BF16 / I8MM 指令(`+sve` march、SVE 汇编、`__bf16`、`smmla`/`usdot`/`ptrue`)
-> 在 K920 上会 **SIGILL**。编译 march 固定 `-march=armv8.2-a+fp16+dotprod`。
+> **ISA 红线(R1)**：任何 SVE / BF16 / I8MM 指令（`+sve` march、SVE 汇编、`__bf16`、`smmla`/`usdot`/`ptrue`）
+> 在 K920 上 **SIGILL**。march 固定 `-march=armv8.2-a+fp16+dotprod`。MXFP4/Q8_0 kernel 只用 NEON
+> `vqtbl1q_s8`（查表）+ `vdotq_s32`（SDOT）。
 
 ### 1.2 软件栈
 
 | 组件 | 版本/路径 |
 |---|---|
-| OS | Ubuntu 22.04 (jammy), aarch64 |
-| Python | `/usr/local/python3.11.14/bin/python3.11`(3.11.14) |
-| PyTorch | `2.8.0+cpu` |
-| torch_npu | `2.8.0.post2`(支持 `pin_memory=True`、`torch.npu.Stream/Event`) |
-| SGLang | 子模块 `third_party/sglang/`(启动前必须 export `PYTHONPATH`) |
-| llama.cpp | 子模块 `third_party/llama.cpp/`,公开 tag **b3173**(`a94e6ff`) |
-| KML | 2.5.0,`/usr/local/kml/`(**仅 Phase 4 候选,当前不链**) |
-| hwloc | `libhwloc-dev 2.7.0-2ubuntu1`(kt-kernel 硬依赖;**每容器需重装**,见 §4.1) |
-| numactl | 已装 |
+| OS / Python | Ubuntu 22.04 aarch64 / `/usr/local/python3.11.14/bin/python3.11` |
+| PyTorch / torch_npu | `2.8.0+cpu` / `2.8.0.post2` |
+| SGLang | 子模块 `third_party/sglang/`，分支 `dsv4_release` @ **`456687a0f`**（含 graph 修复，§6.3） |
+| llama.cpp | 子模块 `third_party/llama.cpp/`，公开 tag **b3173**（`a94e6ff`）+ **patch 0001（NumPy2）+ 0002（MXFP4 类型）** |
+| hwloc | `libhwloc-dev / libhwloc15 2.7.0`（kt-kernel 硬依赖;**每容器需重装**，见 §4.1） |
 
-### 1.3 模型规格(`/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8/config.json`)
+> **子模块 patch 机制（关键）**：vendored llama.cpp 的 ggml 改动**不 commit 进子模块**，全部在
+> `tools/kt_dsv4_npu_patches/llama_cpp/000{1,2}-*.patch`。**`0002` 是 CPU MXFP4 路径的硬依赖**
+> （注册 `GGML_TYPE_MXFP4=39` + NEON kernel + gguf-py 枚举）。两 patch 文件不相交、顺序无关。
 
-| 参数 | 值 |
-|---|---|
-| 层数 `num_hidden_layers` | **43**(全 MoE,`first_k_dense_replace=0`) |
-| `hidden_size` | 4096 |
-| `n_routed_experts` | 256 / 层 |
-| `num_experts_per_tok` | **6**(top-k,注意不是 8) |
-| `n_shared_experts` | 1 / 层 |
-| `moe_intermediate_size` | 2048 |
-| `head_dim` | 512;`num_attention_heads`=64;`num_key_value_heads`=1 |
-| Attention | MLA + NSA(稀疏)+ Lightning Indexer(`index_n_heads`=64,`index_topk`=512,`index_head_dim`=128) |
-| `topk_method` / `scoring_func` | `noaux_tc` / `sqrtsoftplus`;`routed_scaling_factor`=1.5;`norm_topk_prob`=True |
-| `torch_dtype` | bfloat16 |
-| `num_nextn_predict_layers` | 1(speculative,**本项目禁用**) |
+### 1.3 模型规格与两份权重
 
-**W8A8 权重张量**(safetensors,对称量化、无 zero-point、per-output-channel fp32 scale):
+`num_hidden_layers=43`（全 MoE，`first_k_dense_replace=0`）、`hidden_size=4096`、`n_routed_experts=256`、
+`num_experts_per_tok=6`（top-k，**不是 8**）、`n_shared_experts=1`、`moe_intermediate_size=2048`、
+`head_dim=512`、`num_attention_heads=64`、`num_key_value_heads=1`；Attention=MLA+NSA+Lightning Indexer
+（`index_topk=512`）；`num_nextn_predict_layers=1`（MTP，**本项目禁用**，见 [mtp 实测](#)，不划算）。
 
-| 张量(别名) | shape | dtype | scale shape/dtype |
+**两份权重（缺一不可）**：
+
+| 用途 | 路径 | 格式 | 谁用 |
 |---|---|---|---|
-| `…experts.E.gate_proj.weight`(w1) | (2048, 4096) | int8 | (2048,1) fp32 |
-| `…experts.E.up_proj.weight`(w3) | (2048, 4096) | int8 | (2048,1) fp32 |
-| `…experts.E.down_proj.weight`(w2) | (4096, 2048) | int8 | (4096,1) fp32 |
+| **NPU 侧** | `/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8` | W8A8 safetensors（int8 + fp32 per-channel scale） | attention / shared / router / 前 32 常驻专家;启动 `MODEL_PATH` 指它 |
+| **CPU 转换源** | `/workspace/models/DeepSeekV4/DeepSeek-V4-Flash` | **原生 MXFP4**（`expert_dtype:"fp4"`，E2M1 nibble + ue8m0 scale） | 转成 GGUF 喂 CPU offload 专家 |
 
-> 权重根目录共 46 个 safetensors shard,~275 GB。`mlp.gate.weight`(router)与 `shared_experts.*` 留 NPU。
+> 原生 MXFP4 专家张量：`layers.{L}.ffn.experts.{i}.w1/w3/w2.weight`（`I8`，gate/up `[2048,2048]`、
+> down `[4096,1024]`，K nibble-packed 成 K/2）+ `.scale`（`F8_E8M0`，`[2048,128]` / `[4096,64]`，K/32 分组）。
+> 46 shard，**每层专家独占一个 shard**（如 shard 00018 = layer 16）。`router gate` / `shared_experts` 留 NPU（红线 R8）。
+> **Q8_0/BF16（旧 CPU 路径）转换与使用见[附录 A](#附录-aint8q8_0-cpu-权重旧路径附录)。**
 
 ---
 
 ## 2. 系统架构与数据流
 
 ```
-单卡:Atlas 910B (64 GB HBM) + K920 (1.5 TB DRAM, 192 核, 8 NUMA)
+单卡：Atlas 910B (64 GB HBM) + K920 (1.5 TB DRAM, 192 核, 8 NUMA)
 
 input → [NPU: embedding / RoPE / MLA+NSA+Indexer attention]
       → [NPU: MoE router gate → topk_ids, topk_weights(k=6)]
-      → ┌──────────────────────────┬──────────────────────────┐
-        │ NPU experts (N=32 默认)   │ CPU experts (224 默认)     │
-        │ W8A8 safetensors         │ kt-kernel LLAMAFILE GGUF  │
-        │ + shared experts (常驻)   │ (Q8_0 / BF16)             │
-        └──────────────────────────┴──────────────────────────┘
+      → ┌──────────────────────────┬──────────────────────────────┐
+        │ NPU experts (N=32 默认)   │ CPU experts (224 默认)          │
+        │ W8A8 safetensors         │ kt-kernel LLAMAFILE GGUF        │
+        │ + shared experts (常驻)   │ **MXFP4（现行）** / Q8_0（附录） │
+        └──────────────────────────┴──────────────────────────────┘
       → merge → linear + residual → 下一层
 ```
 
 ### 2.1 NPU 端
-- Attention:MLA + NSA + Lightning Indexer + Compressor(SGLang `--attention-backend ascend`)。
-- NPU MoE:`fused_experts_npu`(W8A8),承载前 N 个 routed expert + shared expert + router topk。
-- KV cache:HBM(必要时可 offload DRAM)。
+Attention MLA+NSA+Lightning Indexer+Compressor（SGLang `--attention-backend ascend`）；NPU MoE
+`fused_experts_npu`（W8A8）承载前 N routed + shared + router topk；KV cache 在 HBM。
 
-### 2.2 CPU 端(kt-kernel)
-- backend:LLAMAFILE(`kt-kernel/operators/llamafile/moe.hpp` → `LLAMA_MOE_TP`)。
-- 8 个 NUMA worker pool(每 NUMA 24 **核**;默认 `--kt-cpuinfer 24 --kt-threadpool-count 8` →
-  `24/8 = 3` 线程/subpool,即每 NUMA 3 线程),NEON SDOT 内核。
-- Expert layout(经 Z.2 修复后):
-  - **gate/up**:`(E=256, intermediate=2048, hidden=4096)`,沿 hidden 分 Q8_0 block;
-  - **down**:`(E=256, hidden=4096, intermediate=2048)`,沿 intermediate 分 block。
+### 2.2 CPU 端（kt-kernel）
+- backend：LLAMAFILE（`kt-kernel/operators/llamafile/moe.hpp` → `LLAMA_MOE_TP`）。**对权重量化类型泛化**
+  （buffer 尺寸 / 激活量化 / NUMA TP / 加载加速 / graph callback 全经 ggml `type_traits`，换 MXFP4 这条线不改）。
+- 线程池：8 NUMA worker pool，默认 `--kt-cpuinfer 128 --kt-threadpool-count 8` → **每 NUMA 16 线程**
+  （留 8 核/NUMA 给 NPU host + scheduler）。**`128` 是甜点；192 满核会 thrash 崩**（无余量）。
+- **MXFP4 GEMV kernel**（`ggml_vec_dot_mxfp4_q8_0`，patch 0002）：`vqtbl1q_s8` 查 E2M1 表 → `vdotq_s32`
+  SDOT → e8m0 scale；**行内 `__builtin_prefetch(+512B)` + 双 float32x4 FMA 累加链**（2.4×）。激活在线量化到 Q8_0
+  （`vec_dot_type=Q8_0`，唯一数值损失源，cosine 0.9999）。
+- Expert layout（同 Q8_0 块方向）：gate/up 沿 hidden(4096) 分块、down 沿 intermediate(2048) 分块。
 
-### 2.3 NPU↔CPU 桥(graph callback,任务2)
-- `kt-kernel/cpu_backend/ascend_callback_worker.{cpp,h}`:后台线程 `aclrtSubscribeReport` + 循环
-  `aclrtProcessReport`,把 CPU MoE 的 submit/flush 接进 NPU graph 的 host callback。
-- 关键差异(红线 R2/R3):ACL 的 `aclrtLaunchCallback` **不会自动触发**,必须有专用 poller 线程;
-  否则表现为「卡在 sync、NPU 空闲」。
+### 2.3 NPU↔CPU 桥（graph callback，任务2）
+`kt-kernel/cpu_backend/ascend_callback_worker.{cpp,h}`：后台线程 `aclrtSubscribeReport`+循环
+`aclrtProcessReport`，把 CPU MoE submit/flush 接进 NPU graph host callback。红线 R2/R3：ACL
+`aclrtLaunchCallback` 不会自动触发，必须专用 poller 线程，否则卡 sync、NPU 空闲。
 
 ### 2.4 SGLang 集成
-- 模型:`third_party/sglang/python/sglang/srt/models/deepseek_v4.py`。
-- KT wrapper:`…/layers/moe/kt_ep_wrapper.py`(per-layer `KTMoEWrapper`,`mask_cpu_expert_routing`,
-  prefill/decode 分化,graph 走 host callback)。
-- 设备抽象:`…/utils/kt_accel.py`(CUDA↔NPU stream/event/sync 透明)。
-- Triton 兜底:`triton 3.7 × triton-ascend 3.2` 错配时走 torch 等价实现(`SGLANG_NPU_ALLOC_FORCE_NAIVE=1`),不影响数值。
+模型 `third_party/sglang/.../models/deepseek_v4.py`；KT wrapper `…/layers/moe/kt_ep_wrapper.py`
+（per-layer `KTMoEWrapper`、`mask_cpu_expert_routing`、prefill/decode 分化、graph 走 host callback）；
+设备抽象 `…/utils/kt_accel.py`；Triton 兜底 `SGLANG_NPU_ALLOC_FORCE_NAIVE=1`（不影响数值）。
 
 ---
 
-## 3. 量化与权重方案 ⚠️(关键:旧结论已取代)
+## 3. 量化与权重方案 ⚠️（现行：CPU MXFP4）
 
-### 3.1 现行事实(最新基准)
+### 3.1 现行事实
 
-> **取代声明**:Spec/Handoff(05-12)里「Q8_0 在 aarch64 会 NaN」「MOE_INT8/KML 在 K920 不可用,故必须 BF16(555 GiB)」
-> 的结论**已过时**。实测:**Q8_0(int8)CPU offload 完全可用**,离线对账 cosine ≈ **0.9999**(BF16 ≈ 0.999997)。
+CPU offload 专家用**官方原生 MXFP4**（无损 repack 成 GGUF）。NPU 侧维持 W8A8。
 
-| 格式 | 单层 | 43 层合计 | 现状 |
-|---|---|---|---|
-| **Q8_0** | ~6.85 GiB | **~275 GiB** | **现行生产路径** |
-| BF16 | ~12.9 GiB | ~555 GiB | 数值基线/回退,非必须 |
+| CPU 格式 | 字节/元素 | 单专家 | 最恶劣每层(top-6 全 CPU) | 43 层 DRAM | 现状 |
+|---|---|---|---|---|---|
+| **MXFP4** | **0.53125**（17B/32） | **13.4 MB** | **80 MB** | **~137 GiB** | **现行生产** |
+| Q8_0 | 1.0625（34B/32） | 26.7 MB | 160 MB | ~275 GiB | 旧路径，附录 A |
+| BF16 | 2.0 | ~50 MB | — | ~555 GiB | 数值基线，附录 A |
 
-### 3.2 W8A8 → GGUF 转换
-- 工具:`tools/batch_convert_w8a8_layers_mp.py`(`ProcessPoolExecutor`,`--jobs` = 并发层数)。
-- dequant→requant:`W_fp32 = int8 * fp32_scale[out_ch]`;再按 Q8_0 block(每 32 元 fp16 scale + int8 qs[32])重量化。
-- 调优(本机 192 核):`--jobs 32` 较优(聚合 ~129/192 核,~121 GB RAM,磁盘 I/O 成瓶颈)。
-- 命令见 §4.3。
+> MXFP4 是**官方发布的量化**（训练侧已对齐），转 GGUF 全程 **bit 级无损 repack**——不是再量化，
+> 比"W8A8 int8 再砍到 4bit"的双重量化干净得多。CPU 专家 MXFP4 + NPU 专家 W8A8 混用无碍
+> （各专家独立近似同一母权重）。离线对账 cosine **0.999939** / max_rel 1.12%（唯一损失=激活 Q8）。
+
+### 3.2 原生 MXFP4 → GGUF 转换（现行主路径）
+
+**详细转换 + 三级校验见 [mxfp4_gguf_conversion.md](mxfp4_gguf_conversion.md)。** 要点：
+
+- **nibble 序是核心雷区（坑⑩同类）**：官方 ckpt 是 **consecutive**（byte i = K位 2i/2i+1），上游 GGUF
+  是 **half-block**（qs[j] = K位 j/j+16）。转换器**逐 32-group 重排 nibble**（不是 byte copy！），
+  e8m0 scale 字节原样直存。转换器与 kernel 必须同一约定，对账是裁判。
+- 单层：`tools/convert_mxfp4_layer_to_gguf.py`；全量：`tools/batch_convert_mxfp4_layers_mp.py`。
+- 校验三件套：`verify_mxfp4_layer.py`（GGUF dequant **逐元素 bit-exact** == 原生 dequant）、
+  `p27_cpu_moe_reference_check_mxfp4.py`（kernel cosine 0.9999）、`verify_mxfp4_gguf_set.py`（全集
+  尺寸+sha256+抽样三级，对 `tools/mxfp4_gguf_sha256.txt`）。命令见 §4.3 / §9。
+- 产物：`/workspace/models/cache/dsv4_layer{0..42}_mxfp4.gguf`，每层 **3.42 GiB**，合计 **~138 GiB**。
+  ⚠️ 并发转换曾把某层写截断（576B），**收尾务必逐层 audit 文件大小**（全集校验会 catch）。
 
 ### 3.3 KML / MOE_INT8 —— **不做**
-K920 无 SVE/i8mm,KML `prefillgemm` 的 `usdot`/`ptrue` 内联汇编不可编译;CBLAS `s8s8s32`(NEON)理论可用但
-当前 Q8_0 已满足精度,**不投入 Phase 4**。
+K920 无 SVE/i8mm，KML `usdot`/`ptrue` 不可编译；MXFP4 已满足精度且字节最省，不投入。
 
 ---
 
-## 4. 复现 / 拉起流程
+## 4. 复现 / 拉起流程（从干净 container 起）
 
-### 4.1 每次新 container 需重做的(仅 1 条)
+### 4.1 每次新 container 必做（非持久项）
 
-`/workspace` 挂载持久化:代码、子模块指针、编译产物 `kt_kernel_ext*.so`、GGUF 权重、软链都在。
-**唯一非持久**的是系统 apt 包 hwloc(`~/.ssh`、CANN 镜像层视镜像而定):
+`/workspace` 持久化代码、子模块内容（含 patch apply 态）、`.so`、GGUF 权重。**唯一非持久**是 apt 的 hwloc：
 
 ```bash
-apt-get install -y libhwloc-dev          # 运行期 import kt_kernel 依赖 libhwloc.so.15
+apt-get install -y libhwloc-dev libhwloc15      # 运行期 import kt_kernel 依赖 libhwloc.so.15;cmake 重编也需
 ```
 
-> 自检:`apt` 装好后 `import kt_kernel`、`import torch_npu`、`kt_ep_wrapper` 应一次过;
-> `bash tools/p27_e2e_preflight.sh` → PASS(43 GGUF + kt_kernel_ext 路径)。
+> 若 import 报 "kt_kernel is not installed" 先查 `libhwloc.so.15`。其余（sglang/llama.cpp patch 态、
+> `.so`、MXFP4 GGUF）随 `/workspace` 持久,通常无需重做。
 
-### 4.2 编译 kt-kernel(如需重编;通常 .so 已持久化不必)
+### 4.2 从裸仓复现（仅首次/换机；本机已就绪可跳过）
 
 ```bash
+# (1) 子模块：llama.cpp 钉 b3173 + 打 patch 0001（NumPy2）+ 0002（MXFP4 类型，CPU MXFP4 硬依赖）
+cd third_party/llama.cpp                          # 干净 b3173 (a94e6ff)
+git apply -p1 ../../tools/kt_dsv4_npu_patches/llama_cpp/0001-fix-gguf-NumPy-2-GGUFReader.patch
+git apply -p1 ../../tools/kt_dsv4_npu_patches/llama_cpp/0002-add-ggml-type-mxfp4.patch
+#     sglang 钉 dsv4_release@456687a0f（含 graph 修复）
+
+# (2) 编译 kt-kernel（带 Ascend NPU 后端）
 cd /workspace/code/ktransformers-AK/kt-kernel
 CPUINFER_USE_ASCEND_NPU=1 /usr/local/python3.11.14/bin/python3.11 setup.py build_ext --inplace
-# 预期 march=armv8.2-a+fp16+dotprod;ldd 链接 libascendcl/libruntime;import kt_kernel_ext 不报 undefined symbol
+#     预期 march=armv8.2-a+fp16+dotprod;import kt_kernel_ext 无 undefined symbol
 ```
 
-### 4.3 W8A8 → 43 层 GGUF(Q8_0)
+> ggml 源里出现 `GGML_TYPE_MXFP4 not handled in switch` 警告是**良性**（非 MoE 路径的 op 不需要 mxfp4 分支）。
+
+### 4.3 原生 MXFP4 → 43 层 GGUF（现行主路径）
 
 ```bash
 mkdir -p /workspace/models/cache
-nohup /usr/local/python3.11.14/bin/python3.11 tools/batch_convert_w8a8_layers_mp.py \
-  --input /workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
+nohup /usr/local/python3.11.14/bin/python3.11 tools/batch_convert_mxfp4_layers_mp.py \
+  --input /workspace/models/DeepSeekV4/DeepSeek-V4-Flash \
   --output-dir /workspace/models/cache \
-  --layer-start 0 --layer-end 42 --quant q8_0 --jobs 32 --verify-sample 3 \
-  > /tmp/kt_convert.log 2>&1 &
-# 输出 dsv4_layer{0..42}.gguf
+  --layer-start 0 --layer-end 42 --jobs 16 --verify-sample 3 \
+  > /tmp/kt_mxfp4_convert.log 2>&1 &
+# 输出 dsv4_layer{0..42}_mxfp4.gguf（每层 3.42 GiB，合计 ~138 GiB）
+
+# 收尾全集校验（尺寸 + sha256 + 抽样逐元素）
+python3 tools/verify_mxfp4_gguf_set.py --dir /workspace/models/cache \
+  --sha256-manifest tools/mxfp4_gguf_sha256.txt
 ```
 
-### 4.4 拉起服务
+> 单层快验（开工/换层时）：
+> `python3 tools/convert_mxfp4_layer_to_gguf.py --input <MXFP4模型> --layer-idx 16 --output /tmp/l16.gguf` →
+> `python3 tools/verify_mxfp4_layer.py --gguf /tmp/l16.gguf --layer-idx 16`（bit-exact）。
 
-设备选择:`NPU_DEVICE_ID=<卡号>`(脚本内部 export 成 `ASCEND_RT_VISIBLE_DEVICES`;进程内逻辑为 `npu:0`)。
-启动前先 `npu-smi info` 选空闲卡。
+### 4.4 拉起服务（MXFP4，graph-on）
+
+先 `npu-smi info` 选空闲卡（避开别容器/别 session）。**长跑服务建议在自己的终端前台拉**
+（remote/后台拉的服务父进程上下文会被回收 → `main process disappeared`）。
 
 ```bash
 cd /workspace/code/ktransformers-AK
-
-# (A) 默认:graph-on(性能路径,脚本默认不传 --disable-cuda-graph)
-MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
-NPU_DEVICE_ID=0 \
-bash tools/p27_launch_ds4flash_npu.sh
-
-# (B) 回退:eager + 强制同步(功能正确,见 §6.3 坑⑥⑦)
-MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
-NPU_DEVICE_ID=0 KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" \
-bash tools/p27_launch_ds4flash_npu.sh
-
-# (C) dbg:graph-on + 跳过 CPU MoE 慢加载(输出无意义,仅调 capture/图重放,见 §6.5)
-KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=0 bash tools/p27_launch_ds4flash_npu.sh
+NPU_DEVICE_ID=<空闲卡> PORT=8020 \
+  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' \
+  KT_CPUINFER=128 KT_DECODE_TIMING=1 \
+  MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
+  bash tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/kt_mxfp4_serve.log
 ```
 
-关键 launch 参数:`--device npu --tp 1 --attention-backend ascend --quantization compressed-tensors
---dtype bfloat16 --kt-method LLAMAFILE --kt-num-gpu-experts 32 --kt-weight-path .../dsv4_layer{layer_idx}.gguf
---kt-threadpool-count 8 --kt-cpuinfer 96 --chunked-prefill-size 2048`(**勿传 -1**,见坑⑨)。
-> `--kt-cpuinfer` 现默认 **96**(脚本可用 `KT_CPUINFER` 覆盖;2026-06-09 提速,见 §6.6)。**勿 ≥128**(会 thrash 崩)。
+- `KT_GGUF_TEMPLATE` **必须指 `_mxfp4` 模板**（否则脚本默认走 Q8_0 的 `dsv4_layer{layer_idx}.gguf`）。
+- `MODEL_PATH` 指 **W8A8**（NPU 侧）。两者缺一不可。
+- `KT_CPUINFER` 默认 128（`{layer_idx}` 花括号写法见脚本注释，勿被 `${var:-}` 吃掉）。
+- graph-on 是默认（勿传 `--disable-cuda-graph`）。eager 回退见[附录 A](#附录-aint8q8_0-cpu-权重旧路径附录) / §6.3。
 
-### 4.5 验证(等 ~100s 加载;P0+P1 加载加速前为 ~9 min)
+### 4.5 验证（加载 ~2–3.5 min 热 cache）
 
 ```bash
-curl -sf http://127.0.0.1:8000/health        # 200
-curl -sS -X POST http://127.0.0.1:8000/generate -H 'Content-Type: application/json' \
-  -d '{"text":"中国的首都是","sampling_params":{"max_new_tokens":40,"temperature":0}}'
-# 期望连贯("北京…");若"我,我,我…"退化重复 → 走到了 async 未 flush 路径,用 (B) 回退
+until curl -sf http://127.0.0.1:8020/health >/dev/null; do sleep 5; done   # 就绪
+PORT=8020 bash tools/p27_curl_f2_prompts.sh                                  # 四 prompt 连贯
+curl -sS -X POST http://127.0.0.1:8020/generate -H 'Content-Type: application/json' \
+  -d '{"text":"中国的首都是","sampling_params":{"max_new_tokens":64,"temperature":0}}'
+# 期望连贯（"北京…"）;统计 grep KT_DECODE_TIMING / "gen throughput" /tmp/kt_mxfp4_serve.log
 ```
+
+> ⚠️ **`--max-running-requests 1`，别并发多发**（并发撞争抢窗口会触发 NPU runtime 失稳崩）。单发顺序跑稳。
+> 收服务：跑服务的终端 `Ctrl-C`（优雅释放 HBM）;**绝不 `pkill -f sglang.launch_server`**（杀别 session + 自杀 shell）。
 
 ---
 
-## 5. 全坑汇总(合并 + 现状)
+## 5. 全坑汇总
 
 | # | 现象 | 根因 | 修复 / 现状 |
 |---|------|------|------|
-| ① | CMake 找不到 hwloc | 系统未装 | `apt-get install -y libhwloc-dev`(**每容器**) |
-| ② | llamafile 编译 `llama.cpp/ggml-impl.h: No such file` | llama.cpp 子模块在新版,头文件布局变了 | 钉公开 tag **b3173**(`a94e6ff`);**本会话已固化**(§6.1) |
-| ③ | `import kt_kernel` → `undefined symbol: iqk_mul_mat_moe_arm82` | `iqk_mul_mat_arm82.cpp` 两行 rename `#define` 被注释 | 取消注释 + 重编;**本会话已 commit** |
-| ④ | 转换 `--verify-sample` 报 `newbyteorder` removed | gguf-py NumPy 2.0 不兼容 | apply `tools/kt_dsv4_npu_patches/llama_cpp/0001-*.patch`(只影响读取/校验,不影响权重与 serving) |
-| ⑤ | 启动崩 `quant fp8 != compressed-tensors` / `n_activated_experts` | sglang 子模块切错 fork(无 KT 补丁) | 切 `dsv4_release@a347a9ad5`;**本会话已固化到 yy_repo**(§6.1) |
-| ⑥ | **graph 捕获崩 `aclrtMemcpy 107030`** | `mask_cpu_expert_routing` 内 `gpu_experts_mask.to(device)` 在 capture 期做同步 H2D memcpy | **✅ 已修(2026-06-08)**:`process_weights_after_loading` 内 capture 前把 mask 预搬到 device,`.to()` 短路为 no-op(§6.3 改动一) |
-| ⑥b | graph **重放**崩 `Unsupport run graph with different stream`(ERR03005) | `mask_cpu_expert_routing` 被 `@torch.compile`,NPU torchair 后端把它降为绑定 stream 的独立子图,外层图跨 stream replay 冲突 | **✅ 已修(2026-06-08)**:去掉该函数 `@torch.compile`,eager 折进外层图(§6.3 改动五) |
-| ⑦ | eager 出 token 但乱码(重复) | CPU MoE async submit 未 flush → 输出全零 | `KT_FORCE_SYNC_SUBMIT=1`(§6.3) |
-| ⑧ | Q8_0 aarch64 NaN(历史) | `iqk_mul_mat_arm82`/`tinyBLAS_Q0_ARM` 在 dotprod-only 上 NaN | 已修(无 i8mm 时回退 `ggml_vec_dot_q8_0_q8_0`);Q8_0 现可用 |
-| ⑨ | `--chunked-prefill-size -1` → `malloc unaligned tcache` | `max_len=-1` → C++ 按 1 分配 buffer,prefill 越界 | 默认改 2048;`llamafile.py` ≤0 回落 2048 |
-| ⑩ | W8A8→GGUF layout 错(输出退化 " ! ! !") | 转换器 `permute(2,1,0)` 与 kt-kernel pointer 算术不一致(Z.2) | 去 permute、expert 维 `axis=0` concat;BF16 cosine ≥ 0.999996 |
-| ⑪ | Triton-on-NPU `0 active drivers` | `triton 3.7 × triton-ascend 3.2` 错配 | torch fallback;`SGLANG_NPU_ALLOC_FORCE_NAIVE=1` |
-| ⑫ | apt 镜像签名 403 | Huawei ports 源 GPG | `--allow-unauthenticated -o Acquire::AllowInsecureRepositories=true` |
+| ① | CMake 找不到 hwloc | 系统未装 | `apt-get install -y libhwloc-dev libhwloc15`(**每容器**) |
+| ② | llamafile 编译 `ggml-impl.h: No such file` | llama.cpp 子模块版本错 | 钉 b3173(`a94e6ff`),头在根目录 |
+| ③ | `undefined symbol: iqk_mul_mat_moe_arm82` | `iqk_mul_mat_arm82.cpp` 两行 rename 被注释 | 取消注释 + 重编(已 commit 进主仓) |
+| ④ | `--verify-sample` 报 `newbyteorder` removed | gguf-py NumPy 2.0 不兼容 | patch `0001`(只影响读取/校验) |
+| ⑤ | 启动崩 `quant fp8 != compressed-tensors` | sglang 切错 fork | 切 `dsv4_release@456687a0f` |
+| ⑥/⑥b | graph capture `aclrtMemcpy 107030` / 重放 `Unsupport run graph` | mask H2D 同步 / `@torch.compile` 跨 stream 子图 | **✅ 已修(06-08)**,见 §6.3 |
+| ⑦ | eager 出 token 但乱码 | CPU MoE async submit 未 flush → 全零 | eager 下 `KT_FORCE_SYNC_SUBMIT=1` |
+| ⑧ | Q8_0 aarch64 NaN(历史) | iqk/tinyBLAS dotprod-only NaN | 回退 ggml `vec_dot_q8_0_q8_0`,Q8_0 可用 |
+| ⑨ | `--chunked-prefill-size -1` → malloc 越界 | `max_len=-1` 按 1 分配 | 默认 2048;`llamafile.py` ≤0 回落 |
+| ⑩ | GGUF layout 错 → 输出退化 | nibble/permute 与 pointer 算术不一致 | 去 permute、expert 维 axis=0(Q8_0);**MXFP4 见 ⑬** |
+| ⑪ | Triton-on-NPU `0 active drivers` | triton×triton-ascend 错配 | torch fallback;`SGLANG_NPU_ALLOC_FORCE_NAIVE=1` |
+| ⑫ | apt 镜像签名 403 | Huawei ports GPG | `--allow-unauthenticated -o Acquire::AllowInsecureRepositories=true` |
+| **⑬** | **MXFP4 GGUF 输出乱码/对账偏** | **nibble 序：官方 consecutive vs GGUF half-block 未重排** | **转换器逐 32-group 重排 nibble（非 byte copy）;`verify_mxfp4_layer.py` bit-exact 闸门(§3.2)** |
+| ⑭ | 服务跑一会儿 `main process disappeared` | remote/后台拉的服务父进程上下文被回收 | **长跑服务在自己终端前台拉**（见 §4.4） |
+| ⑮ | 离线单层对账 cand 全零 | 孤立单层调用 stream-callback 路径不回写 | `KT_FORCE_SYNC_SUBMIT=1`（对账脚本已内置） |
 
 ---
 
 ## 6. 当前修改与进展
 
-### 6.1 本会话环境固化 —— 分支 `dsv4_one_card_dev`(5 个 commit)
-
-目的:把「从 patch 已打好但散乱的工作树」固化成**可复现、remote 可达**的基线,供后续 graph 工作干净起步。
-
-| commit | 内容 | 可复现性 |
-|---|---|---|
-| `8b0bbe6` | `[chore](sglang)`:子模块切到 **yy_repo/dsv4_release@a347a9ad5**;`.gitmodules` url → `git@github.com:wenxuewuhd/sglang-dsv4.git` | 已确认 `a347a9ad5` 在 yy_repo 上,裸 clone 可 fetch |
-| `e2343bf` | `[fix](llamafile)`:取消 `iqk_mul_mat_arm82.cpp` 两行 rename 注释(坑③) | 主仓内 vendored 文件,直接生效 |
-| `6b45430` | `[chore](llama.cpp)`:指针 `ac315ccc → a94e6ff`(公开 b3173);url 换公开 `ggerganov/llama.cpp` | 公开可达零鉴权;坑④ NumPy2 修复保留为 tracked patch |
-| `bdd3b88` | `[chore](repo)`:跟踪 `tools/kt_dsv4_npu_patches/`(37 patch + readme,复现包);`.gitignore` 忽略 `.claude/`、`kernel_meta/`、`fusion_result.json`、`kt-kernel/kt_kernel`,并用 `!…/*.patch` 反忽略全局 `*.patch` | 复现链闭合 |
-| `dc4a57f` | `[chore](tools)`:p27 launch 默认 `MODEL_PATH` → `DeepSeekV4/` 实际路径 | — |
-
-**预期残留(非问题)**:`third_party/llama.cpp` 长期显示 `modified content` —— 即坑④ patch 的 apply 态
-(`gguf-py/gguf/gguf_reader.py`),逐行等于 tracked patch,**不要 commit 进子模块**。
-
-**子模块 remote 现状**:
-- sglang → `git@github.com:wenxuewuhd/sglang-dsv4.git`(私有,SSH,需 key)
-- llama.cpp → `https://github.com/ggerganov/llama.cpp.git`(公开)
-- 两者的 `a347a9ad5` / `a94e6ff` 均已确认在对应 remote 可达。
-
-### 6.2 功能进展状态
+### 6.1 功能进展状态
 
 | 模块 | 状态 |
 |---|---|
-| Phase 0 编译期 NPU 适配(CANN aclrt 包装、ARM feature、链接) | ✅ |
-| W8A8 → GGUF(BF16 + Q8_0) | ✅(Q8_0 cosine 0.9999,生产可用) |
-| 单卡整网 wiring(SGLang + CPU MoE) | ✅ HTTP 200,输出连贯 |
-| eager + `KT_FORCE_SYNC_SUBMIT` 功能路径 | ✅(~1.6 tok/s,保留作对照) |
-| **NPU graph + ACL callback worker(任务2)** | **✅ 已闭合(2026-06-08,见 §6.3);decode `npu graph: True` ~3.6 tok/s** |
-| Triton fallback / GGUF layout / chunked-prefill | ✅(坑⑩⑪⑨ 已修) |
+| Phase 0 编译期 NPU 适配 | ✅ |
+| 单卡整网 wiring（SGLang + CPU MoE） | ✅ HTTP 200,连贯 |
+| NPU graph + ACL callback worker | ✅ 闭合(06-08,§6.3) |
+| CPU 权重加载加速(zero-copy + 并行重排) | ✅ 43 层 ~47s(`CPU权重加载加速_P0-P1.md`) |
+| graph decode 提速(kt-cpuinfer 24→96→128 + GEMV prefetch) | ✅ 06-09 |
+| **CPU MoE 原生 MXFP4(字节减半 + kernel 2.4×)** | **✅ 合入主干(06-11,§6.7);decode ~13–16 tok/s** |
 
-### 6.3 ✅ graph capture 修复(2026-06-08 已闭合)
+### 6.2 ✅ graph capture 修复（2026-06-08 闭合，保留）
 
-> 原专项文档 [graph_mode_fix_handoff.md](graph_mode_fix_handoff.md) 的 5 个嫌疑点经实测**均非真因**——
-> 真因是两个之前未被点名的点(改动一、改动五)。下面是最终修好的全部改动与实测。
+真因两层（均不在当时嫌疑栈）：① `kt_ep_wrapper.py::mask_cpu_expert_routing` 的
+`gpu_experts_mask.to(device)` 在 capture 期做同步 H2D（107030）；② 该函数被 `@torch.compile`→NPU
+torchair 编成绑定 stream 的独立子图，与外层图跨 stream replay 冲突（`Unsupport run graph`）。
+**改动（sglang `456687a0f`）**：capture 前预搬 mask 到 device（`.to()` no-op）+ 去掉 `@torch.compile`
+改 eager 折进外层图 + 预订阅 ACL report stream；kt-kernel `experts_base.py::_wait_device` 加 capture
+兜底。详尽根因见 [graph_mode_fix_handoff.md](graph_mode_fix_handoff.md)（5 个旧嫌疑点均证伪）。
 
-**真因(两层)**:
-- **第一层(坑⑥,107030)**:`kt_ep_wrapper.py` 的 `mask_cpu_expert_routing` 里
-  `gpu_experts_mask.to(topk_ids.device)` / `logical_to_gpu_index.to(...)` 是 CPU→NPU 同步 H2D。
-  mask 在 `kt_expert_masks.py` 以 `device="cpu"` 建;**NPU 上 capture 前没有 eager 预热 forward**
-  (CUDA 才有 `kernel_warmup`),首个 forward 即 capture,该 H2D 撞 ACL「captured-stream 禁止同步 memcpy」。
-- **第二层(坑⑥b,Unsupport run graph)**:修好第一层后 capture 能过,但首请求 prefill 图重放崩
-  `Unsupport run graph with different stream`。因 `mask_cpu_expert_routing` 被
-  `@torch.compile(backend=get_compiler_backend())`,NPU 上该 backend 是 **torchair(max-autotune)**,
-  把它编成绑定 trace-stream 的独立 NPU 子图,与外层 sglang NPU graph 在不同 stream 上 replay 冲突。
+### 6.3 🔧 dbg 期绕过 CPU MoE 慢加载（`KT_DUMMY_CPU_WEIGHTS`）
 
-**最终改动(5 处)**:
+调 graph/capture 反复重启时,真实权重 GGUF 读取是主要开销。`KT_DUMMY_CPU_WEIGHTS=1` **跳过磁盘读取**,
+按张量元数据 fabricate 同字节布局零 buffer（C++ MOE/load_weights_task 路径不变,capture 与 forward
+忠实执行）。MXFP4 类型注册后天然支持。⚠️ 输出无意义,**严禁精度验收**,仅"图能否跑通"。
 
-| # | 文件 | 改动 | commit |
-|---|---|---|---|
-| 一(P0) | `third_party/sglang/.../kt_ep_wrapper.py` `process_weights_after_loading` | capture 前(权重加载完)把 `gpu_experts_mask`/`logical_to_gpu_index` 预搬到 `layer.w13_weight.device`;`.to()` 变 no-op,消除 107030 | sglang `456687a0f` |
-| 五(P0) | 同文件 `mask_cpu_expert_routing` | **去掉 `@torch.compile`**(torchair 跨 stream),改 eager 折进外层图 | sglang `456687a0f` |
-| 三(P2) | 同文件 `process_weights_after_loading` 末尾 | capture 前预订阅 ACL report stream(幂等、best-effort) | sglang `456687a0f` |
-| 二(P1) | `kt-kernel/python/experts_base.py` `_wait_device` | 加 `get_is_capture_mode()` 兜底:`torch.npu.is_current_stream_capturing()` 在 capture 期若返回 False/抛异常,改查 sglang 全局 capture 标志,防误入 `synchronize()`(107027) | 父仓本次 |
-| 四 | `kt-kernel/python/utils/{loader,llamafile}.py` | `KT_DUMMY_CPU_WEIGHTS` 调试开关(见 §6.5) | 父仓本次 |
+### 6.4 ⚡ graph decode 提速（kt-cpuinfer + GEMV prefetch，06-09）
 
-> 改动二是**潜在崩溃加固**:默认 graph 路径不走 `_wait_device`(仅 `KT_FORCE_SYNC_SUBMIT=1` bypass 才触达),
-> 但 `is_current_stream_capturing()` 在 torch_npu graph 下可靠性未知,故按 `_npu_use_graph_host_callback`
-> 同款双重检测加固。原嫌疑的 `copy_inputs_to_cpu_buffers`/`copy_forward_output_to_device` 经核实已是
-> `non_blocking=True` pinned 异步拷贝,capture-safe,无需改。
+CPU MoE 是内存带宽瓶颈,旧 `--kt-cpuinfer 24` 只用 24/192 核。提到 **96→128**（隔离微基准证明
+旧"≥128 thrash"是在线争抢假象,**只有 192 满核才崩**）+ GEMV 行内预取 → decode 3.6→8.5 tok/s。
+详见 [graph_decode_bandwidth_findings.md](graph_decode_bandwidth_findings.md)。
 
-**实测闭环(NPU 1,真实 W8A8 + Q8_0 CPU MoE)**:
-- Load weight 477s → capture **6.79s** 通过 → health 200。
-- `tools/p27_curl_f2_prompts.sh` 四 prompt 全部连贯(fib 递归 / 监督学习 / transformer 中文 / pandas-sklearn 代码),无 NaN/感叹号/乱码。
-- decode 日志 `npu graph: True`,gen throughput **3.46–3.89 tok/s**(prefill 批 `npu graph: False` 正常)。
+### 6.5 NPU 侧天花板 / MTP（Session B，已收口，未采用）
 
-### 6.4 其它开放项(优先级低于 graph)
+纯 NPU decode 天花板 ≈ 19.8 tok/s（逐层 host callback ~7.4ms/token 往返不可消除）;独立 stream 并行
+−35% 回归（同步开销 > 可重叠工作量）;MTP accept_len ~1.8 < 盈亏线 2.5,不划算。详见
+[npu_decode_ceiling_and_callback_findings.md](npu_decode_ceiling_and_callback_findings.md) /
+[mtp_on_npu_findings.md](mtp_on_npu_findings.md)。**结论：CPU 侧（字节/带宽）是当前主杠杆。**
+
+### 6.6 其它开放项
 
 | 优先级 | 任务 | 备注 |
 |---|---|---|
-| P1 | graph 性能调参 | `TASK_QUEUE_ENABLE=0` 对照、多 `cuda-graph-bs`、shared-expert 双 stream |
-| P2 | mxfp4 原生权重 | NPU MoE 换 mxfp4,CPU 保留 GGUF,重算 `kt-num-gpu-experts` 预算 |
-| P3 | EPLB 动态 hot-expert | 当前硬编码「前 N」;按 activation 频次取 top-16 |
-| P4 | CPU MoE 慢加载提速 | 真实权重 GGUF 读取 ~477s(单线程 TP 切分 + 多 GB I/O);dbg 期用 §6.5 dummy 绕过,生产提速需并行化 C++ `load_weights_task`(另议) |
-| – | MOE_INT8 / KML | **不做**(K920 无 SVE/i8mm) |
+| P1 | 热专家放置（EPLB 动态） | 当前硬编码前 32;按 activation 频次取最热 → 更多 top-6 命中 NPU、CPU 搬字节再降 |
+| P2 | CPU↔NPU overlap | MXFP4 后 CPU MoE ~17–27ms vs NPU ~50ms,NPU 成主导,overlap 价值上升（Session B 线） |
+| P3 | 长序列 prefill 流式加载 + 热专家常驻 | Session C 线;流式搬的也是 MXFP4 GGUF（字节减半直接利好） |
+| P4 | 预取距离扫描 / down 短行 | 512B 未调优;down nrc=2、跨专家预取已试为负结果（Session D 收口） |
 
-### 6.5 🔧 dbg 期绕过 CPU MoE 权重加载(`KT_DUMMY_CPU_WEIGHTS`)
+### 6.7 🔥 CPU MoE 原生 MXFP4（Session D，2026-06-11 合入 `91b9c92`）
 
-**痛点**:真实权重每次拉起要等 **~477s**(GGUF 单线程 TP 切分 + 多 GB 磁盘 I/O,日志刷
-`TP MOE layer N` / `Llamafile TP splitting`)。调 graph/capture 时反复重启,这段加载是主要时间开销。
-
-**方案**:本会话新增环境开关 `KT_DUMMY_CPU_WEIGHTS=1`,**跳过 GGUF 磁盘读取**,只按张量元数据
-(shape / ggml 量化类型 / 元素数,从 `GGUFLoader.tensor_info` O(1) 取)fabricate **同字节布局的
-零 buffer**;之后 C++ `MOE(moe_config)` / `load_weights_task` 路径**完全不变**(buffer 尺寸、kernel
-选择、capture 与 forward 全部忠实执行),只是权重值是 0。
-
-实现落点:
-- `kt-kernel/python/utils/loader.py`:`GGML_QUANT_SIZES` 提到模块级;新增
-  `GGUFLoader.get_dummy_tensor_and_ggml_type(name)`——只读 `tensor_info`,返回
-  `torch.zeros(n_bytes, uint8)` + 原 ggml 类型,不碰 mmap 数据。
-- `kt-kernel/python/utils/llamafile.py` `load_weights`:开关命中时改用 dummy 加载器(layer 0 打印醒目告警)。
-
-用法 / 边界:
-```bash
-# dbg：跳过慢加载，快速反复调 capture（输出乱码，仅验证“能跑通图”）
-KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=<空闲卡> bash tools/p27_launch_ds4flash_npu.sh
-# 验收：去掉开关，真实权重 + tools/p27_curl_f2_prompts.sh 看连贯 + p27_cpu_moe_reference_check.py 对账
-```
-- ⚠️ dummy 权重输出**无意义**,严禁用于精度验收;只用于「capture / 图重放能否跑通」这类结构性调试。
-- ⚠️ 当前只省**磁盘 I/O**(实测最大头);C++ 单线程 TP 切分仍跑。若实测瓶颈在切分,需进一步并行化(P4)。
-- ⚠️ 生产勿长期开 `KT_DUMMY_CPU_WEIGHTS` / `KT_FORCE_SYNC_SUBMIT` / `KT_DEBUG_*` / `SGLANG_NPU_PROFILE_ENABLE`。
-
-### 6.6 ⚡ graph decode 提速:`--kt-cpuinfer 24→96`(2026-06-09,commit `68f8556`)
-
-**结论**:graph decode 真实权重 **3.6 → 6.12 tok/s(~1.7×)**,精度无损,**纯配置改动**。
-
-**根因**:decode ~280ms/token 中 ~70% 是 43 层 CPU MoE。CPU MoE 是**内存带宽瓶颈**——每层把
-~140MB(最恶劣 top-6 全落 CPU 160MB)int8 专家权重从 DDR 搬进来过一遍,int8 GEMV 算力 ~0.4ms/token
-可忽略(`AI=0.94 MAC/byte ≪ 平衡点 21`)。而生产 `--kt-cpuinfer 24` 只用了 192 核里的 **24 核**
-(3/NUMA),有效带宽仅 **31 GB/s ≈ DDR 峰值的 4%**。
-
-**修复**:`tools/p27_launch_ds4flash_npu.sh` 把 `--kt-cpuinfer` 默认 **24→96**(`KT_CPUINFER` 可覆盖)。
-
-| cpuinfer | 每 NUMA | 有效带宽 | 真实 decode | CPU MoE/token | F2 连贯 |
-|---|---|---|---|---|---|
-| 24(旧) | 3 | 31 GB/s | 3.6 tok/s | ~215 ms | ✅ |
-| **96(新默认)** | 12 | **95 GB/s** | **6.12 tok/s** | **115 ms** | ✅ |
-| 128 | 16 | — | **崩(1149ms/token)** | — | ❌ |
-
-- **≥128 会 thrash**(无余量给 NPU host 线程);96 留 8 核/NUMA,是验证过的甜点。
-- ⚠️ 经验:① "快参考"先验证输出非零(一个 no-op 幻象 `forward()` 曾误导数小时);
-  ② **扫最优线程数必须用真实权重**(dummy 路由退化、访存少,崩溃点失真:dummy 128 是峰、真实 128 崩)。
-- 完整诊断 + 纠错记录:[graph_decode_profiling_report.md](graph_decode_profiling_report.md)。
-- **仍有空间**:96 核也只用了 ~13% DDR 带宽 → kernel 访存优化 / 根治多线程崩溃 / 降 Q4 还能再榨 ~4–8×。
-  见 [graph_decode_bandwidth_handoff.md](graph_decode_bandwidth_handoff.md)。
+- **P1 类型注册**：`GGML_TYPE_MXFP4=39`（`block_mxfp4{e;qs[16]}` blck32 size17，`vec_dot_type=Q8_0`）。
+  改 vendored ggml.h/ggml-common.h/ggml-quants.{c,h}/ggml.c + kt loader.py + gguf-py，全在 **patch 0002**。
+- **P2 无损转换器**：consecutive→half-block 逐 32-group nibble 重排，e8m0 字节直存。layer16 bit-exact。
+- **P3 NEON kernel**：`ggml_vec_dot_mxfp4_q8_0`（`vqtbl1q_s8`+`vdotq_s32`）+ 行内 +512B 预取 + 双 FMA 累加链
+  → 微基准 **2.4×**（0.95→0.40ms/层 @128t）;cosine 0.999939。`kt_llamafile_sgemm` 加 MXFP4×Q8_0 分支。
+- **P4 merge 并行**（7×，merge 98→14µs/层）。
+- **Q8_0 路径同款优化**（commit `18d25b7`）：`kt_vec_dot_q8_0_q8_0` 自包含变体 2.38×，**ggml 零改动**，
+  `KT_Q8_REF=1` 回退。DSv4 生产不走（已用 MXFP4），价值在惠及其他 W8A8→Q8_0 走 CPU offload 的模型。
+- **实测**：cpu_moe_wall 55→**median ~22–27ms / min 17ms**;decode 8.5→**~13–16 tok/s**（清净窗口 ~16，
+  中等争抢 ~13–14）;DRAM 275→**137 GiB**;F2 四 prompt 连贯。负结果（down nrc=2 / 跨专家预取）已记录回退。
+- 完整记录：[mxfp4_cpu_moe_handoff.md](mxfp4_cpu_moe_handoff.md)。**后续 CPU 侧迭代主要基于 MXFP4。**
 
 ---
 
-## 7. 性能数据(参考,未大规模调参)
+## 7. 性能数据（参考）
 
 | 项 | 值 |
 |---|---|
-| Graph capture 时间(实测 06-08) | 6.79 s(bs=1,真实权重);dummy 9.89 s |
-| Decode 吞吐 — graph,`--kt-cpuinfer 96`(实测 06-09) | **6.12 tok/s**(真实权重,F2 连贯;§6.6) |
-| Decode 吞吐 — graph,`--kt-cpuinfer 24`(旧默认,06-08) | 3.46–3.89 tok/s(`npu graph: True`) |
+| Decode 吞吐 — **MXFP4** graph `kt-cpuinfer 128`（06-11） | **~13–16 tok/s**（清净窗口 ~16，中等争抢 ~13–14；min cpu_moe_wall 17ms） |
+| Decode 吞吐 — Q8_0 graph `kt-cpuinfer 128`（06-09） | ~8.5 tok/s |
 | Decode 吞吐 — eager | ~1.6 tok/s |
-| 模型加载 | **~100s**(43 层 MoE GGUF ~47s〔P0+P1 加速〕+ 46 shard/建模 ~54s);旧 ~9 min,见 `DeepSeek-V4-Flash_CPU权重加载加速_P0-P1.md` |
-| HBM 占用(N=32) | ~16 GB expert + attention + KV |
-| DRAM 占用 | ~275 GB(Q8_0)/ ~555 GB(BF16) |
+| Graph capture | ~6.8s（bs=1，真实权重） |
+| 模型加载（MXFP4 138 GiB） | **~2–3.5 min**（热 cache，page cache 全驻;冷盘首启另加磁盘读） |
+| HBM 占用（N=32） | ~16 GB expert + attention + KV |
+| DRAM 占用 | **~137 GiB（MXFP4）** / 275（Q8_0）/ 555（BF16） |
+
+> 共享机 load 长期 ~400 时所有绝对带宽是被邻居挤占后的下限;清净独占聚合 ~442 GB/s。decode 的
+> median−min 抖动主体是邻居噪声（G1，max-of-8-NUMA 放大）。
 
 ---
 
@@ -396,52 +361,95 @@ KT_DUMMY_CPU_WEIGHTS=1 NPU_DEVICE_ID=<空闲卡> bash tools/p27_launch_ds4flash_
 
 | # | 红线 | 后果 |
 |---|---|---|
-| R1 | 不上 SVE/BF16/I8MM 指令;march 固定 `armv8.2-a+fp16+dotprod` | SIGILL |
-| R2 | C++ pybind 模块不 `#include <torch_npu/...>` | ABI 不稳 |
+| R1 | 不上 SVE/BF16/I8MM;march 固定 `armv8.2-a+fp16+dotprod`;kernel 只用 `vqtbl1q_s8`+`vdotq_s32` | SIGILL |
+| R2 | C++ pybind 不 `#include <torch_npu/...>` | ABI 不稳 |
 | R3 | ACL callback 必须专用 poller 线程 subscribe+process | 卡 sync、NPU 空闲 |
-| R4 | W8A8→Q8_0 不可 reinterpret int8 块(scale 粒度不同) | 数值错但不报错 |
-| R5 | 不把 `/workspace`、`/usr/local/Ascend` 等环境路径硬编码进**代码** | 换环境撞死 |
+| R4 | **MXFP4 nibble 序：consecutive(ckpt) vs half-block(GGUF) 必须重排**;Q8_0 不可 reinterpret int8 块 | 数值错但不报错 |
+| R5 | 不把环境路径硬编码进**代码** | 换环境撞死 |
 | R6 | SGLang 不 fork 整模型实现,只加分支/继承 | 升级 submodule 破坏 |
+| R7 | **vendored ggml 改动不 commit 进子模块,走 patch 0002** | 合并污染 gitlink |
 | R8 | shared_experts / router gate 不 offload,留 NPU | 路由/精度 |
-| R9 | `first_k_dense_replace` 层无 256 expert,offload 要 skip(本模型=0,全 MoE) | KeyError |
-| R10 | NEXTN(speculative)第一版不开 | sglang NPU NEXTN 有坑 |
-| — | 勿 `pkill -f "sglang.launch_server"`(会杀掉自身 shell);按 PID 杀 | exit 1、像没运行 |
+| R9 | `first_k_dense_replace` 层无 256 expert,offload 要 skip（本模型=0） | KeyError |
+| R10 | NEXTN(MTP)不开 | sglang NPU NEXTN 有坑且不划算(§6.5) |
+| — | 绝不 `pkill -f sglang.launch_server`;按 PID/端口杀,SIGTERM 优雅释放 HBM | 杀别 session、自杀 shell、孤儿占 HBM |
 
 ---
 
 ## 9. 命令速查
 
 ```bash
-# 体检
-ls third_party/sglang/python/sglang/__init__.py third_party/llama.cpp/gguf-py/gguf/__init__.py
-find kt-kernel -name "kt_kernel_ext*.so"; ls /workspace/models/cache/dsv4_layer*.gguf | wc -l
-npu-smi info | head -20; numactl --hardware
-
 # 每容器
-apt-get install -y libhwloc-dev
+apt-get install -y libhwloc-dev libhwloc15
 
-# 编译(必要时)
+# 体检
+find kt-kernel -name "kt_kernel_ext*.so"; ls /workspace/models/cache/dsv4_layer*_mxfp4.gguf | wc -l
+npu-smi info | head -20
+
+# 编译（必要时）
 cd kt-kernel && CPUINFER_USE_ASCEND_NPU=1 /usr/local/python3.11.14/bin/python3.11 setup.py build_ext --inplace
 
-# 转权重(Q8_0)
-/usr/local/python3.11.14/bin/python3.11 tools/batch_convert_w8a8_layers_mp.py \
-  --input /workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 --output-dir /workspace/models/cache \
-  --layer-start 0 --layer-end 42 --quant q8_0 --jobs 32 --verify-sample 3
+# 转 MXFP4 GGUF（现行主路径）+ 全集校验
+/usr/local/python3.11.14/bin/python3.11 tools/batch_convert_mxfp4_layers_mp.py \
+  --input /workspace/models/DeepSeekV4/DeepSeek-V4-Flash --output-dir /workspace/models/cache \
+  --layer-start 0 --layer-end 42 --jobs 16 --verify-sample 3
+python3 tools/verify_mxfp4_gguf_set.py --dir /workspace/models/cache --sha256-manifest tools/mxfp4_gguf_sha256.txt
 
-# 预检 + 拉起(graph 默认 / eager 回退)
-bash tools/p27_e2e_preflight.sh
-MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 NPU_DEVICE_ID=0 bash tools/p27_launch_ds4flash_npu.sh
-MODEL_PATH=… NPU_DEVICE_ID=0 KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" bash tools/p27_launch_ds4flash_npu.sh
+# 拉起（MXFP4，graph-on；自己终端前台跑）
+NPU_DEVICE_ID=<空闲卡> PORT=8020 \
+  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' \
+  KT_CPUINFER=128 MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
+  bash tools/p27_launch_ds4flash_npu.sh
 
-# CPU MoE 离线对账(定位数值问题)
+# MXFP4 kernel 离线对账（cosine 0.9999）
 PYTHONPATH="$PWD/third_party/sglang/python:$PWD/kt-kernel" /usr/local/python3.11.14/bin/python3.11 \
-  tools/p27_cpu_moe_reference_check.py --w8a8 /workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
-  --gguf /workspace/models/cache/dsv4_layer3.gguf --layer-idx 3 --method LLAMAFILE
+  tools/p27_cpu_moe_reference_check_mxfp4.py --model-dir /workspace/models/DeepSeekV4/DeepSeek-V4-Flash \
+  --gguf /workspace/models/cache/dsv4_layer16_mxfp4.gguf --layer-idx 16
 ```
 
 ---
 
-*整合自 4 份来源,以本文为现行总纲。维护:`dsv4_one_card_dev`。graph capture 已闭合(§6.3);
-后续主攻 §6.4 性能调参 / CPU MoE 慢加载提速(dbg 期可用 §6.5 `KT_DUMMY_CPU_WEIGHTS` 绕过)。*
-</content>
-</invoke>
+## 附录 A：int8（Q8_0）CPU 权重（旧路径，附录）
+
+> Q8_0 是 MXFP4 之前的 CPU offload 路径（int8，1.0625 B/元素，275 GiB）。**现行生产已换 MXFP4，
+> 后续 CPU 迭代不再基于 Q8_0。** 保留此附录供：① 无原生 MXFP4 权重时的回退；② 对照基线;
+> ③ 复用 Q8_0 kernel 优化（`KT_Q8_REF`）的其他 W8A8 模型。
+
+**W8A8 → Q8_0 GGUF 转换**（与 MXFP4 不同：这是 dequant→requant 的**再量化**，不是无损 repack）：
+
+```bash
+/usr/local/python3.11.14/bin/python3.11 tools/batch_convert_w8a8_layers_mp.py \
+  --input /workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 --output-dir /workspace/models/cache \
+  --layer-start 0 --layer-end 42 --quant q8_0 --jobs 32 --verify-sample 3
+# dequant→requant：W_fp32 = int8 * fp32_scale[out_ch]；再按 Q8_0 block（每 32 元 fp16 scale + int8 qs[32]）。
+# 输出 dsv4_layer{0..42}.gguf（无 _mxfp4 后缀）;--jobs 32 较优（聚合 ~129/192 核，磁盘 I/O 成瓶颈）。
+# 也支持 --quant bf16（dsv4_layer{i}_bf16.gguf，数值基线 cosine 0.999997）。
+```
+
+**用 Q8_0 拉起**（不传 `KT_GGUF_TEMPLATE` 即走 Q8_0 默认模板）：
+
+```bash
+NPU_DEVICE_ID=<空闲卡> PORT=8000 KT_CPUINFER=128 \
+  MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
+  bash tools/p27_launch_ds4flash_npu.sh
+# 默认 KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
+
+# eager 回退（仅对照/排障）：
+NPU_DEVICE_ID=<卡> KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" bash tools/p27_launch_ds4flash_npu.sh
+```
+
+**Q8_0 离线对账**：
+
+```bash
+PYTHONPATH="$PWD/third_party/sglang/python:$PWD/kt-kernel" /usr/local/python3.11.14/bin/python3.11 \
+  tools/p27_cpu_moe_reference_check.py --w8a8 /workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
+  --gguf /workspace/models/cache/dsv4_layer3.gguf --layer-idx 3 --method LLAMAFILE
+# Q8_0 cosine 0.9999;BF16 0.999997
+```
+
+**历史结论修正**：Spec/Handoff（05-12）的「Q8_0 在 aarch64 会 NaN」「MOE_INT8/KML 必须 BF16」已过时——
+实测 Q8_0(int8) CPU offload 可用（坑⑧ 已修，无 i8mm 时回退 `ggml_vec_dot_q8_0_q8_0`）。
+
+---
+
+*整合自多份来源,以本文为现行总纲。维护:`dsv4_one_card_dev`。现行：CPU MXFP4（§6.7）;
+后续 CPU 侧迭代主要基于 MXFP4（热专家放置 / overlap / 长序列流式）。*

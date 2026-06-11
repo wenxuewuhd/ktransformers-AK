@@ -535,6 +535,16 @@ baseline(32 GPU experts,不流式)**也做 NZ 转换**,但没这延迟,两个原
 > **MXFP4**(GGUF 里就没有 NPU 要的 int8 了)→ NPU 流式池**必须**从 safetensors 建。**这点不能违反。**
 > ∴ 之前"像 GGUF loader"的说法要更正:**重点是"并行读 safetensors"这个技术,不是复用 GGUF 数据**。
 
+#### 2c-ii-c5 ✅ 并行 O_DIRECT 建池实测(2026-06-11,生产满配 card0)
+
+`_build_pool_parread`(8 worker O_DIRECT 读全 256 专家 safetensors → pinned ND → 就地 NZ)。capture 改 no-op。
+- **建池 167s = read 98s(277GB → 2.8 GB/s,近 NVMe 上限!)+ NZ 69s**,vs capture 标准等效 ~400s = **2.4×**;
+- **精度 ✓**:3637-token 流式 + 32 token,输出与之前已验版本**逐字一致**(权重 bitwise 没变);0 fallback,速度不变。
+- ⚠️ **但启动总时只从 553s → 519s(省 34s)**,远小于建池本身的提速。原因:**旧 capture 与模型加载循环
+  重叠**(边 load 边物化,load 本就在读),而 **parread 在 load 之后串行跑**。∴ 建池虽快 2.4×,因不重叠,
+  总收益被吃掉。**下一步要害 = 让建池读与模型加载重叠**(后台读,趁 load 的 CPU/graph 阶段 NVMe 空闲),
+  或直接**复用 sglang loader 的并行 safetensors 机制把 256 专家一起加载**(用户建议,见下)。
+
 **正确的优化方向**:**baseline 本来就并行加载 safetensors 到 NPU**(sglang loader 的 executor 多 worker,
 读 ~32 专家 + attn/shared 约 60-75GB 折进 150s,等效 ~3 GB/s)。所以 safetensors 读**能并行也快**——我的
 ~1 GB/s 是 **Python 实现问题**。⇒ 终极解 = **让 safetensors→NZ 的读达到 baseline 并行 loader 的 ~3 GB/s**

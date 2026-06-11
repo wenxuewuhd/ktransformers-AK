@@ -898,3 +898,20 @@ bitwise 等价,`nz_batched_gather_test.py`)、空卡 12.5× 快(716→57ms)。**
 decode 保持连贯,OOM 安全(失败回退静态集)。
 **要砍到 ~15-25s 需更大改动**:host 端存 ND 池(+277GB host 内存,总 554GB)→ switch 在 host 做 ND fancy-index(对、快)
 → 只 H2D 32 个常驻(34GB,~1.5s)→ NZ-cast 32 个 → 免掉每层整池 6.4GB 设备 format_cast。待定。
+
+### D-叠加热专家到底多少(2026-06-11):流式池 decode 税在 MXFP4 上 16→8,热专家净负
+**配对实测(同窗口,MXFP4 prefix-32,仅流式开关不同)**:
+| 配置 | decode tok/s |
+|---|---|
+| MXFP4 trunk(无流式) | **~16**(15.2–17.0,稳) |
+| MXFP4 + 流式 | **~8**(7.2–10.3) |
+
+**流式 prefill 把 MXFP4 decode 砍半(16→8,ratio 0.5)**。机制:profile 显示 NVMe~0、CPU busy 65% → 不是缺页、不是停等,
+是 **277GB pinned 流式池饿了 CPU MoE 的 DDR 带宽**(NUMA/内存控制器/大页扰动)。MXFP4 解码 DDR 高效(快、对带宽余量敏感)
+→ 被砍半;Q8_0(慢、本就 DDR 饱和)之前测 ratio 1.0 不受影响——**修正之前"流式不影响 decode"的结论(那是 Q8_0 专属)**。
+
+**所以"叠加热专家能到多少":~8.5 tok/s,反而 < trunk 的 16** —— 因为热专家(real-topK)依赖流式,而流式税(16→8)远大于
+热专家提速(MXFP4 上仅 ~1.06×)。**净负。**
+
+**修复方向(关键,未做)**:流式池在 decode 期是**闲置**的(decode 走 hybrid,常驻热专家已在 HBM,非常驻走 MXFP4 GGUF)。
+**切换后释放/缩小流式池** → decode 恢复 ~16 + 热专家上 NPU 的提速。代价:下次长 prefill 要重建池(~110s)。decode-heavy 负载划算。

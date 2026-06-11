@@ -888,3 +888,13 @@ MXFP4 .so 复用 kt-D 已构建件(本分支 merge-base 后无 kt-kernel C++ 改
 tok/s → **MXFP4 不快,Q8_0 略快**。因 mxfp4 分支也给 Q8_0 上了同款 2.38× 优化(行内预取),MXFP4 半字节带宽收益
 被 4-bit 反量化开销抵消(那个 -28~37% 是 vs 旧 Q8_0)。**真收益=内存:GGUF 3.2GB/层 vs 6.4GB/层(总 137 vs 277GB)。**
 推论:**decode 提速来自 Goal-2 热专家常驻(~1.5–1.8×),非 MXFP4;MXFP4 是内存账。** 砍 152s 切换仍值得(降 Goal-2 成本)。
+
+### D-砍切换开销(2026-06-11):165→124s,瓶颈是 NZ 设备切片 copy 带宽病态
+**Profile(KT_DYN_SWITCH_PROF=1)**:H2D 整池=12.6s(正常),**gather 逐专家=152.8s(瓶颈)**。根因:NZ 设备
+切片 copy `slot13[e]→w13[s]` 跑 ~0.3GB/s(HBM 峰值的 ~1/3000),病态。
+**修复:ND 往返 gather**(`format_cast NZ→ND` 全带宽 → ND fancy-index → `ND→NZ`)。算子级实测 cos=1.0(与逐专家
+bitwise 等价,`nz_batched_gather_test.py`)、空卡 12.5× 快(716→57ms)。**但服务内 format_cast 受 HBM 占用拖累**
+(~2.8GB/s vs 空卡 28GB/s,仅 7.9GB free,且 NPU 路径 mem-fraction 不释放 HBM)→ gather 152.8→106.3s,**切换 165→124s**。
+decode 保持连贯,OOM 安全(失败回退静态集)。
+**要砍到 ~15-25s 需更大改动**:host 端存 ND 池(+277GB host 内存,总 554GB)→ switch 在 host 做 ND fancy-index(对、快)
+→ 只 H2D 32 个常驻(34GB,~1.5s)→ NZ-cast 32 个 → 免掉每层整池 6.4GB 设备 format_cast。待定。

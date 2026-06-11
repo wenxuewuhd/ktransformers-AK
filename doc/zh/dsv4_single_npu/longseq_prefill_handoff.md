@@ -651,6 +651,12 @@ vs 56% 退化,单调)**。
 (W8A8 承接的热流量越多)退化越重——这正是 Goal 2「把热专家提到 NPU 提速」的固有代价 **在当前
 量化配置下**。
 
+**量化粒度实测坐实(直接查 checkpoint,非推测):** W8A8 safetensor 专家权重
+`w1.weight=[2048,4096] I8`,`w1.weight_scale=[2048,1] F32` —— **每输出行 1 个 scale**(per-output-channel),
+4096 个收缩维元素共享一个 scale。Q8_0(GGUF)是 per-block-32 → 同一行 4096 维有 **128 个 scale**。
+即沿收缩维 **NPU-W8A8 比 CPU-Q8_0 粗 128×**。把高影响热专家从 128× 细的 Q8_0 路径提到粗的 W8A8,
+注入显著更多量化误差,定量解释了 hit-rate 单调退化。
+
 **对路线图的关键含义(会反转!):用户后续计划 CPU→MXFP4(4-bit,比 W8A8 更粗)。届时 NPU-W8A8
 变成更细的路径,把热专家提到 NPU 将同时提速 + 提精度——退化反转为纯收益。** 即 Goal 2 的精度顾虑
 是当下「CPU 恰好更细」的临时产物;在目标 MXFP4-CPU 配置下,动态热专家常驻是干净的双赢。
@@ -668,8 +674,8 @@ vs 56% 退化,单调)**。
 **剩余可选(非阻塞)**:
 - 定量化:teacher-forced decode logprob/perplexity 给"W8A8 比 Q8_0 粗多少"一个数(机制上需第二次
   请求在常驻集生效后 prefill 打分;qualitative 重复循环 + 单调 hit-rate 判别已足够定性坐实)。
-- 直接验证 W8A8 vs Q8_0 量化粒度:看 compressed-tensors checkpoint 的 scale 是 per-channel 还是
-  per-tensor(若 per-channel 即比 Q8_0 per-block-32 粗,佐证根因)。
+- ~~直接验证 W8A8 vs Q8_0 量化粒度~~ ✅ 已做:W8A8 per-output-channel(每行 1 scale)vs Q8_0
+  per-block-32(每行 128 scale),沿收缩维粗 128×,定量坐实根因(见上)。
 - 等 CPU→MXFP4 落地后复测真 top-K decode:预期退化反转为收益(见上「路线图反转」)。这是 Goal 2
   真正的目标配置,应作为后续 session 的验收点。
 

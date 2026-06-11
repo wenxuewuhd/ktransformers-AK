@@ -882,3 +882,9 @@ MXFP4 .so 复用 kt-D 已构建件(本分支 merge-base 后无 kt-kernel C++ 改
 
 **结论:MXFP4-CPU + Goal-2 动态常驻 合一可用、精度正确。** 待办:MXFP4 vs Q8_0 decode 同负载配对实测(MXFP4 半字节,
 预期 CPU MoE decode 更快~30%);切换 ~157s 成本同前(可优化:批量化 gather)。
+
+### D-MXFP4收益确认(2026-06-11):decode 不提速(vs 优化版 Q8_0),收益在内存砍半
+配对实测(prefix-32,同 .so,仅 GGUF 不同,card6/7):decode M(MXFP4) settled ~11 vs Q(Q8_0 优化版) settled ~12
+tok/s → **MXFP4 不快,Q8_0 略快**。因 mxfp4 分支也给 Q8_0 上了同款 2.38× 优化(行内预取),MXFP4 半字节带宽收益
+被 4-bit 反量化开销抵消(那个 -28~37% 是 vs 旧 Q8_0)。**真收益=内存:GGUF 3.2GB/层 vs 6.4GB/层(总 137 vs 277GB)。**
+推论:**decode 提速来自 Goal-2 热专家常驻(~1.5–1.8×),非 MXFP4;MXFP4 是内存账。** 砍 152s 切换仍值得(降 Goal-2 成本)。

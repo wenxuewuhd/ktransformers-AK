@@ -616,7 +616,7 @@ H2D 0.18s、D2H 0.22s、**format_cast 0.01s(可忽略)**。chunk 64=35s < 128=40
 
 剩 2c-ii-d(直方图按请求复位 → post-prefill 定 decode 热池 = 子任务 4);池落盘缓存(torch.save 段错误,待修)。
 
-### D-目标2(2026-06-10→11,已收口):动态 decode 常驻池——机制全对;"退化"是拿错基线比出的单卡 mix 漂移(非缺陷),对正确基线方向是对的,不用管
+### D-目标2(2026-06-10→11,根因 v3):动态 decode 常驻池——退化=单卡 hybrid 动态切换的运行时状态 bug(非精度/非算子,算子实测无辜);能修,修了就拿 ~2× decode;未定到具体层(待运行时差分)
 
 实现(sglang `468ea4662`+`df220520f`,`KT_DYNAMIC_RESIDENT=1`):流式 prefill 期 device bincount
 计每层激活;末层把静态 prefix-32 换成本请求每层 top-32:权重从 DDR NZ 池 host-gather 进 pinned
@@ -639,34 +639,39 @@ staging 整张量路径 bitwise == fresh cast**),scale device 索引,三处路�
 | `FORCE_SET=permlayer`(每层 `[L*8..]%E`)| 每层异集,**固定**| 12.5% | ✅ 干净(64 tok)| 排除"每层异集"嫌疑 |
 | `FORCE_SET=scatter`(每层 stride-7)| 每层**散布**,固定 | 12.7% | ✅ 干净(64 tok,`_layers=43`/W8A8 连贯)| 排除"层内散布常驻"嫌疑 |
 | `FORCE_SET=antitop`(每层 bottom-K)| **数据相关**,低 hit | **0.6%** | ✅ 干净(64 tok,`_layers=1`/qk_rope 连贯)| **数据相关路径无辜** |
-| 真 top-K(每层热集)| 数据相关,**高 hit 0.56**| 56% | ✗ ~15 tok 后 `_lame` 循环 | 非缺陷:单卡 mix 漂移(δ 加权到热专家),对错基线比出来的(见收口) |
+| 真 top-K(每层热集)| 数据相关,**高 hit 0.56**| 56% | ✗ ~15 tok 后 `_lame` 循环 | 单卡 hybrid 动态切换运行时 bug(算子已证无辜);误差随热专家权重放大,故只此例崩(见根因 v3)|
 
 五个对照集全干净 → bug **不是**切换机制、不是非 prefix、不是每层异集、不是层内散布、**不是数据相关选择**
 (`antitop` 数据相关但低 hit,干净)。real-topK 与所有干净集的唯一区别 = **NPU 命中率(0.6%/13% 干净
 vs 56% 退化,单调)**。
 
-**收口结论(2026-06-11,用户定调):不用管,因为之前拿错了精度基线。**
-之前一直把**单卡 prefix-32(CPU-Q8_0-heavy)**当基线判 real-topK"退化",但它根本不是金标准——是单卡
-显存受限下的 offload 近似。**真正的精度基线 = 多卡 TP、全专家 NPU-int8。** 对这个基线:
-- prefix-32 与 real-topK **都是**偏离参考的单卡近似点,二者漂移不是"谁对谁错";
-- 把热专家挪上 NPU(real-topK)是**往参考靠**(更多高贡献专家走与参考一致的 W8A8 计算)→ 方向正确,非 regression。
+**根因结论 v3(2026-06-11,作废 v2 的量化精度说;用户反例 + 算子实测共同推翻):real-topK 退化是
+单卡 hybrid 动态切换的运行时状态 bug,不是精度、不是算子。MXFP4 救不了,但这是个能修的 bug。**
 
-**那个 `_lame` 重复循环的归位**:它是**单卡 hybrid 混合路径**在"高贡献专家骑在 NPU/CPU 边界"操作点上的
-产物,**不是 W8A8 decode 算子 bug**。安全依据:多卡全-NPU-int8(同一套 W8A8 NPU kernel)是已验证连贯的
-金标准 → 等于已排掉"decode 算子是否有问题"。**故 H1(粗粒度)/H2(算子误差)根因追查关闭,δ(E) 不必量。**
+**作废 v2(量化精度/δ(E)/128× 粗/MXFP4 反转)**。推翻它的两条硬证据:
+1. **用户反例**:多卡 TP 全专家 NPU-W8A8 int8 **不胡言乱语** → W8A8 精度本身没问题,"热专家上 W8A8 掉精度"不成立。
+2. **算子实测**(`tools/longseq_dbg/kernel_decode_vs_prefill.py`,纯算子级无 server):同一输入喂 decode 算子
+   `npu_fused_experts_w8a8_decode` vs prefill 算子 `npu_fused_experts`,**逐 token cos=1.00000**,两者都对 bf16
+   参考 cos=0.99954(int8 量化噪声 ~3%,两边一样)。**decode 算子 = prefill 算子 = 参考,算子无辜。**
 
-**精确表述(纠正"hit-rate→更多 W8A8 误差"的松散说法)**:两配置每专家**计算精度相同**(都是 32×W8A8-NPU
-+ 224×Q8_0-CPU,scale per-expert 不跨专家)。差别在 `输出误差 = Σ_E δ(E)·贡献权重(E)`:prefix 把两路差异
-δ 加权到冷专家(小权重),real-topK 加权到热专家(56% 权重)。即 **compute-precision 相同、output-precision
-不同**。而崩塌幅度远超 per-channel-int8 该有的 <1%,本身也提示这只是单卡 mix 的坏操作点,不是目标配置。
+**已静态读码核对、确认正确的三处**(所以 bug 不是这些静态逻辑):
+- CPU 侧(`kt-kernel/operators/llamafile/moe.hpp:815`):`should_skip_expert()` **每次 forward live 读**
+  `gpu_experts_mask` 跳过常驻专家;按**逻辑 id** 索引权重(256 个全在);末段 `Σ weight_j×out_j` 只累非常驻、
+  无归一化。无双算、无缺权重。
+- NPU 侧(`mask_cpu_expert_routing`):常驻→真权重,非常驻→权重 0。
+- 合并(`kt_ep_wrapper:743`):`gpu_out + cpu_out` = 全专家求和,精确。
 
-**量化粒度旁证(查 checkpoint,保留)**:W8A8 `w1.weight_scale=[2048,1]`=per-output-channel(每行 1 scale);
-Q8_0 per-block-32(每行 128 scale)→ 沿收缩维 W8A8 比 Q8_0 粗 128×。这是单卡 hybrid 里两路 δ(E) 的来源,
-但在正确基线(全-NPU-int8)下不构成问题。
+**所以 bug 在动态切换的运行时状态**(三个结构 `gpu_experts_mask`/`logical_to_gpu_index`/常驻 NZ 权重 在 decode
+时未真正一致),不是上面任何静态逻辑。自洽点:只有 real-topK 崩、随热专家权重放大;scatter/antitop 用同一套切换
+机制"干净"只是因为它们的常驻专家权重小、把同一误差压住了(不是机制对)。**未定到具体层/具体结构——需运行时差分,
+不靠读码猜(读码已证明显眼处全对)。**
 
-**Goal-2 反被强化**:CPU 那批专家(Q8_0 或将来 MXFP4)的活就是"够用地近似参考",所以**低贡献专家落 CPU、
-高贡献专家留在与参考一致的 NPU**正是 real-topK 在做的事;MXFP4-CPU 之后更成立(更粗的 CPU 专家恰好该是
-低贡献那批)。**故 Goal-2 的精度顾虑在正确基线下基本不成立;后续验收 = 单卡流式+常驻 对齐 多卡全-NPU-int8。**
+**怎么拿到 decode 提速(修正"等 MXFP4"的错):修单卡 hybrid 动态切换这个运行时 bug**,让 real-topK 能连贯解码,
+就拿到 ~2× decode。**跟 MXFP4 无关。** 这是 kt_ep_wrapper / `_apply_dynamic_residency` + kt_kernel mask 同步区域
+(与 Session B 协调)。
+
+**下一步(钉死的决定性实验)**:运行时 per-layer 差分——real-topK decode 时,逐层比 hybrid 输出 vs 全-NPU 流式
+输出(已知对)对同一输入,同时 dump 三个 mask 在 decode 时的实际值/一致性。哪层先发散、哪个结构不一致,就钉死。
 
 **⚠️ decode 提速实测——作废重测(2026-06-11)**:这台机器是**共享**的,decode 是 K920 DDR 带宽 bound,
 邻居容器一忙就把本服务 decode 从 ~9 tok/s 饿到 0.3(单测绝对值随邻居负载摆 ~24×)。下面这版用了**不同

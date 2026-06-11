@@ -616,7 +616,31 @@ H2D 0.18s、D2H 0.22s、**format_cast 0.01s(可忽略)**。chunk 64=35s < 128=40
 
 剩 2c-ii-d(直方图按请求复位 → post-prefill 定 decode 热池 = 子任务 4);池落盘缓存(torch.save 段错误,待修)。
 
-### D-目标2(2026-06-10→11,根因 v3):动态 decode 常驻池——退化=单卡 hybrid 动态切换的运行时状态 bug(非精度/非算子,算子实测无辜);能修,修了就拿 ~2× decode;未定到具体层(待运行时差分)
+### D-目标2(2026-06-10→11,✅ 已修复并验证):动态 decode 常驻池——根因=常驻权重 gather 切的是 host NZ 池(host 切片 format-unaware→字节错乱);改为设备上切片即修复,real-topK decode 完全连贯
+
+**✅ 根因坐实 + 修复验证(2026-06-11)。** `_apply_dynamic_residency` 把热专家从 DDR 池 gather 进 `layer.w13_weight`
+时,用的是 **host 上**的 per-expert 切片 `stag13[s].copy_(h13[e])`。池是 **NZ(FRACTAL_NZ tiled)布局**,但 host 张量
+**format-unaware**——host 切片按 ND 字节算,从 NZ-tiled 字节里抽出来的是**错位垃圾**。scale 没事(非 NZ)。
+
+**定位链(全部实测,不靠读码猜)**:
+1. 算子实测:decode 算子 == prefill 算子 == bf16 ref(cos 1.0)→ 算子无辜。
+2. 关图复测:real-topK + `--disable-cuda-graph` 仍乱码 → graph staleness 排除。
+3. 运行时 per-layer 差分(`KT_DYN_DIFF`):`cos(gpu,ref_res)≈0` 全层、`cos(cpu,ref_non)≈0.999` → **NPU 常驻分支算的是垃圾,CPU 分支对**。
+4. 直接探针(`KT_DYN_PROBE`):`layer.w13_weight[slot] == pool[expert] (ND)? False, cos=0.0004;scale eq? True`
+   → **权重错、scale 对**。
+5. 单卡 mix 自洽:NPU 分支恒垃圾,但只在常驻=**热**专家(权重大)时显形;prefix(s==e 恒等)、scatter/antitop(冷专家≈0 权重)
+   所以"看着干净"。旧 L0 自检 `readback==staging` 永远 True 是拿垃圾比同款垃圾,无效。
+
+**修复**(sglang `kt_stream_prefill.py`):gather 改到**设备**上——整池 H2D 进 NZ slot(整张量拷贝 format 正确),再
+`layer.w13_weight.data[s].copy_(slot13[e])`(NPU 切片 format-aware 正确)。验证:`KT_DYN_DIFF` 下 `cos(gpu,ref_res)=1.0000`
+全层;生产配置(图开、无 diff)real-topK decode **完全连贯**(`_layers=1`/`num_layers=43`/`qk_rope_head_dim=64`…无重复)。
+
+**意义**:Goal-2 动态热专家常驻现在**精度正确**。decode 提速(命中 0.13→0.56,预期 ~2×)现在可拿——下一步用
+`paired_decode.py` 同负载配对实测真实倍数。诊断开关 `KT_DYN_DIFF` / `KT_DYN_PROBE`(`maybe_dyn_diff`)、
+算子测 `kernel_decode_vs_prefill.py` / `nz_gather_test.py` 全保留。
+
+---
+**(以下为修复前的调查记录,保留备查)**
 
 实现(sglang `468ea4662`+`df220520f`,`KT_DYNAMIC_RESIDENT=1`):流式 prefill 期 device bincount
 计每层激活;末层把静态 prefix-32 换成本请求每层 top-32:权重从 DDR NZ 池 host-gather 进 pinned

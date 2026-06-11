@@ -552,7 +552,28 @@ baseline(32 GPU experts,不流式)**也做 NZ 转换**,但没这延迟,两个原
 
 **pipelined parread ✅**:8 个 O_DIRECT 读 worker(NVMe/CPU)产出 buffer,主线程逐层 NZ-cast(NPU)消费;
 read(~101s)与 NZ(~80s)用不同资源 → 重叠到 **110s(first-read 20s)**,vs 串行 182s = **省 72s(40%)**。
-精度 ✓ 逐字一致。**下一步:让 parread(110s)与模型加载(152s)重叠,把这 110s 也藏掉。**
+
+#### 2c-ii-c7 ✅ 建池↔load 重叠(2026-06-11):reads 后台化,藏进模型加载
+
+`_start_bg_reads`(首个 process_weights 启动 8 后台 O_DIRECT 读 worker,host-only 无 HBM)+
+`_finish_bg_build`(末层 drain done_q + 逐层 NZ)。reads 与 GGUF 加载/构造**并发**。实测(精度 ✓ 逐字一致):
+
+| 版本 | 总启动 |
+|---|---|
+| capture(冷)| 553s |
+| parread 串行(冷/暖)| 519 / 398s |
+| pipelined parread | 338s |
+| **+ load 重叠** | **308s** |
+| baseline | 152s |
+
+**收益有限(338→308,省 30s),根因 NVMe 争用**:parread reads(NVMe)和 GGUF 加载(NVMe)抢同一卷
+→ GGUF 从 63.7s 拖到 76.3s;NZ-drain 95s 仍串行在 load 之后(NZ 要 HBM scratch,而 load 期 HBM 紧,
+不能安全地在 load 中跑 NZ,否则 OOM——同 build-at-load 教训)。**流式启动从 553s 优化到 308s**,
+vs baseline 152s,净增 ~156s(NZ 95 + GGUF 争用 13 + read 未全藏 + cache 方差)。
+
+**剩余 floor / 未来杠杆**:① 专家数据读两遍(safetensors int8 277GB + GGUF 287GB)= NVMe 硬底
+~161s;② **CPU 切 MXFP4 后 GGUF 变小 → NVMe 争用减 → 流式 reads 更快**(自然改善);③ 复用 sglang
+并行 loader 一次读 256 专家(避免和 GGUF 双读争用);④ NZ 也藏进 load(需解决 load 期 HBM 紧,风险高)。
 
 #### 2c-ii-c5 ✅ 并行 O_DIRECT 建池实测(2026-06-11,生产满配 card0)
 

@@ -650,9 +650,20 @@ H2D 0.18s、D2H 0.22s、**format_cast 0.01s(可忽略)**。chunk 64=35s < 128=40
 2. **decode 实际命中率可能 < 0.56**:0.559 是 prefill share,decode(config 列举那种 token)路由未必全落常驻热集。
 3. 固定开销(attention/routing/NPU/H2D)占比比模型设的大。
 
-**成本回归(我的修复引入)**:常驻切换从 ~21s 涨到 ~160s(争用下)——device-gather 每层整池 H2D(43×6.4GB=277GB)。
-一次性/每长 prefill,可优化(只搬常驻、或复用 streaming 已 H2D 的 slot),但当前是真 cost。**净评估:Goal-2 现在
-正确,但单卡当前量化配置下 decode 提速仅 ~1.2×(争用下界)且切换变贵——值不值得上,取决于解码长度与独占带宽。**
+**复测(2026-06-11,安静窗口,全卡 5%/CPU 2%)**:同法配对。A prefix-32 稳态 ~5.2 tok/s(窗口 3.4–6.4),
+B real-topK ~7.7 中位 / ~9–10 clean-state(窗口 4.3–10.5)。**安静下提速 ≈ 1.5–1.8×**(比争用下的 1.2× 高,
+逼近但未到模型的 2×)。印证之前判断:**争用会把比值压扁,安静下 CPU/NPU 分割差异显出来**。仍短于 2× 因 decode
+实际命中 <0.56 + 固定开销。B 实测 120 token **完全连贯**(`_layers=1`…`intermediate_size=12288`…`w8a8`,无重复)。
+
+**精度实测(2026-06-11):real-topK 至少不差于 baseline,本测中明显更好。** 两个 instruction 式 prompt(可校验答案),
+**A prefix-32 都掉进重复**,**B real-topK 都连贯且事实正确**(自然 prompt 正确答出"生产可用=3 种";另一 prompt 正确
+提取"13 单元/节点、7 节点")。与"多卡全-NPU 是金标准、real-topK 更多专家走 NPU→更靠近参考"自洽。**故修复后
+real-topK 精度站得住,甚至优于单卡 prefix-32。**
+
+**成本回归(我的修复引入,确认非争用)**:常驻切换 ~21s 涨到 **~160s(安静下仍 ~160s)**——非 H2D 带宽,而是
+device-gather 的 **1376 次(43 层×32 专家)逐专家 NZ 切片 copy** 的 launch/sync 开销。一次性/每长 prefill,可优化
+(批量 gather / fancy-index slot13[top] 一次 / 复用 streaming 已 H2D 的 slot)。**净评估:Goal-2 现在精度正确、能跑,
+安静下 decode ~1.5–1.8×;但切换变贵(~160s,可优化)。值不值得上 = 解码长度(摊薄切换)× 独占带宽(提速更大)。**
 
 ---
 **(以下为修复前的调查记录,保留备查)**

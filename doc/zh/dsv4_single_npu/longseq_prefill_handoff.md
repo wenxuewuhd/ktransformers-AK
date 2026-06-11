@@ -931,3 +931,18 @@ KT_POOL_BOUNCE=1(池 unpinned + 6.4GB pinned bounce 做 H2D)实测:switch profil
 默认行为=pinned 不变)备查,不再推。
 对比三态(quiet):pinned=prefill 14s/decode 8(税);全 unpinned=prefill 237s/decode 15;bounce=prefill 730s/decode 7(坏)。
 **真正的解是 MXFP4 流式消池(agent ① 已证无损 + 1.8× 快 + 省 277GB,缺 fused 转换 kernel —— agent ② 在探路)。**
+
+### D-两个收益都拿:已证可行但被基础设施卡住(2026-06-11)
+**纠正之前 roofline:cpu_moe_wall 是大头(~17-27ms no-stream / 39-55ms streaming-pinned),非 11%。我那个 0.16ms 是带宽地板,实际 NUMA-bound ~42GB/s/NUMA + max-of-8 + fork-join。**
+**实测(KT_DECODE_TIMING)**:
+- 热专家**真有用**:streaming-pinned cpu_moe_wall prefix-32 low ~39ms → real-topK low ~20ms(**~2×**,off_cpu ∝ 专家数,5.25→2.6 砍半)。
+- pin 税经 cpu_moe_wall:no-stream ~17-27 → streaming-pinned ~39-55ms(~2-3×)。
+- cpu_moe_wall 方差极大(20-118ms,NUMA skew),需 ≥500 token median 才稳。
+
+**两个收益独立都真,合起来卡在 W8A8 池的 pin 税,而 pin 税在 runtime 去不掉**:
+- unpin 原地:torch 无 API;
+- free+gc:torch pinned **caching allocator 不释放**(无 host-cache-empty API,torch.npu.empty_cache 只管 device)→ 实测 free 后 cpu_moe_wall 仍 ~60ms;
+- bounce:unpinned→pinned memcpy 慢(switch H2D 12→235s);
+- 全程 unpinned:decode 无税(~15)但 prefill H2D 慢(237s,无 DMA)。
+
+**干净的解 = 消池(MXFP4 流式)**:无池→无税→热专家收益 + prefill 1.8× + 省 277GB。但 agent② 证**向量化 PyTorch 转换 3.4s/层(比 345ms 慢 10×),必须写 AscendC fused dequant kernel**。瓶颈已精确定位:dequant 段(nibble unpack + FP4 + e8m0 scale,int32 flat-index 物化 + 13GB bf16 中间量,launch/materialization bound,非带宽)。requant(196ms)+nz(599ms)是 NPU-native,可不动。脚本 `tools/longseq_dbg/mxfp4_conv_vectorized_npu.py`(向量化版,bit-exact,但慢)。

@@ -48,6 +48,7 @@ class GGMLQuantizationType(IntEnum):
     F64 = 28
     IQ1_M = 29
     BF16 = 30
+    MXFP4 = 39  # OCP microscaling FP4 (E2M1 + ue8m0), id aligned with upstream ggml
 
 
 # (block_size, type_size) per GGML quant type — bytes per `block_size` elements.
@@ -83,6 +84,7 @@ GGML_QUANT_SIZES = {
     GGMLQuantizationType.I64: (1, 8),
     GGMLQuantizationType.F64: (1, 8),
     GGMLQuantizationType.IQ1_M: (256, 256 // 8 + 256 // 16 + 256 // 32),
+    GGMLQuantizationType.MXFP4: (32, 1 + 16),  # 1B e8m0 scale + 16B nibble-packed E2M1
 }
 
 

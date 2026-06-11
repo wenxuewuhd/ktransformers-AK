@@ -571,6 +571,23 @@ read(~101s)与 NZ(~80s)用不同资源 → 重叠到 **110s(first-read 20s)**,vs
 不能安全地在 load 中跑 NZ,否则 OOM——同 build-at-load 教训)。**流式启动从 553s 优化到 308s**,
 vs baseline 152s,净增 ~156s(NZ 95 + GGUF 争用 13 + read 未全藏 + cache 方差)。
 
+#### 2c-ii-c8 ✅ "加载到底"结论(2026-06-11):build 已贴硬件地板,没大肉可扣
+
+NZ-cast 95s 子步骤拆解(`/tmp` 单机一层 w13):**transpose+contiguous 0.39s(~50%,最大)**、
+H2D 0.18s、D2H 0.22s、**format_cast 0.01s(可忽略)**。chunk 64=35s < 128=40s < 256=46s →
+**小 chunk 反而快,64 已最优**。
+
+| build 部分 | 现状 | 能扣? |
+|---|---|---|
+| read 277GB | 79s(NVMe 3.5GB/s 上限)| ❌ 硬件顶,已藏进 load |
+| NZ transpose | ~17s | ❌ NZ 格式必须转置(strided HBM ~3GB/s,非算法慢)|
+| NZ PCIe 往返 | ~17s | ❌ 池在 DDR、format_cast 在 HBM,必往返 |
+| format_cast | ~0 | 已是 0 |
+
+⇒ **build 不可约 ≈ NZ 54s**(单机;server 95s,差 41s 是内存压力开销)。308s vs 理论 ~206s
+(baseline 152 + NZ 54)的 ~100s 水分 = read 没全藏(GGUF 抢 NVMe)+ server NZ 开销 + cache 方差,
+**有空间但难且边际**。**结论:这块到此为止,大头交 MXFP4 自然收益。**
+
 **剩余 floor / 未来杠杆**:① 专家数据读两遍(safetensors int8 277GB + GGUF 287GB)= NVMe 硬底
 ~161s;② **CPU 切 MXFP4 后 GGUF 变小 → NVMe 争用减 → 流式 reads 更快**(自然改善);③ 复用 sglang
 并行 loader 一次读 256 专家(避免和 GGUF 双读争用);④ NZ 也藏进 load(需解决 load 期 HBM 紧,风险高)。

@@ -41,10 +41,10 @@ except ImportError:
     pass
 
 
-# Q8_0 = 1.0625 bytes/element; one expert = gate[I,H]+up[I,H]+down[H,I]
-def _bytes_per_expert(hidden: int, inter: int) -> float:
+# Q8_0 = 1.0625 bytes/element, MXFP4 = 0.53125; one expert = gate[I,H]+up[I,H]+down[H,I]
+def _bytes_per_expert(hidden: int, inter: int, bytes_per_elem: float) -> float:
     elems = 2 * inter * hidden + hidden * inter  # gate + up + down
-    return elems * 1.0625
+    return elems * bytes_per_elem
 
 
 def main() -> int:
@@ -63,6 +63,8 @@ def main() -> int:
     ap.add_argument("--npu-id", type=int, default=0)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--json-out", type=Path, default=None)
+    ap.add_argument("--bytes-per-elem", type=float, default=1.0625,
+                    help="weight bytes/element for bandwidth calc: Q8_0=1.0625, MXFP4=0.53125")
     args = ap.parse_args()
 
     gguf = args.gguf.expanduser().resolve()
@@ -160,7 +162,7 @@ def main() -> int:
     med = statistics.median(times_ms)
     p10 = times_ms[len(times_ms) // 10]
     mn = times_ms[0]
-    bpe = _bytes_per_expert(H, args.moe_intermediate_size)
+    bpe = _bytes_per_expert(H, args.moe_intermediate_size, args.bytes_per_elem)
     bytes_moved = B * args.k * bpe  # worst case: all k experts on CPU
     bw_med = bytes_moved / (med / 1e3) / 1e9  # GB/s
     bw_min = bytes_moved / (mn / 1e3) / 1e9

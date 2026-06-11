@@ -21,6 +21,27 @@
 #include "llama.cpp/ggml-quants.h"
 #include "llama.cpp/ggml.h"
 #include "llamafile/sgemm.h"
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+// ---------------------------------------------------------------------------
+// KT_MOE_PHASE_TIMING=1 — Session D Phase-0 测量：decode (forward_one) 三段
+// (input量化 / gate+up job / down job) + TP 层 merge 的累计耗时，定位固定开销 F
+// 的构成。env 关闭时仅一次 getenv + 分支，零扰动。每 tp 每 4300 次调用
+// (=43层×100 token) 打一行均值到 stderr。
+// 线程安全性：同一 tp_part_idx 的 forward_one 在 decode 流内串行（逐层），
+// 不同 tp 并行但写不同槽位 → 无需原子。
+// ---------------------------------------------------------------------------
+static inline bool kt_phase_timing_on() {
+  static const bool on = std::getenv("KT_MOE_PHASE_TIMING") != nullptr;
+  return on;
+}
+struct KtPhaseAcc {
+  uint64_t calls = 0;
+  uint64_t quant_ns = 0, gateup_ns = 0, down_ns = 0;
+};
+inline KtPhaseAcc g_kt_phase_acc[16];
 
 inline void debug_quant(void* input, ggml_type type) {
   std::vector<float> output(ggml_blck_size(type));
@@ -64,20 +85,103 @@ static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
 // Kunpeng 920 (aarch64, dotprod, no SVE/i8mm): iqk_mul_mat and tinyBLAS_Q0_ARM both
 // produce NaN for Q8_0×Q8_0. Use ggml's vec_dot (same as llama.cpp) for MoE GEMMs.
 #if defined(__aarch64__) && !defined(__ARM_FEATURE_SVE)
+
+// kt Q8_0×Q8_0 GEMV-row dot — same two wins proven on the MXFP4 kernel (commit
+// b601b06, +2.4x), ported to the Q8_0 path WITHOUT touching ggml's original
+// ggml_vec_dot_q8_0_q8_0 (kept as the safe reference; this is kt-only, lives here):
+//   (1) in-row software prefetch ~512B ahead — the TSV110 HW prefetcher can't keep
+//       up with this loop's low load density; weight rows stream from DRAM and the
+//       per-row cold-miss latency is otherwise fully exposed.
+//   (2) two float32x4 FMA accumulators instead of per-2-block vaddvq + scalar adds,
+//       removing the serial horizontal-reduce dependency chain.
+// Numerically equivalent up to FP reassociation (deferred horizontal add): result =
+// sum_b d_b * sum_lane(prod_b) = sum_lane( sum_b d_b*prod_b ). dotprod is guaranteed
+// by the build march (armv8.2-a+fp16+dotprod), so raw vdotq_s32 is safe (no fallback).
+static inline float kt_vec_dot_q8_0_q8_0(int nb, const block_q8_0* __restrict x,
+                                         const block_q8_0* __restrict y, bool prefetch_on) {
+  float32x4_t s0 = vdupq_n_f32(0.0f);
+  float32x4_t s1 = vdupq_n_f32(0.0f);
+  int ib = 0;
+  for (; ib + 1 < nb; ib += 2) {
+    if (prefetch_on) __builtin_prefetch((const char*)&x[ib] + 512, 0, 0);
+    const int8x16_t xa0 = vld1q_s8(x[ib + 0].qs), xa1 = vld1q_s8(x[ib + 0].qs + 16);
+    const int8x16_t xb0 = vld1q_s8(x[ib + 1].qs), xb1 = vld1q_s8(x[ib + 1].qs + 16);
+    const int8x16_t ya0 = vld1q_s8(y[ib + 0].qs), ya1 = vld1q_s8(y[ib + 0].qs + 16);
+    const int8x16_t yb0 = vld1q_s8(y[ib + 1].qs), yb1 = vld1q_s8(y[ib + 1].qs + 16);
+    const int32x4_t p0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), xa0, ya0), xa1, ya1);
+    const int32x4_t p1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), xb0, yb0), xb1, yb1);
+    __fp16 hxa, hya, hxb, hyb;
+    memcpy(&hxa, &x[ib + 0].d, 2); memcpy(&hya, &y[ib + 0].d, 2);
+    memcpy(&hxb, &x[ib + 1].d, 2); memcpy(&hyb, &y[ib + 1].d, 2);
+    s0 = vfmaq_n_f32(s0, vcvtq_f32_s32(p0), (float)hxa * (float)hya);
+    s1 = vfmaq_n_f32(s1, vcvtq_f32_s32(p1), (float)hxb * (float)hyb);
+  }
+  float sumf = vaddvq_f32(vaddq_f32(s0, s1));
+  for (; ib < nb; ++ib) {  // odd-block tail
+    const int8x16_t x0 = vld1q_s8(x[ib].qs), x1 = vld1q_s8(x[ib].qs + 16);
+    const int8x16_t y0 = vld1q_s8(y[ib].qs), y1 = vld1q_s8(y[ib].qs + 16);
+    const int32x4_t p = vdotq_s32(vdotq_s32(vdupq_n_s32(0), x0, y0), x1, y1);
+    __fp16 hx, hy; memcpy(&hx, &x[ib].d, 2); memcpy(&hy, &y[ib].d, 2);
+    sumf += (float)hx * (float)hy * (float)vaddvq_s32(p);
+  }
+  return sumf;
+}
+
 static inline bool kt_llamafile_sgemm(long m, long n, long k, const void* A, long lda, const void* B, long ldb,
                                       void* C, long ldc, int ith, int nth, int task, ggml_type Atype,
                                       ggml_type Btype, ggml_type Ctype, int precision) {
   if (Atype == GGML_TYPE_Q8_0 && Btype == GGML_TYPE_Q8_0 && Ctype == GGML_TYPE_F32 && ith == 0 && nth == 1) {
-    const int ne = static_cast<int>(k * ggml_blck_size(GGML_TYPE_Q8_0));
-    const size_t bx = static_cast<size_t>(lda) * sizeof(block_q8_0);
-    const size_t by = static_cast<size_t>(ldb) * sizeof(block_q8_0);
+    const int ne_blocks = static_cast<int>(k);  // k is in Q8_0 blocks (1 block = 32 elems)
     auto* c = static_cast<float*>(C);
     const auto* a = static_cast<const block_q8_0*>(A);
     const auto* b = static_cast<const block_q8_0*>(B);
-    // M=1 GEMV is DDR-bandwidth-bound; warm the head of the next weight row while
-    // dotting the current one to hide the per-row cold miss and raise memory-level
-    // parallelism. Env-gated for A/B: KT_NO_MOE_PREFETCH=1 disables.
+    // M=1 GEMV is DDR-bandwidth-bound. kt_vec_dot_q8_0_q8_0 does in-row +512B prefetch
+    // + vector-FMA accumulate (the MXFP4 b601b06 wins, ported here; ggml original
+    // untouched). Keep a next-row head warm too. Env-gated: KT_NO_MOE_PREFETCH=1 off.
     static const bool prefetch_on = (std::getenv("KT_NO_MOE_PREFETCH") == nullptr);
+    // KT_Q8_REF=1: fall back to ggml's original vec_dot (A/B baseline + safety escape).
+    static const bool q8_ref = (std::getenv("KT_Q8_REF") != nullptr);
+    const size_t bx = static_cast<size_t>(lda) * sizeof(block_q8_0);
+    const size_t by = static_cast<size_t>(ldb) * sizeof(block_q8_0);
+    for (long j = 0; j < n; ++j) {
+      const auto* b_col = b + ldb * j;
+      for (long i = 0; i < m; ++i) {
+        if (prefetch_on && i + 1 < m) {
+          __builtin_prefetch(reinterpret_cast<const char*>(a + lda * (i + 1)), 0, 1);
+        }
+        float sum;
+        if (q8_ref) {
+          sum = 0.f;
+          ggml_vec_dot_q8_0_q8_0(ne_blocks * 32, &sum, 0, a + lda * i, bx, b_col, by, 1);
+        } else {
+          sum = kt_vec_dot_q8_0_q8_0(ne_blocks, a + lda * i, b_col, prefetch_on);
+        }
+        if (!std::isfinite(sum)) {
+          sum = 0.f;  // defensive; should not happen with valid weights/activations
+        }
+        c[ldc * j + i] = sum;
+      }
+    }
+    (void)task;
+    (void)precision;
+    return true;
+  }
+  // MXFP4 weight × Q8_0 activation (Session D CPU MoE). Same GEMV structure as the
+  // Q8_0 path: weight rows stride by sizeof(block_mxfp4)=17B (vs 34B for Q8_0), so
+  // ~half the DDR traffic. Activation is Q8_0 (MXFP4 vec_dot_type). NEON tbl+SDOT.
+  if (Atype == GGML_TYPE_MXFP4 && Btype == GGML_TYPE_Q8_0 && Ctype == GGML_TYPE_F32 && ith == 0 && nth == 1) {
+    const int ne = static_cast<int>(k * ggml_blck_size(GGML_TYPE_MXFP4));
+    const size_t bx = static_cast<size_t>(lda) * sizeof(block_mxfp4);
+    const size_t by = static_cast<size_t>(ldb) * sizeof(block_q8_0);
+    auto* c = static_cast<float*>(C);
+    const auto* a = static_cast<const block_mxfp4*>(A);
+    const auto* b = static_cast<const block_q8_0*>(B);
+    static const bool prefetch_on = (std::getenv("KT_NO_MOE_PREFETCH") == nullptr);
+    // Note(2026-06-10): an nrc=2 row-pair variant (shared activation, dual weight
+    // streams) was tried and measured NEUTRAL at 128 threads (0.402→0.421ms median,
+    // min identical): the in-row +512B prefetch inside ggml_vec_dot_mxfp4_q8_0
+    // already streams across contiguous short rows (down rows are 136B), so the
+    // short-row penalty it targeted is gone. Reverted to keep the kernel simple.
     for (long j = 0; j < n; ++j) {
       const auto* b_col = b + ldb * j;
       for (long i = 0; i < m; ++i) {
@@ -85,11 +189,9 @@ static inline bool kt_llamafile_sgemm(long m, long n, long k, const void* A, lon
           const char* nxt = reinterpret_cast<const char*>(a + lda * (i + 1));
           __builtin_prefetch(nxt, 0, 1);
           __builtin_prefetch(nxt + 64, 0, 1);
-          __builtin_prefetch(nxt + 128, 0, 1);
-          __builtin_prefetch(nxt + 192, 0, 1);
         }
         float sum = 0.f;
-        ggml_vec_dot_q8_0_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
+        ggml_vec_dot_mxfp4_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
         if (!std::isfinite(sum)) {
           sum = 0.f;  // defensive; should not happen with valid weights/activations
         }
@@ -374,6 +476,9 @@ class LLAMA_MOE_TP {
 #ifdef FORWARD_TIME_PROFILE
     auto t0 = std::chrono::high_resolution_clock::now();
 #endif
+    const bool kt_pt = kt_phase_timing_on();
+    std::chrono::high_resolution_clock::time_point kt_pt0, kt_pt1, kt_pt2;
+    if (kt_pt) kt_pt0 = std::chrono::high_resolution_clock::now();
     const void* gate_input_ptr;
     const void* up_input_ptr;
     if ((ggml_type)config_.hidden_type == kt_effective_vec_dot_type((ggml_type)config_.gate_type) &&
@@ -417,6 +522,8 @@ class LLAMA_MOE_TP {
                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
 
 #endif
+
+    if (kt_pt) kt_pt1 = std::chrono::high_resolution_clock::now();
 
     int activated_expert = 0;
     for (int i = 0; i < k; i++) {
@@ -504,6 +611,7 @@ class LLAMA_MOE_TP {
     fmt::print("numa_node: {}, gate/up time: {}\n", tp_part_idx,
                std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
 #endif
+    if (kt_pt) kt_pt2 = std::chrono::high_resolution_clock::now();
 
     nth = config_.hidden_size / config_.m_block;
     pool->do_work_stealing_job(
@@ -556,6 +664,22 @@ class LLAMA_MOE_TP {
     fmt::print("numa_node: {}, total time: {}\n", tp_part_idx,
                std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count());
 #endif
+    if (kt_pt) {
+      auto kt_pt3 = std::chrono::high_resolution_clock::now();
+      auto ns = [](auto a, auto b) {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+      };
+      auto& acc = g_kt_phase_acc[tp_part_idx & 15];
+      acc.calls++;
+      acc.quant_ns += ns(kt_pt0, kt_pt1);
+      acc.gateup_ns += ns(kt_pt1, kt_pt2);
+      acc.down_ns += ns(kt_pt2, kt_pt3);
+      if (acc.calls % 4300 == 0) {
+        fprintf(stderr, "[KT_PHASE tp%d] n=%llu avg/layer-call: quant=%.1fus gateup=%.1fus down=%.1fus\n",
+                tp_part_idx, (unsigned long long)acc.calls, acc.quant_ns / 1e3 / acc.calls,
+                acc.gateup_ns / 1e3 / acc.calls, acc.down_ns / 1e3 / acc.calls);
+      }
+    }
   }
 
   void forward_many(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
@@ -890,31 +1014,58 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
 
   void merge_results(int qlen, void* output, bool incremental) {
     auto pool = this->config.pool;
+    const bool kt_pt = kt_phase_timing_on();
+    std::chrono::high_resolution_clock::time_point kt_m0;
+    if (kt_pt) kt_m0 = std::chrono::high_resolution_clock::now();
+    // Tile over (token, hidden-chunk) so decode (qlen=1) still spreads across the
+    // whole pool instead of running the 8-NUMA reduce + from_float on a single core.
+    // F-opt Phase 1 (Session D): merge was ~98us/layer single-core at qlen=1
+    // (~11% of cpu_moe_wall). Only chunk when hidden_type is unblocked (BF16/F16/F32,
+    // blck==1) so an arbitrary element boundary is always valid; block-quant hidden
+    // types fall back to per-token (num_chunks=1), preserving the original behavior.
+    const int H = config.hidden_size;
+    const ggml_type htype = (ggml_type)config.hidden_type;
+    const size_t hsz = ggml_type_size(htype);
+    const int hblck = ggml_blck_size(htype);
+    int num_chunks = 1;
+    if (hblck == 1) {
+      num_chunks = H / 256;
+      if (num_chunks < 1) num_chunks = 1;
+      if (num_chunks > 32) num_chunks = 32;
+    }
+    const int chunk = (H + num_chunks - 1) / num_chunks;
     pool->do_work_stealing_job(
-        qlen, nullptr,
-        [this, output, incremental](int token_nth) {
+        qlen * num_chunks, nullptr,
+        [this, output, incremental, H, htype, hsz, hblck, num_chunks, chunk](int task_id) {
+          const int token_nth = task_id / num_chunks;
+          const int c = task_id % num_chunks;
+          const int e0 = c * chunk;
+          const int e1 = std::min(H, e0 + chunk);
+          if (e0 >= e1) return;
+          float* base0 = local_output_numa[0] + token_nth * H;
           if (incremental) {
-            to_float((uint8_t*)output + token_nth * config.hidden_size * ggml_type_size((ggml_type)config.hidden_type) /
-                                            ggml_blck_size((ggml_type)config.hidden_type),
-                     local_output + token_nth * config.hidden_size, config.hidden_size, (ggml_type)config.hidden_type);
-            for (int e = 0; e < config.hidden_size; e++) {
-              local_output_numa[0][token_nth * config.hidden_size + e] +=
-                  local_output[token_nth * config.hidden_size + e];
-            }
+            to_float((uint8_t*)output + (size_t)(token_nth * H + e0) * hsz / hblck,
+                     local_output + token_nth * H + e0, e1 - e0, htype);
+            for (int e = e0; e < e1; e++) base0[e] += local_output[token_nth * H + e];
           }
-          auto& tp_count = this->tp_count;
-          for (int i = 1; i < tp_count; i++) {
-            for (int e = 0; e < config.hidden_size; e++) {
-              local_output_numa[0][token_nth * config.hidden_size + e] +=
-                  local_output_numa[i][token_nth * config.hidden_size + e];
-            }
+          for (int i = 1; i < this->tp_count; i++) {
+            const float* basei = local_output_numa[i] + token_nth * H;
+            for (int e = e0; e < e1; e++) base0[e] += basei[e];
           }
-          from_float(local_output_numa[0] + token_nth * config.hidden_size,
-                     (uint8_t*)output + token_nth * config.hidden_size * ggml_type_size((ggml_type)config.hidden_type) /
-                                            ggml_blck_size((ggml_type)config.hidden_type),
-                     config.hidden_size, (ggml_type)config.hidden_type);
+          from_float(base0 + e0, (uint8_t*)output + (size_t)(token_nth * H + e0) * hsz / hblck, e1 - e0, htype);
         },
         nullptr);
+    if (kt_pt) {
+      auto kt_m1 = std::chrono::high_resolution_clock::now();
+      // 槽位 15 专用于 merge（forward_one 只用 tp 0..7）
+      auto& acc = g_kt_phase_acc[15];
+      acc.calls++;
+      acc.quant_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(kt_m1 - kt_m0).count();
+      if (acc.calls % 4300 == 0) {
+        fprintf(stderr, "[KT_PHASE merge] n=%llu avg/layer-call: merge=%.1fus (qlen=%d)\n",
+                (unsigned long long)acc.calls, acc.quant_ns / 1e3 / acc.calls, qlen);
+      }
+    }
   }
 };
 #endif

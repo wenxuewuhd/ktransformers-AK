@@ -616,7 +616,7 @@ H2D 0.18s、D2H 0.22s、**format_cast 0.01s(可忽略)**。chunk 64=35s < 128=40
 
 剩 2c-ii-d(直方图按请求复位 → post-prefill 定 decode 热池 = 子任务 4);池落盘缓存(torch.save 段错误,待修)。
 
-### D-目标2(2026-06-10,进行中):动态 decode 常驻池——机制已通,real-topK 退化待根因
+### D-目标2(2026-06-10→11,根因已坐实):动态 decode 常驻池——机制全对,退化=量化命中率权衡(非 bug),MXFP4 下反转为收益
 
 实现(sglang `468ea4662`+`df220520f`,`KT_DYNAMIC_RESIDENT=1`):流式 prefill 期 device bincount
 计每层激活;末层把静态 prefix-32 换成本请求每层 top-32:权重从 DDR NZ 池 host-gather 进 pinned
@@ -624,12 +624,36 @@ staging → 整张量 copy 进 `layer.w13_weight/w2_weight`(**per-slot NZ 切片
 staging 整张量路径 bitwise == fresh cast**),scale device 索引,三处路由结构**原地**改写
 (KTEP device mask+l2g;kt_kernel pinned CPU mask——C++ 持指针 live 读)。切换 ~21s/请求(可优化)。
 
-**证据链(三次判别实验,全部已提交)**:
-| 实验 | 长 prompt decode | 结论 |
-|---|---|---|
-| `KT_DYN_FORCE_PREFIX=1`(0..31)| ✅ 干净 | **切换机制全对**(权重/双 mask/l2g/graph 原地可见性)|
-| `KT_DYN_FORCE_SET=shift1`(1..32)| ✅ 干净(64 token)| **decode graph 吃非 prefix 集没问题** |
-| 真 top-K(每层异集,id 跨全域)| ✗ ~15 token 后 `_lame` 循环 | **唯一遗留异常** |
+**关键重构(读 `_streaming_forward` 确认):动态常驻是 decode-only 量化混合效应,与 prefill 无关。**
+流式 prefill(M≥512)每层走全 256 专家 streaming 路径(全 W8A8,精确),`_apply_dynamic_residency`
+只在末层副作用改写 `layer.w13_weight`,**只影响后续 decode(M=1)的 hybrid 路径**。所以:
+- baseline decode(prefix-32)= 32 专家 W8A8-NPU + 224 专家 Q8_0-CPU(后者扛 87% 流量);
+- 真 top-K decode = 把扛 56% 流量的**热**专家提到 W8A8-NPU,冷专家落 Q8_0-CPU。
+两者差异 = **哪 32 个专家走 W8A8 vs Q8_0**。退化 ⇔ 把高流量热专家放到更粗的 W8A8 路径上。
+
+**证据链(判别实验,全部已提交)**:
+| 实验 | 常驻集性质 | hit | 长 prompt decode | 结论 |
+|---|---|---|---|---|
+| `FORCE_PREFIX=1`(0..31)| 同基线/低 id | 13% | ✅ 干净 | **切换机制全对**(权重/双 mask/l2g/graph 原地可见性)|
+| `FORCE_SET=shift1`(1..32)| 固定,最小扰动 | 13% | ✅ 干净(64 tok)| **decode graph 吃非 prefix 集没问题** |
+| `FORCE_SET=permlayer`(每层 `[L*8..]%E`)| 每层异集,**固定**| 12.5% | ✅ 干净(64 tok)| 排除"每层异集"嫌疑 |
+| `FORCE_SET=scatter`(每层 stride-7)| 每层**散布**,固定 | 12.7% | ✅ 干净(64 tok,`_layers=43`/W8A8 连贯)| 排除"层内散布常驻"嫌疑 |
+| `FORCE_SET=antitop`(每层 bottom-K)| **数据相关**,低 hit | **0.6%** | ✅ 干净(64 tok,`_layers=1`/qk_rope 连贯)| **数据相关路径无辜** |
+| 真 top-K(每层热集)| 数据相关,**高 hit 0.56**| 56% | ✗ ~15 tok 后 `_lame` 循环 | **唯一遗留异常** |
+
+五个对照集全干净 → bug **不是**切换机制、不是非 prefix、不是每层异集、不是层内散布、**不是数据相关选择**
+(`antitop` 数据相关但低 hit,干净)。real-topK 与所有干净集的唯一区别 = **NPU 命中率(0.6%/13% 干净
+vs 56% 退化,单调)**。
+
+**根因结论(已坐实,2026-06-11):退化由 hit-rate 驱动,是量化精度权衡,非代码 bug。**
+切换机制 5 个受控变体全对。当前 CPU=Q8_0(per-block-32,细)、NPU=W8A8(更粗);把扛 56% 解码
+流量的**热**专家从细的 Q8_0-CPU 提到粗的 W8A8-NPU,误差累积把贪心解码推进重复吸引子。命中率越高
+(W8A8 承接的热流量越多)退化越重——这正是 Goal 2「把热专家提到 NPU 提速」的固有代价 **在当前
+量化配置下**。
+
+**对路线图的关键含义(会反转!):用户后续计划 CPU→MXFP4(4-bit,比 W8A8 更粗)。届时 NPU-W8A8
+变成更细的路径,把热专家提到 NPU 将同时提速 + 提精度——退化反转为纯收益。** 即 Goal 2 的精度顾虑
+是当下「CPU 恰好更细」的临时产物;在目标 MXFP4-CPU 配置下,动态热专家常驻是干净的双赢。
 
 **重要方法论结论**:
 1. `readback==False` 但 force-prefix 干净 → param `copy_` 非对称(H2D raw 字节、D2H 格式转换),
@@ -638,10 +662,16 @@ staging 整张量路径 bitwise == fresh cast**),scale device 索引,三处路�
    混合 → 欠定 prompt 贪心天然漂移(force-prefix 的短答案同样答非所问)。判质量须强上下文或定量指标。
 3. prefill top-K share:真 top-K 0.559(单请求局部性强于聚合分布的 0.395!),prefix 0.133 ✓ 自洽。
 
-**下一步(按性价比)**:(a) `FORCE_SET=224..255`(纯高 chunk 固定集)判"高 id 专家提取"嫌疑;
-(b) 每层不同 set 但固定(如 layer L 取 (L*8..L*8+31)%256)判"每层异集"嫌疑;(c) 用 teacher-forced
-logprob(/generate return_logprob)做定量精度指标替代肉眼;(d) 若全过 → real-topK 退化可能是量化混合
-漂移撞上重复吸引子 → 评估接受/缓解(如限制常驻切换比例)。诊断开关:`KT_DYN_FORCE_PREFIX/_FORCE_SET/_SKIP_WEIGHTS`。
+**诊断开关(已落 commit)**:`KT_DYN_FORCE_PREFIX` / `KT_DYN_FORCE_SET=shift1|permlayer|scatter|antitop`
+/ `KT_DYN_SKIP_WEIGHTS`。判别链已收敛,无需再加变体。
+
+**剩余可选(非阻塞)**:
+- 定量化:teacher-forced decode logprob/perplexity 给"W8A8 比 Q8_0 粗多少"一个数(机制上需第二次
+  请求在常驻集生效后 prefill 打分;qualitative 重复循环 + 单调 hit-rate 判别已足够定性坐实)。
+- 直接验证 W8A8 vs Q8_0 量化粒度:看 compressed-tensors checkpoint 的 scale 是 per-channel 还是
+  per-tensor(若 per-channel 即比 Q8_0 per-block-32 粗,佐证根因)。
+- 等 CPU→MXFP4 落地后复测真 top-K decode:预期退化反转为收益(见上「路线图反转」)。这是 Goal 2
+  真正的目标配置,应作为后续 session 的验收点。
 
 ### D-阈值. ✅ "长度阈值:短走 hybrid / 长走纯流式"——有价值,但定位是短 prompt 保护(2026-06-10)
 

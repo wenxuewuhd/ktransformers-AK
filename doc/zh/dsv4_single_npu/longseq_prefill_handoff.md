@@ -535,6 +535,25 @@ baseline(32 GPU experts,不流式)**也做 NZ 转换**,但没这延迟,两个原
 > **MXFP4**(GGUF 里就没有 NPU 要的 int8 了)→ NPU 流式池**必须**从 safetensors 建。**这点不能违反。**
 > ∴ 之前"像 GGUF loader"的说法要更正:**重点是"并行读 safetensors"这个技术,不是复用 GGUF 数据**。
 
+#### 2c-ii-c6 ✅ 启动耗时精确分解 + pipelined 建池(2026-06-11,受控对照)
+
+**`KT_LOAD_PROFILE=1`(kt_ep_wrapper.process_weights 插桩)+ baseline/warm 对照,把 519s 谜团钉死**:
+
+| | Load weight | GGUF | construct+safetensors | parread | 总启动 |
+|---|---|---|---|---|---|
+| **baseline(关流式)** | 121s | **63.7s** | 55s | — | **152s** |
+| 流式 warm(串行 parread)| 306s | 60.5s | 61s | 182s | 398s |
+| 流式 cold(早先)| 454s | — | — | 172s | 519s |
+| **流式 warm + pipelined parread** | — | — | — | **110s** | **338s** |
+
+**结论(195s 谜团解开)**:① GGUF(~62s,287GB CPU 专家)和 safetensors(~58s)在 warm 下流式 vs baseline **几乎一样**——
+流式没拖慢它们;② cold 519s 比 warm 398s 多的 ~120s = **纯 page-cache 冷读方差**,非真实成本;③ **流式真实
+确定增量 = parread 建池**。**GGUF 63.7s 是 baseline 最大单项**(CPU 切 MXFP4 后会变)。
+
+**pipelined parread ✅**:8 个 O_DIRECT 读 worker(NVMe/CPU)产出 buffer,主线程逐层 NZ-cast(NPU)消费;
+read(~101s)与 NZ(~80s)用不同资源 → 重叠到 **110s(first-read 20s)**,vs 串行 182s = **省 72s(40%)**。
+精度 ✓ 逐字一致。**下一步:让 parread(110s)与模型加载(152s)重叠,把这 110s 也藏掉。**
+
 #### 2c-ii-c5 ✅ 并行 O_DIRECT 建池实测(2026-06-11,生产满配 card0)
 
 `_build_pool_parread`(8 worker O_DIRECT 读全 256 专家 safetensors → pinned ND → 就地 NZ)。capture 改 no-op。

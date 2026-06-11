@@ -668,25 +668,23 @@ Q8_0 per-block-32(每行 128 scale)→ 沿收缩维 W8A8 比 Q8_0 粗 128×。�
 高贡献专家留在与参考一致的 NPU**正是 real-topK 在做的事;MXFP4-CPU 之后更成立(更粗的 CPU 专家恰好该是
 低贡献那批)。**故 Goal-2 的精度顾虑在正确基线下基本不成立;后续验收 = 单卡流式+常驻 对齐 多卡全-NPU-int8。**
 
-**decode 提速实测(2026-06-11,A/B 同条件,3637-token prompt,temp0)**:
-| 配置 | decode | 输出 | 权重命中(prefill share)|
-|---|---|---|---|
-| A `prefix-32` | **0.31 tok/s**(256 tok,e2e 823s) | 连贯 | 0.13 |
-| B `real-topK` | 表观 1.98 tok/s(120 tok) | `_lame` 循环 | 0.559 |
+**⚠️ decode 提速实测——作废重测(2026-06-11)**:这台机器是**共享**的,decode 是 K920 DDR 带宽 bound,
+邻居容器一忙就把本服务 decode 从 ~9 tok/s 饿到 0.3(单测绝对值随邻居负载摆 ~24×)。下面这版用了**不同
+负载窗口**测的两个数(A 在 card 0/3/5 都 86–95% 的拥挤时刻测出 0.31,B 另一时刻 1.98),**两个数不在同一
+争用下,不可比**,故 6.4×/公平 1.9× 的结论**作废**。
 
-**关键:B 的表观提速被重复循环放大,不能直接当奖品。** B 的 per-window:win1 0.08(含 prefill)→ win2
-**4.53** → win3 **6.07**——decode 随循环收紧而**加速**,因为重复 token 每步命中同一批常驻热专家,decode 实际
-命中率冲向 ~100%、CPU 专家→0、几乎全上 NPU。所以表观 6.4×(乃至 win3 ~20×)是退化假象。
+~~A prefix-32 0.31 / B real-topK 1.98 / CPU-bound 回填公平 1.9×~~ ——baseline 被邻居争用污染,不算数。
+(B 单请求内 per-window 0.08→4.53→6.07 的**加速**仍是真的:重复循环每步命中同批常驻热专家→命中率→~100%
+→几乎全上 NPU。这说明 decode 确被 CPU-offload 专家数 bound,但**倍数要在同负载配对下重测**。)
 
-**CPU-bound 模型回填出公平倍数**:`t/token = c·(CPU专家数) + k`,CPU专家 ≈ 6·(1−h)。
-两锚点:A(h=0.13,5.22 CPU专家,3.23 s/tok)、B-win3(全循环 h→1,CPU≈0,0.165 s/tok ⇒ 固定开销
-**k≈0.165 s/tok**=attention+NPU+routing)→ 解出 **c≈0.59 s/CPU专家·token**。代入 B 真实热集 h=0.56
-(2.64 CPU专家):t=0.59·2.64+0.165=1.71 s/tok=**0.58 tok/s** → **公平提速 ≈ 1.9×**。
+**流式 prefill 对 decode 无影响(已配对坐实,2026-06-11)**:同条件交替 A=流式(8013)vs B=非流式(8015),
+短 prompt 隔离 decode,6 轮:ratio A/B = **1.00**(round1–5:1.01/0.95/1.05/1.00/1.00;round0 0.72 是首请求 graph
+warmup)。**277GB pinned pool 不拖慢 decode。** 之前担心的"流式拖垮 decode"是邻居争用假象,非流式本身。
+脚本 `tools/longseq_dbg/{measure_decode_speed,profile_decode,paired_decode}.py`。
 
-**结论:速度与命中率干净匹配** —— decode 被 CPU-offload 专家数线性卡住(`t≈0.59·CPU专家数+0.17`),
-命中 0.13→0.56 → **~2× decode**(对上 §D-阈值 的 ~2× 上限预测)。减 CPU 专家(热专家常驻 NPU)是对的杠杆;
-但 ~2× 的公平奖品**只在能连贯解码的目标配置**(多卡全-NPU 基线 / MXFP4-CPU)下可拿,当前单卡 hybrid 下
-real-topK 会退化(见上),表观倍数不可信。脚本 `tools/longseq_dbg/measure_decode_speed.py`。
+**待重测(同负载配对)**:prefix-32 vs real-topK decode tok/s,用 `paired_decode.py` 交替两服务同一争用窗口测,
+才能得到 Goal-2 真实提速倍数(预期仍 ~2×,但需坐实;且 real-topK 重复循环会把表观倍数冲高,须用连贯解码或
+per-token 命中率校正)。**教训**:共享机器单测 decode 绝对值无意义,必须同窗口配对 / 控 CPU busy%。
 
 **重要方法论结论**:
 1. `readback==False` 但 force-prefix 干净 → param `copy_` 非对称(H2D raw 字节、D2H 格式转换),

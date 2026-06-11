@@ -484,6 +484,40 @@ safetensors。目标:**第一条 prompt 无额外建池耗时**(建在加载里)
 - `capture_expert` **物化** memcpy 进该层**最终 pinned ND 缓冲**(shard 页正热);每层 1536 张量凑齐
   **立即就地 NZ**(chunked ND→HBM→cast→写回**同一块** pinned 字节;单测 bitwise == 整体 cast);
   **零 stage、零额外缓冲、建池摊进加载循环**;in-loop cast 失败(HBM 紧)defer 到 last-layer 重试。
+#### 2c-ii-c4 建池 roofline(2026-06-11):瓶颈是单线程 buffered 读 checkpoint,非 H2D
+
+各链路实测带宽 + 读 277GB 耗时(`/tmp` 受控测量):
+
+| 链路 | 实测带宽 | 277GB |
+|---|---|---|
+| H2D (PCIe) | 24 GB/s | **12s** |
+| HBM 内 NZ 转换 | 1.37 TB/s | 0.2s |
+| pinning(并行 / 预热后串行)| 44 / 6.8 GB/s | 6~40s |
+| memcpy DDR→pinned | 6.9 GB/s | 40s |
+| **safetensors 读(现状:单线程 buffered mmap + 1536 get_tensor/层)** | **0.8 GB/s** | **343s ← 瓶颈** |
+| NVMe 裸读 direct 单线程 | 3.2 GB/s | 87s |
+| NVMe 裸读 direct 并行(卷上限,8 路仅 3.57)| 3.5 GB/s | 79s |
+
+**判读**:H2D 只占 12s(用户直觉对,完全不是瓶颈);~330s 是**读 + rearrange 277GB**。⚠️ pinning 首块
+0.71 GB/s 是冷启动假象(warmup 教训),预热后 6.8-44 GB/s,非瓶颈;buffered 读受 page-cache 污染测不准。
+
+**O_DIRECT 受控测量(cache-independent,可信)+ 深挖结论(`tools/longseq_dbg/odirect_reader.py`,正确性 ✓)**:
+| 操作 | 带宽 | 说明 |
+|---|---|---|
+| O_DIRECT 读(纯读,不拷出)单线程 | 2.7 GB/s | = `dd iflag=direct` |
+| O_DIRECT 读 并行 4-8 文件 | **3.5 GB/s** | = NVMe 卷上限(并行不再涨)|
+| **O_DIRECT 读 + per-expert rearrange(单线程)** | **0.76 GB/s** | ← rearrange 是真瓶颈 |
+| 同上 4 线程并行 | 1.2 GB/s | rearrange 的 GIL/dispatch 限制,仅 ~2× |
+| memcpy DDR(rearrange 数据量)| 6.9 GB/s | 数据本身 277GB=40s,Python 768 拷/层 inflate 到 ~360s |
+
+**根因**:checkpoint 专家布局是 **expert-major 但散布**(每专家 w1/w2/w3 连 24MB,但专家在文件里跳着排)→
+建池要 **768 次/层 per-expert copy** 把专家摆进池 layout(w13=concat[gate,up])。**raw 读能到 3.5 GB/s,
+但 Python per-expert rearrange 把整体压回 ~0.76-1.2 GB/s**——这是 Python 硬顶。
+
+**结论**:① **H2D 完全不是瓶颈(12s),用户直觉对**;② 真瓶颈是 Python 读+rearrange 277GB(~1 GB/s);
+③ Python 并行最多 ~2×(400s→~200s);④ **要到 NVMe 速度(3.5 GB/s,建池~150s)必须把读+rearrange 落 C++**
+(像 kt-kernel GGUF loader 那样,6 GB/s)。落盘缓存(NZ 字节直读)也能绕开,但 torch.save 段错误待修。
+
 - **实测(生产满配 card1)**:每层 NZ 仅 **1.5-1.6s**(旧 13-14s,~9×);43 层全部 in-loop 完成;
   **启动总 553s**(旧 ~750s);建池新增成本 600s→~400s,其中 NZ 65s,**剩余是必须的一次性 I/O**
   (240GB 冷专家 NVMe 读 ~90s + 277GB memcpy + 277GB pinning)≈ 物理地板,再快需线程化 capture 流水(边际)。

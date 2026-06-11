@@ -21,6 +21,9 @@
 #include "llama.cpp/ggml-quants.h"
 #include "llama.cpp/ggml.h"
 #include "llamafile/sgemm.h"
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // KT_MOE_PHASE_TIMING=1 — Session D Phase-0 测量：decode (forward_one) 三段
@@ -82,32 +85,77 @@ static inline ggml_type kt_effective_vec_dot_type(ggml_type weight_type) {
 // Kunpeng 920 (aarch64, dotprod, no SVE/i8mm): iqk_mul_mat and tinyBLAS_Q0_ARM both
 // produce NaN for Q8_0×Q8_0. Use ggml's vec_dot (same as llama.cpp) for MoE GEMMs.
 #if defined(__aarch64__) && !defined(__ARM_FEATURE_SVE)
+
+// kt Q8_0×Q8_0 GEMV-row dot — same two wins proven on the MXFP4 kernel (commit
+// b601b06, +2.4x), ported to the Q8_0 path WITHOUT touching ggml's original
+// ggml_vec_dot_q8_0_q8_0 (kept as the safe reference; this is kt-only, lives here):
+//   (1) in-row software prefetch ~512B ahead — the TSV110 HW prefetcher can't keep
+//       up with this loop's low load density; weight rows stream from DRAM and the
+//       per-row cold-miss latency is otherwise fully exposed.
+//   (2) two float32x4 FMA accumulators instead of per-2-block vaddvq + scalar adds,
+//       removing the serial horizontal-reduce dependency chain.
+// Numerically equivalent up to FP reassociation (deferred horizontal add): result =
+// sum_b d_b * sum_lane(prod_b) = sum_lane( sum_b d_b*prod_b ). dotprod is guaranteed
+// by the build march (armv8.2-a+fp16+dotprod), so raw vdotq_s32 is safe (no fallback).
+static inline float kt_vec_dot_q8_0_q8_0(int nb, const block_q8_0* __restrict x,
+                                         const block_q8_0* __restrict y, bool prefetch_on) {
+  float32x4_t s0 = vdupq_n_f32(0.0f);
+  float32x4_t s1 = vdupq_n_f32(0.0f);
+  int ib = 0;
+  for (; ib + 1 < nb; ib += 2) {
+    if (prefetch_on) __builtin_prefetch((const char*)&x[ib] + 512, 0, 0);
+    const int8x16_t xa0 = vld1q_s8(x[ib + 0].qs), xa1 = vld1q_s8(x[ib + 0].qs + 16);
+    const int8x16_t xb0 = vld1q_s8(x[ib + 1].qs), xb1 = vld1q_s8(x[ib + 1].qs + 16);
+    const int8x16_t ya0 = vld1q_s8(y[ib + 0].qs), ya1 = vld1q_s8(y[ib + 0].qs + 16);
+    const int8x16_t yb0 = vld1q_s8(y[ib + 1].qs), yb1 = vld1q_s8(y[ib + 1].qs + 16);
+    const int32x4_t p0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), xa0, ya0), xa1, ya1);
+    const int32x4_t p1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), xb0, yb0), xb1, yb1);
+    __fp16 hxa, hya, hxb, hyb;
+    memcpy(&hxa, &x[ib + 0].d, 2); memcpy(&hya, &y[ib + 0].d, 2);
+    memcpy(&hxb, &x[ib + 1].d, 2); memcpy(&hyb, &y[ib + 1].d, 2);
+    s0 = vfmaq_n_f32(s0, vcvtq_f32_s32(p0), (float)hxa * (float)hya);
+    s1 = vfmaq_n_f32(s1, vcvtq_f32_s32(p1), (float)hxb * (float)hyb);
+  }
+  float sumf = vaddvq_f32(vaddq_f32(s0, s1));
+  for (; ib < nb; ++ib) {  // odd-block tail
+    const int8x16_t x0 = vld1q_s8(x[ib].qs), x1 = vld1q_s8(x[ib].qs + 16);
+    const int8x16_t y0 = vld1q_s8(y[ib].qs), y1 = vld1q_s8(y[ib].qs + 16);
+    const int32x4_t p = vdotq_s32(vdotq_s32(vdupq_n_s32(0), x0, y0), x1, y1);
+    __fp16 hx, hy; memcpy(&hx, &x[ib].d, 2); memcpy(&hy, &y[ib].d, 2);
+    sumf += (float)hx * (float)hy * (float)vaddvq_s32(p);
+  }
+  return sumf;
+}
+
 static inline bool kt_llamafile_sgemm(long m, long n, long k, const void* A, long lda, const void* B, long ldb,
                                       void* C, long ldc, int ith, int nth, int task, ggml_type Atype,
                                       ggml_type Btype, ggml_type Ctype, int precision) {
   if (Atype == GGML_TYPE_Q8_0 && Btype == GGML_TYPE_Q8_0 && Ctype == GGML_TYPE_F32 && ith == 0 && nth == 1) {
-    const int ne = static_cast<int>(k * ggml_blck_size(GGML_TYPE_Q8_0));
-    const size_t bx = static_cast<size_t>(lda) * sizeof(block_q8_0);
-    const size_t by = static_cast<size_t>(ldb) * sizeof(block_q8_0);
+    const int ne_blocks = static_cast<int>(k);  // k is in Q8_0 blocks (1 block = 32 elems)
     auto* c = static_cast<float*>(C);
     const auto* a = static_cast<const block_q8_0*>(A);
     const auto* b = static_cast<const block_q8_0*>(B);
-    // M=1 GEMV is DDR-bandwidth-bound; warm the head of the next weight row while
-    // dotting the current one to hide the per-row cold miss and raise memory-level
-    // parallelism. Env-gated for A/B: KT_NO_MOE_PREFETCH=1 disables.
+    // M=1 GEMV is DDR-bandwidth-bound. kt_vec_dot_q8_0_q8_0 does in-row +512B prefetch
+    // + vector-FMA accumulate (the MXFP4 b601b06 wins, ported here; ggml original
+    // untouched). Keep a next-row head warm too. Env-gated: KT_NO_MOE_PREFETCH=1 off.
     static const bool prefetch_on = (std::getenv("KT_NO_MOE_PREFETCH") == nullptr);
+    // KT_Q8_REF=1: fall back to ggml's original vec_dot (A/B baseline + safety escape).
+    static const bool q8_ref = (std::getenv("KT_Q8_REF") != nullptr);
+    const size_t bx = static_cast<size_t>(lda) * sizeof(block_q8_0);
+    const size_t by = static_cast<size_t>(ldb) * sizeof(block_q8_0);
     for (long j = 0; j < n; ++j) {
       const auto* b_col = b + ldb * j;
       for (long i = 0; i < m; ++i) {
         if (prefetch_on && i + 1 < m) {
-          const char* nxt = reinterpret_cast<const char*>(a + lda * (i + 1));
-          __builtin_prefetch(nxt, 0, 1);
-          __builtin_prefetch(nxt + 64, 0, 1);
-          __builtin_prefetch(nxt + 128, 0, 1);
-          __builtin_prefetch(nxt + 192, 0, 1);
+          __builtin_prefetch(reinterpret_cast<const char*>(a + lda * (i + 1)), 0, 1);
         }
-        float sum = 0.f;
-        ggml_vec_dot_q8_0_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
+        float sum;
+        if (q8_ref) {
+          sum = 0.f;
+          ggml_vec_dot_q8_0_q8_0(ne_blocks * 32, &sum, 0, a + lda * i, bx, b_col, by, 1);
+        } else {
+          sum = kt_vec_dot_q8_0_q8_0(ne_blocks, a + lda * i, b_col, prefetch_on);
+        }
         if (!std::isfinite(sum)) {
           sum = 0.f;  // defensive; should not happen with valid weights/activations
         }

@@ -946,3 +946,11 @@ KT_POOL_BOUNCE=1(池 unpinned + 6.4GB pinned bounce 做 H2D)实测:switch profil
 - 全程 unpinned:decode 无税(~15)但 prefill H2D 慢(237s,无 DMA)。
 
 **干净的解 = 消池(MXFP4 流式)**:无池→无税→热专家收益 + prefill 1.8× + 省 277GB。但 agent② 证**向量化 PyTorch 转换 3.4s/层(比 345ms 慢 10×),必须写 AscendC fused dequant kernel**。瓶颈已精确定位:dequant 段(nibble unpack + FP4 + e8m0 scale,int32 flat-index 物化 + 13GB bf16 中间量,launch/materialization bound,非带宽)。requant(196ms)+nz(599ms)是 NPU-native,可不动。脚本 `tools/longseq_dbg/mxfp4_conv_vectorized_npu.py`(向量化版,bit-exact,但慢)。
+
+### D-端到端"两个收益"测不准(2026-06-11):共享 NUMA 噪声击败小样本
+unpinned + real-topK 实测:cpu_moe_wall **min 12.3ms(税-free+热专家地板对)/ median ~44ms / max 72ms**,decode ~7.8 tok/s。
+**每个配置 cpu_moe_wall 都在 12-120ms 巨幅摆**(NUMA skew + max-of-8 + c3 邻居),100-150 token 小样本根本测不稳——
+handoff 自己也要 ≥500 token + 独占机才出稳定 median。**min 12ms 证明地板存在,但 median 是噪声。**
+**结论**:① 组件级已证(热专家砍 cpu_moe_wall low-end 39→20;流式 prefill 真;pin 税真且 runtime 去不掉)。
+② 端到端"两收益一起"的干净数,**这台共享机给不了**,需独占机或换路。③ **可靠的路 = AscendC 消池 dequant kernel**
+(无池→无税无论 pin/size,decode 满速+热专家+省 277GB,agent 已给精确 spec)。

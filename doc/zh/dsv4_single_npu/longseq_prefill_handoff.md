@@ -915,3 +915,11 @@ decode 保持连贯,OOM 安全(失败回退静态集)。
 
 **修复方向(关键,未做)**:流式池在 decode 期是**闲置**的(decode 走 hybrid,常驻热专家已在 HBM,非常驻走 MXFP4 GGUF)。
 **切换后释放/缩小流式池** → decode 恢复 ~16 + 热专家上 NPU 的提速。代价:下次长 prefill 要重建池(~110s)。decode-heavy 负载划算。
+
+### D-流式 decode 税根因=PIN 非 SIZE(2026-06-11,用户点破):unpin 即恢复
+**实验(KT_POOL_NO_PIN=1,池建在常规 DDR 不 page-lock,quiet 窗口)**:streaming decode 窗口 6→8→11→**14→15** tok/s
+(climb 到 ~15,≈ trunk 16;早期低是首请求 unpinned-H2D 慢的瞬态)。**vs pinned streaming ~8。**
+→ **decode 税来自 pin(page-lock 扰乱 CPU MoE 的 DDR 带宽/NUMA/大页),不是 277GB 占用本身。数据放 DDR 没问题,别 pin。**
+**代价**:全程 unpin 使流式 prefill H2D 大幅变慢(首请求 237s vs pinned ~14s)。
+**正解**:prefill 期 pin(H2D 快)→ 切换后 unpin(decode 快,~16)→ 下次 prefill 前再 pin;或大池 unpin + 小 pinned bounce buffer 做 H2D。
+两者都能同时拿到 **快 prefill + ~16 decode + 热专家上 NPU**——这才让 MXFP4+热专家 > 16 成立。

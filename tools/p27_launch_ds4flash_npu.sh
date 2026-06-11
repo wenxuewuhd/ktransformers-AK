@@ -170,6 +170,12 @@ if [[ "${SKIP_WARMUP}" == "0" ]]; then
   WARMUP_FLAG=""
 fi
 echo "[p27] SKIP_WARMUP=${SKIP_WARMUP} (warmup_flag='${WARMUP_FLAG}')"
+# 可调 env（2026-06-11 加）：
+#   KT_NUM_GPU_EXPERTS  每层放 NPU 的 expert 数，默认 32。每多 1 个 ≈ +1.0GB HBM。
+#       实测上限（context 65536）：40 可起（KV max_total=135k，仍≥2×context），42 崩
+#       （SWA 多池 c128 盘口算负）。想更多须降 --context-length 或改 KV 分配算法。
+#   MEM_FRACTION  默认 0.85。⚠️ 实测在本 NPU 路径下不影响 avail mem（0.85/0.92 同样 60.5GB），
+#       故不能靠它腾 HBM；保留仅为兼容。
 # shellcheck disable=SC2086
 exec "${PYTHON_BIN}" -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
@@ -181,14 +187,14 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --disable-shared-experts-fusion \
   --dtype bfloat16 \
   --trust-remote-code \
-  --mem-fraction-static 0.85 \
+  --mem-fraction-static "${MEM_FRACTION:-0.85}" \
   --disable-radix-cache \
   --max-prefill-tokens 65535 \
   --context-length 65536 \
   --watchdog-timeout 18000 \
   ${WARMUP_FLAG} \
   --kt-method LLAMAFILE \
-  --kt-num-gpu-experts 32 \
+  --kt-num-gpu-experts "${KT_NUM_GPU_EXPERTS:-32}" \
   --kt-weight-path "$KT_GGUF_TEMPLATE" \
   --kt-threadpool-count 8 \
   --kt-cpuinfer "$KT_CPUINFER" \

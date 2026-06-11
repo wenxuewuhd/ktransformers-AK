@@ -313,3 +313,36 @@
 - 与 B/C 的边界：本任务只动 CPU 权重格式与 kernel，不碰 submit/sync/overlap 编排（B）与
   流式加载/常驻策略（C）;但 **C 的流式加载将来搬的也是这份 mxfp4 GGUF**（字节减半对 C 直接利好），
   合并次序无硬依赖。
+
+---
+
+## §NPU expert 容量上限（2026-06-11 实测）
+
+问题：当前配置（910B3 64GB、context 65536、`max-running-requests 1`）下 NPU 最多放几个 expert/层？
+
+**实测扫描**（每点拉服务看加载期内存，不受运行时噪声影响）：
+
+| experts/层 | weights | weight 后 avail | 结果 | KV max_total_num_tokens |
+|---|---|---|---|---|
+| 32（默认） | 42.4 GB | 18.1 GB | ✅ | 1.5M |
+| 38 | 48.5 GB | 12.0 GB | ✅ | 479k |
+| **40** | 50.4 GB | 10.1 GB | **✅（上限）** | 135k（仍 ≥2×context） |
+| 42 | 52.5 GB | 8.0 GB | ❌ c128 assert | — |
+| 45 | 55.5 GB | 5.0 GB | ❌ c128 assert | — |
+
+**单 expert 成本**：实测 ≈ **1.007 GB/expert/层**（W8A8：3×2048×4096 int8）。
+
+**结论：当前算法不改、不降 context → 上限 40 experts/层。**
+
+**为什么不是更高 / 要不要改 KV 算法**：
+- 崩在 `pool_configurator._solve_pool_sizes` 的 `assert c128_max_total_num_tokens > 0`。DSv4 是
+  NSA sliding-window hybrid KV（full + swa + c4 + c128 多池）；c128 主池 = (total_tokens·head_dim −
+  c4_state/c128_state/swa 等**不可压缩 indexer 盘口**)/denom。剩余内存太小时分子被固定盘口减成负。
+- `--max-total-tokens` **无效**：total_tokens 由剩余内存推算，不是该 flag 决定。
+- `--mem-fraction-static` **在本 NPU 路径无效**：0.85/0.92 实测 avail 都是 60.50GB。
+- 所以唯一"不改算法"的腾内存手段是**减 expert**或**降 `--context-length`**（KV/indexer 盘口随 context 线性降，
+  context 8192 可腾出 ~7GB → 估可到 ~46）。真要在 65536 context 下放 >40，得改 KV 算法（降 indexer/SWA 固定池盘口）。
+- **性价比**：40 vs 32 只让 CPU 端 top-6 命中从 5.25→5.0（CPU 字节 -5%，小杠杆；配频率放置才放大）。
+  为多放 8 个去改 KV 算法不划算；要放更多优先考虑降 context 或 B 线热专家放置。
+
+env：`KT_NUM_GPU_EXPERTS=40 bash tools/p27_launch_ds4flash_npu.sh`（脚本已参数化）。

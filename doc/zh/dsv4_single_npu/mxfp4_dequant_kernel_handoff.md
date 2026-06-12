@@ -341,11 +341,19 @@ decode 侧 `kt_ep_wrapper.py` / kt-kernel `experts_base.py` 的 submit/sync/comb
 - vs W8A8 H2D 345ms:**持平**——消池后"MXFP4 H2D + 现转"替掉"W8A8 H2D",prefill **不退化**(§0.2 预期"保留")。
 - vs MXFP4 H2D ~170ms:**~2× 偏大,未藏住**——现转会成为流水每层地板(~358 而非 ~170),即 prefill 持平 W8A8 而非
   更快;消池主奖(decode pin 税消失 + DDR 砍 2/3)**不受影响**。
-- **瓶颈定位实测**:dequant-only(无 reduction/requant)w13 仅 **135ms / 127GB·s**;加 per-output-channel
-  **标量 reduction**(`tl.max`)+ requant → 215ms / 20GB·s。即**卡在每行归约**,不是带宽、不是 decode 数学、不是
-  store 布局(num_warps / 选择式解码 / strided-vs-contiguous store 都实测过,均不是瓶颈)。
-  **下一步提速正解** = 跨行向量化 tiling(一程序吃 [RB, 行]、沿列轴归约成 [RB] 而非标量),但受 UB 192KB 限,
-  迭代成本高;因主奖与"持平"已够,本 session 未做,留给后续。
+- **瓶颈实测(已穷尽 Triton 侧的杠杆,别重试)**:
+  - 单点定位:把 reduction 换成**常量 scale**(不归约)→ 358→**311ms**,即 **reduction 只占 ~47ms**;
+    `dequant-only`(decode + strided fp32 store,无 requant)135ms 但写 17GB fp32(被 fp32 写带宽卡)。
+    → **大头 311ms 是 decode + requant(round/clamp/cast)+ int8 strided store**,不是归约、不是带宽。
+  - **跨行向量化 tiling 已试,UB 炸,放弃**:RB=2 整行宽 [RB,NB,16] 即 268KB(fp32)/ 252KB(bf16 中间量)
+    > UB 192KB——**单行就吃掉 ~126KB**(decode 的 sign/exp/mant/base/mag × lo/hi 多个中间量,编译器不复用),
+    2 行必爆。bf16 中间量(dequant 值 bf16 无损)只省一点,仍爆。
+  - 其它杠杆全实测无效:`num_warps`(1/8/16 无差)、`multibuffer=False`、`floor(x+0.5)` vs libdevice round
+    (无差)、strided vs contiguous int8 store(contiguous 反而更慢)、gather-load(灾难 2068ms)。
+  - **结论**:**Triton 在本后端就落在 ~310–360ms,<150ms 在 Triton 路线不可达**(去掉归约也只到 311;唯一能
+    摊薄归约的跨行被 UB 挡死)。要压到 ~12ms 理论地板,只能走 **AscendC**(显式 tiling / 双缓冲 / MTE 控制,
+    §3 的 fallback)——那是几百行、独立的大活。**但 350ms 已让 prefill 与 W8A8 H2D 持平、消池主奖全拿**,
+    是否值得为"藏住 prefill"再投 AscendC,需权衡(收益只是 prefill 持平→更快,decode 主奖不依赖它)。
 
 ### 11.3 §10.2 集成 = **组件级已证,生产 wiring 留补丁**
 - `mxfp4_layer_to_slots(c13,s13,c2,s2,H,I)` 直接吐 `npu_fused_experts` 要的槽张量

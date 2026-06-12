@@ -4,11 +4,27 @@
 see `doc/.../mxfp4_dequant_kernel_handoff.md` §11) by writing the dequant op in AscendC, where
 explicit tiling/pipelining/MTE control can approach the ~12ms HBM-bandwidth floor.
 
-## Status: WIP. The int8 weight output is CORRECT (single + multi core); only the per-channel
-## `oscale` GM write is unresolved. Do NOT wire into production until oscale is fixed.
+## Status: WORKING end-to-end via TWO kernels (int8 + oscale). e2e cos 0.99999976 vs fp32 golden;
+## 165 ms/layer (E=256), 2.2x faster than the Triton 358 ms. The oscale GM-write quirk in the
+## single fused kernel was sidestepped, not solved (see below).
 
-> Authoritative agent-facing spec/golden/acceptance live in `tools/mxfp4_w8a8_op/` — use those
-> to (re)implement. This dir is the WIP reference kernel + hard-won findings.
+> Authoritative agent-facing spec/golden/acceptance live in `tools/mxfp4_w8a8_op/`.
+
+### Working operator (this dir)
+- `mxfp4_dq_kernel.cpp` — MXFP4 → int8 weight (two contiguous planes `[lo|hi]`; de-interleave in a
+  torch post-step). Correct single + multi core. Its own `oscale` output is broken/unused (ignored).
+- `mxfp4_oscale_kernel.cpp` — MXFP4 → per-output-channel `oscale = amax/127`. Correct single + multi
+  core: accumulates scales per core in UB and flushes each block as ONE large contiguous `DataCopy`
+  (sidesteps the small-store-interleaved-with-loads failure mode).
+- `test_e2e_combined.py` — both kernels → de-interleave → NZ → real `npu_fused_experts`:
+  **cos(kernel, fp32-golden) = 0.99999976 PASS**; cos vs bf16-golden 0.99973 (benign bf16 floor).
+- Timing (full layer E=256, w13+w2, bd=40): **int8 89 ms + oscale 77 ms = 165 ms/layer**.
+
+### Next (perf): fuse into ONE kernel to stop re-reading MXFP4 twice
+The two kernels each decode+scale the MXFP4; the oscale kernel duplicates work. Fusing oscale into
+the int8 kernel (reusing the decode) would drop ~77 ms → projected **~90-100 ms/layer**. Blocked on
+the oscale GM-write quirk inside the fused kernel (below); the two-kernel split is the robust
+fallback that already beats Triton.
 
 ### ✅ Working (verified this session)
 1. **Toolchain end-to-end**: bisheng compiles AscendC (`-x asc --cce-aicore-arch=dav-c220`) device

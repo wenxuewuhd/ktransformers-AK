@@ -314,3 +314,57 @@ decode 侧 `kt_ep_wrapper.py` / kt-kernel `experts_base.py` 的 submit/sync/comb
    (4096 prefill ~14s 量级);`free`/RSS 证 277GB W8A8 池已消、DDR 落到 ~137GB。
 4. **收益地板**:decode 开热专家常驻,`cpu_moe_wall` 回到 ~20ms 档(而非 39–55)。
    **判定靠这个组件数,不靠 decode tok/s**——共享机 NUMA 噪声让小样本 tok/s 不可信(§坑6)。
+
+---
+
+## 11. 结果(Session G,2026-06-12,Triton 路线跑通)
+
+**算子已写出并端到端验证**。Triton-Ascend,纯 Python,不碰 kt-kernel C++。三个文件:
+- `tools/longseq_dbg/mxfp4_dequant_triton.py` —— 核 + 三个生产 API(`mxfp4_dequant_requant` /
+  `mxfp4_proj_to_slot_nz` / `mxfp4_layer_to_slots`)。
+- `tools/longseq_dbg/test_mxfp4_dequant_triton.py` —— 离线对账 + 单层计时。
+- `tools/longseq_dbg/test_mxfp4_kernel_e2e.py` —— **真 `npu_fused_experts` 端到端等价**(§10.1 #1)。
+
+### 11.1 §10.1 #1 算子正确性 = **过**
+- **dequant 段 bit-exact**:e2m1 算术解码(sign/exp/mant,选择式,无 LUT gather,无 transcendental)+
+  e8m0 经 `(e<<23) bitcast→fp32` 精确 `2^(e-127)`,对 `dequant_native` **max|err|=0.0**(三个 proj 全 0)。
+- **整核 vs 慢版向量参考(同 NZ 同 GEMM,真 `npu_fused_experts`)**:`ref-dtype=fp32` 对齐时
+  **cos=0.99999976, rel_l2=0.0**;`ref-dtype=bf16` 时 cos=0.99973(纯 **CPU-torch vs NPU-triton 的 bf16
+  除法舍入分歧**,非算子缺陷——切 fp32 即归 1)。
+- **int8 eq-frac≈0.90 / max|dq|=1**:与 bf16 参考差的那 10% 全是 ±1 个 int8 档,同样来自上面那条 bf16 舍入分歧;
+  weight-GEMM 投影显示 **kernel-vs-true ≥ ref-vs-true**(三个 proj 都是),即本算子的 W8A8 不比参考差,反而略优
+  (kernel 内部走 fp32,比参考的 bf16 master 更贴真权重)。
+
+### 11.2 §10.1 #2 算子够快 = **部分**(不病态、与 H2D 持平,但未达 ~150ms 目标)
+满层 E=256(w13+w2)warmup 后中位:**~358ms/层**(w13 ~215 + w2 ~140)。
+- vs PyTorch 慢版 3.4s:**9.6× 更快**——**不病态**(§2.1 说"别病态"即可,这条达成)。
+- vs W8A8 H2D 345ms:**持平**——消池后"MXFP4 H2D + 现转"替掉"W8A8 H2D",prefill **不退化**(§0.2 预期"保留")。
+- vs MXFP4 H2D ~170ms:**~2× 偏大,未藏住**——现转会成为流水每层地板(~358 而非 ~170),即 prefill 持平 W8A8 而非
+  更快;消池主奖(decode pin 税消失 + DDR 砍 2/3)**不受影响**。
+- **瓶颈定位实测**:dequant-only(无 reduction/requant)w13 仅 **135ms / 127GB·s**;加 per-output-channel
+  **标量 reduction**(`tl.max`)+ requant → 215ms / 20GB·s。即**卡在每行归约**,不是带宽、不是 decode 数学、不是
+  store 布局(num_warps / 选择式解码 / strided-vs-contiguous store 都实测过,均不是瓶颈)。
+  **下一步提速正解** = 跨行向量化 tiling(一程序吃 [RB, 行]、沿列轴归约成 [RB] 而非标量),但受 UB 192KB 限,
+  迭代成本高;因主奖与"持平"已够,本 session 未做,留给后续。
+
+### 11.3 §10.2 集成 = **组件级已证,生产 wiring 留补丁**
+- `mxfp4_layer_to_slots(c13,s13,c2,s2,H,I)` 直接吐 `npu_fused_experts` 要的槽张量
+  (`w13_nz` FRACTAL_NZ int8 [E,H,2I] + `s13b` bf16 [E,2I];w2 同理),**已被 e2e 测试用作被验证的产物**
+  (cos 0.99999976)。这就是 §7 集成点要插的转换函数,**经过验证、可直接 drop-in**。
+- **生产 wiring(`kt_stream_prefill`)未改**:`_load_layer_experts` 现在从 **W8A8 checkpoint**(`_CKPT`)读、
+  非 MXFP4;消池要把池源切到 MXFP4 model-dir,并在 `_streaming_forward` 把 `slot.copy_(h)` 换成
+  `mxfp4_layer_to_slots(...) → slot`。这是**改共享文件 + 需起服务验证**的活,而"起服务追干净数"被 §0.1 明确划出
+  你的单点之外(且 Session C 已证共享机端到端测不准)。故本 session **只交经验证的转换函数 + 精确 wiring 说明**,
+  不动生产流。后续接手者:池源换 MXFP4、`_streaming_forward` 调用上面的 helper、跟 Session B/C 合并对齐(§8)。
+
+### 11.4 Triton-Ascend 踩坑(给后续同后端的人)
+- **`tl.interleave` / `tl.join` 在大 tile(整行 [NB,32],NB=128)炸 UB**(要 768KB > 192KB)。整行交错输出
+  改成**两次 stride-2 store**(even/odd)绕过——见核里 `tl.store(obase+even/odd, ...)`。
+- **int32 偏移溢出**:满 E=256 时 `r*IN`(r≈1M,IN=4096)超 int32(2.15e9)→ "MTE DDR out of range" 乱跑/假
+  0.56ms。行偏移**必须 `.to(tl.int64)`**。
+- **grid < 65536 硬限**;`tl.static_range` 全展开会炸 UB,用 **`tl.range` 运行时循环**(复用 buffer);每程序
+  `rows_per_prog` 取 `ceil(E*OUT/65535)`。
+- **变量整数移位 `1<<tensor` 病态**(10× 慢);2^k 用**选择式**(where exp==…)或 **bitcast** 出。
+- **嵌套 `tl.range` 编译极慢**(两层循环的 chunk 方案 >300s 编不完,放弃)。
+- `multibuffer=False` / `num_warps` 对本核**无可测影响**(已饱和 / 后端忽略)。
+- 计时**必须 warmup**(memory `npu-bandwidth-bench-needs-warmup`)。

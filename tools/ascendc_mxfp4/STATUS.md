@@ -31,10 +31,21 @@ historical stepping stone; the fused kernel supersedes it.
   DeepSeek-V4-Flash model dir), optional `KT_MXFP4_OP_DIR=<this dir>`.
 - Offline-validated: the production `_load_layer_mxfp4` + convert hook through `npu_fused_experts`
   on real layer-16 gives cos 0.99999976 vs fp32 golden.
-- **Remaining = server bring-up + decode-floor measurement** (out of scope here; shared-machine
-  decode tok/s is noisy — judge by the `cpu_moe_wall` component, see handoff §10.2).
-- Not yet wired for depool: the dynamic-resident (hot-expert) path (it reads the W8A8 `_POOL`);
-  it stays on the W8A8 pool. Wiring it to the MXFP4 pool is a separate follow-up.
+- **Server-validated (2026-06-12, card 3, DSv4-Flash single NPU)**: with `KT_PREFILL_STREAM=1
+  KT_MXFP4_DEPOOL=1 KT_MXFP4_NZ_CHUNK=32` + `--mem-fraction-static 0.72` (HBM headroom for the
+  conversion), a 640-token prefill ran the depool path with **0 streaming failures and coherent
+  output**. **DDR benefit MEASURED**: MXFP4 pool ≈ **140GB** (DDR 326→~475GB) vs the W8A8 pool
+  277GB → **~137GB saved**. (Needed: kt-kernel ext rebuild + reapply llama.cpp MXFP4 patch
+  `tools/kt_dsv4_npu_patches/llama_cpp/0002-add-ggml-type-mxfp4.patch` — both lost on container
+  restart; and HBM headroom via lower mem-fraction since depool skips the W8A8 slot reservation.)
+- **Decode hot-expert benefit NOT delivered by v1** (two reasons, both follow-ups):
+  1. depool disables the dynamic-resident update (reads the W8A8 `_POOL`) → decode uses static
+     prefix-32 → many experts routed to CPU → `cpu_moe_wall` `off_cpu` high (140-330ms, also
+     shared-machine noise). Wiring dynamic-resident to convert hot experts' MXFP4 → resident W8A8
+     is the fix for the real-topK benefit.
+  2. v1 pins a SEPARATE ~140GB MXFP4 pool, so the pin tax is reduced (139 vs 277GB) but not gone;
+     the handoff's full benefit needs the NPU to share the CPU's MXFP4 (no separate pinned pool)
+     or stream unpinned. The DDR win is delivered; the decode pin-tax win needs this.
 
 ### Working operator (this dir)
 - `mxfp4_dq_kernel.cpp` — MXFP4 → int8 weight (two contiguous planes `[lo|hi]`; de-interleave in a

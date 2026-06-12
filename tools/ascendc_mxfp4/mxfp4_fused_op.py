@@ -81,33 +81,47 @@ def _consts(HALF, NB, dev):
     return out
 
 
+_NZ_CHUNK = int(os.environ.get("KT_MXFP4_NZ_CHUNK", "32"))  # experts/chunk -> bounds HBM transient
+
+
 def convert_proj(codes_dev, scale_dev, IN, blockdim=40):
-    """One projection: MXFP4 codes/scale [E,OUT,*] -> (q_nz [E,IN,OUT] FRACTAL_NZ, oscale bf16 [E,OUT])."""
+    """One projection: MXFP4 codes/scale [E,OUT,*] -> (q_nz [E,IN,OUT] FRACTAL_NZ, oscale bf16 [E,OUT]).
+
+    Chunked over experts so the transient (int8 planes + de-interleave + NZ cast) stays small —
+    only the final [E,IN,OUT] NZ output is full-size (HBM-bounded like the W8A8 slot)."""
     import torch_npu
     lib = get_lib()
     dev = codes_dev.device
     E, OUT, HALF = codes_dev.shape
     NB = scale_dev.shape[2]
-    R = E * OUT
+    HALFp = IN // 2
     lutLo, lutHi, lutE8, scOff = _consts(HALF, NB, dev)
-    cd = codes_dev.reshape(R, HALF).contiguous()
-    sd = scale_dev.reshape(R, NB).contiguous()
-    out = torch.empty((R, IN), dtype=torch.int8, device=dev)        # two planes [lo|hi]
-    Rp = (R + _ACC - 1) // _ACC * _ACC
-    osc = torch.empty((Rp,), dtype=torch.float32, device=dev)
     st = torch.npu.current_stream().npu_stream
     P = lambda t: ctypes.c_void_p(t.data_ptr())
-    lib.launch_mxfp4_fused(ctypes.c_void_p(st), blockdim, P(cd), P(sd), P(out), P(osc),
-                           P(lutLo), P(lutHi), P(lutE8), P(scOff), R, HALF, NB, IN)
-    # de-interleave planes -> [E,OUT,IN] consecutive-nibble order
-    HALFp = IN // 2
-    q = torch.empty((R, IN), dtype=torch.int8, device=dev)
-    q[:, 0::2] = out[:, :HALFp]
-    q[:, 1::2] = out[:, HALFp:]
-    q = q.reshape(E, OUT, IN)
-    q_nz = torch_npu.npu_format_cast(q.transpose(1, 2).contiguous(), _NZ)   # [E,IN,OUT]
-    oscale = osc[:R].reshape(E, OUT).to(torch.bfloat16)
-    return q_nz, oscale
+
+    out_nz = None
+    oscale = torch.empty((E, OUT), dtype=torch.bfloat16, device=dev)
+    for c in range(0, E, _NZ_CHUNK):
+        ce = min(c + _NZ_CHUNK, E)
+        Ec = ce - c
+        Rc = Ec * OUT
+        cd = codes_dev[c:ce].reshape(Rc, HALF).contiguous()
+        sd = scale_dev[c:ce].reshape(Rc, NB).contiguous()
+        out = torch.empty((Rc, IN), dtype=torch.int8, device=dev)   # two planes [lo|hi]
+        Rp = (Rc + _ACC - 1) // _ACC * _ACC
+        osc = torch.empty((Rp,), dtype=torch.float32, device=dev)
+        lib.launch_mxfp4_fused(ctypes.c_void_p(st), blockdim, P(cd), P(sd), P(out), P(osc),
+                               P(lutLo), P(lutHi), P(lutE8), P(scOff), Rc, HALF, NB, IN)
+        q = torch.empty((Rc, IN), dtype=torch.int8, device=dev)
+        q[:, 0::2] = out[:, :HALFp]
+        q[:, 1::2] = out[:, HALFp:]
+        nz = torch_npu.npu_format_cast(q.reshape(Ec, OUT, IN).transpose(1, 2).contiguous(), _NZ)
+        if out_nz is None:
+            out_nz = torch.empty((E,) + tuple(nz.shape[1:]), dtype=torch.int8, device=dev)
+        out_nz[c:ce].copy_(nz)
+        oscale[c:ce] = osc[:Rc].reshape(Ec, OUT).to(torch.bfloat16)
+        del out, q, nz, osc, cd, sd
+    return out_nz, oscale
 
 
 def mxfp4_layer_to_nz_slots(c13, s13, c2, s2, H, I, blockdim=40):

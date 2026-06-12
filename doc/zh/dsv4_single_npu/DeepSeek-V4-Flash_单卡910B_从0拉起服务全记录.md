@@ -145,7 +145,7 @@ $PY -c "import importlib.util as u; print('kt_ep_wrapper:', u.find_spec('sglang.
 cd /workspace/code/ktransformers-AK
 NPU_DEVICE_ID=<空闲卡> PORT=8020 \
   KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' \
-  KT_CPUINFER=128 KT_DECODE_TIMING=1 \
+  KT_CPUINFER=128 KT_DECODE_TIMING=1 SKIP_WARMUP=0 \
   MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
   bash tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/kt_mxfp4_serve.log
 ```
@@ -153,6 +153,10 @@ NPU_DEVICE_ID=<空闲卡> PORT=8020 \
 - `KT_GGUF_TEMPLATE` **必须指 `_mxfp4` 模板**(否则脚本默认走 Q8_0 的 `dsv4_layer{layer_idx}.gguf`)。
 - `MODEL_PATH` 指 **W8A8**(NPU 侧 attention/shared/router/常驻专家)。两份权重缺一不可。
 - `KT_CPUINFER` 默认 128(每 NUMA 16 线程,留 8 核给 NPU host;**勿 192 满核会 thrash**)。
+- **`SKIP_WARMUP=0` 开机预热(serving 建议开)**:去掉脚本默认的 `--skip-server-warmup`,开机时多跑一次 dummy
+  decode pass 暖 NPU graph/cache → **开机第一发不再冷**(实测 req1 2.1–2.5s→1.8s,两臂区间不重叠;预热 pass
+  仅 ~5s,几乎零 boot 代价)。脚本默认 `SKIP_WARMUP=1`(保持基线)。⚠️ 只治开机冷启,不治会话中途空闲后又掉速
+  (那是 per-request 首 token transition + 邻居争抢,需周期性 keep-warm;**调 worker park 阈值已证伪无效**)。
 - graph-on 是默认(坑⑥/⑥b 已修,见总纲 §6.2),勿传 `--disable-cuda-graph`。
 
 ### 坑 ⑤:`Quantization method (fp8) does not match (compressed-tensors)`

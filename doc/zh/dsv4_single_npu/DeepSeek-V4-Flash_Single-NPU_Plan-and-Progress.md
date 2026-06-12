@@ -227,7 +227,7 @@ python3 tools/verify_mxfp4_gguf_set.py --dir /workspace/models/cache \
 cd /workspace/code/ktransformers-AK
 NPU_DEVICE_ID=<空闲卡> PORT=8020 \
   KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' \
-  KT_CPUINFER=128 KT_DECODE_TIMING=1 \
+  KT_CPUINFER=128 KT_DECODE_TIMING=1 SKIP_WARMUP=0 \
   MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
   bash tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/kt_mxfp4_serve.log
 ```
@@ -235,6 +235,8 @@ NPU_DEVICE_ID=<空闲卡> PORT=8020 \
 - `KT_GGUF_TEMPLATE` **必须指 `_mxfp4` 模板**（否则脚本默认走 Q8_0 的 `dsv4_layer{layer_idx}.gguf`）。
 - `MODEL_PATH` 指 **W8A8**（NPU 侧）。两者缺一不可。
 - `KT_CPUINFER` 默认 128（`{layer_idx}` 花括号写法见脚本注释，勿被 `${var:-}` 吃掉）。
+- **`SKIP_WARMUP=0` serving 建议开**：去掉脚本默认的 `--skip-server-warmup`，开机暖一次 NPU graph/cache →
+  开机第一发不再冷（§7 实测 req1 2.1–2.5→1.8s，两臂区间不重叠，预热 pass 仅 ~5s）。默认 `SKIP_WARMUP=1` 保持基线。
 - graph-on 是默认（勿传 `--disable-cuda-graph`）。eager 回退见[附录 A](#附录-aint8q8_0-cpu-权重旧路径附录) / §6.3。
 
 ### 4.5 验证（加载 ~2–3.5 min 热 cache）
@@ -338,6 +340,21 @@ CPU MoE 是内存带宽瓶颈,旧 `--kt-cpuinfer 24` 只用 24/192 核。提到 
   中等争抢 ~13–14）;DRAM 275→**137 GiB**;F2 四 prompt 连贯。负结果（down nrc=2 / 跨专家预取）已记录回退。
 - 完整记录：[mxfp4_cpu_moe_handoff.md](mxfp4_cpu_moe_handoff.md)。**后续 CPU 侧迭代主要基于 MXFP4。**
 
+### 6.8 decode 冷启调查（Session F，2026-06-12）：park 阈值证伪，warmup 采纳
+
+现象：decode 开机第一发慢、连发几个升到稳态。两条假说,实测:
+
+- **❌ worker park 阈值（证伪，别再调）**：`worker_pool.cpp` 的 spin-park 50ms 阈值**不是**冷启因。受控 A/B
+  （50ms vs 2000ms，env `KT_PARK_IDLE_MS` 可配，两处都改）：吞吐/首发/抖动**无可测差异**;连续 decode 每 token
+  按 43 层逐层 submit、worker 空闲永远 <50ms → **根本不 park**（active CPU 两档都 ~129 核）。拉大阈值唯一净效果是
+  **坏处**（sub-2s 间隔活动把 128 核钉死 100%，共享机不友好）。代码已 revert 回基线，无残留。
+- **✅ `SKIP_WARMUP=0`（开机预热，采纳）**：去掉启动脚本默认的 `--skip-server-warmup`，开机跑一次 dummy decode
+  暖 NPU graph/cache → **开机第一发不再冷**。独立验证（清净窗口 load~21，每臂 boot×2）：基线 req1 **2.08–2.49s** vs
+  预热 req1 **1.82–1.84s**，**两臂区间不重叠**;预热把 req1 拉到稳态、消掉 ramp;预热 pass 仅 ~5s，几乎零 boot 代价。
+  脚本已 `${SKIP_WARMUP:-1}` 门控（默认 1 保基线，serving 设 0）。**边界**：只治开机冷启，不治会话中途空闲后又掉速
+  （那是 per-request 首 token transition + 邻居争抢，需周期性 keep-warm）。
+- 完整数据/机制见 [workerpark_tune_handoff.md](workerpark_tune_handoff.md) 的 Closeout + Follow-up。
+
 ---
 
 ## 7. 性能数据（参考）
@@ -349,6 +366,7 @@ CPU MoE 是内存带宽瓶颈,旧 `--kt-cpuinfer 24` 只用 24/192 核。提到 
 | Decode 吞吐 — eager | ~1.6 tok/s |
 | Graph capture | ~6.8s（bs=1，真实权重） |
 | 模型加载（MXFP4 138 GiB） | **~2–3.5 min**（热 cache，page cache 全驻;冷盘首启另加磁盘读） |
+| 开机第一发（20-tok）— `SKIP_WARMUP=1` 基线 / `=0` 预热 | req1 **2.1–2.5s → 1.8s**（清净窗口 load~21，§6.8;预热消掉冷启 ramp） |
 | HBM 占用（N=32） | ~16 GB expert + attention + KV |
 | DRAM 占用 | **~137 GiB（MXFP4）** / 275（Q8_0）/ 555（BF16） |
 

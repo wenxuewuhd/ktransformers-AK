@@ -22,6 +22,20 @@ One pass: reads MXFP4 once → int8 weight (two `[lo|hi]` planes, de-interleave 
 The two-kernel version (`mxfp4_dq_kernel.cpp` + `mxfp4_oscale_kernel.cpp`, 165 ms) is the
 historical stepping stone; the fused kernel supersedes it.
 
+### Integrated into kt_stream_prefill (depool), gated
+- `mxfp4_fused_op.py` — runtime wrapper: builds (bisheng) + loads the fused `.so`, exposes
+  `mxfp4_layer_to_nz_slots(c13,s13,c2,s2,H,I) -> (w13_nz, s13b, w2_nz, s2b)`.
+- `kt_stream_prefill.py` (sglang submodule) — `KT_MXFP4_DEPOOL=1` stores MXFP4 (pinned, ~137GB)
+  instead of the 277GB W8A8 NZ pool and converts per layer on chip. Default off = W8A8 path
+  byte-identical. Env: `KT_MXFP4_DEPOOL=1`, `KT_MXFP4_CKPT=<MXFP4 safetensors dir>` (default the
+  DeepSeek-V4-Flash model dir), optional `KT_MXFP4_OP_DIR=<this dir>`.
+- Offline-validated: the production `_load_layer_mxfp4` + convert hook through `npu_fused_experts`
+  on real layer-16 gives cos 0.99999976 vs fp32 golden.
+- **Remaining = server bring-up + decode-floor measurement** (out of scope here; shared-machine
+  decode tok/s is noisy — judge by the `cpu_moe_wall` component, see handoff §10.2).
+- Not yet wired for depool: the dynamic-resident (hot-expert) path (it reads the W8A8 `_POOL`);
+  it stays on the W8A8 pool. Wiring it to the MXFP4 pool is a separate follow-up.
+
 ### Working operator (this dir)
 - `mxfp4_dq_kernel.cpp` — MXFP4 → int8 weight (two contiguous planes `[lo|hi]`; de-interleave in a
   torch post-step). Correct single + multi core. Its own `oscale` output is broken/unused (ignored).

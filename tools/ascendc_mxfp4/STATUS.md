@@ -37,9 +37,19 @@ while the int8 `out` (same VECOUT-TQue + `DataCopy` idiom) writes 100% correctly
 - Tried (all pass in isolation, including with ~120KB UB pressure and a parallel int8 TQue write):
   the `[R,8]` `Duplicate`+`DataCopy`. So it is **not** the mechanism, UB pressure, or arg position —
   it is some interaction with the compute ops (gather/reduce/requant) preceding the write.
-- Likely a pipe/sync ordering issue specific to this op mix; the expert AscendC agent should solve
-  with the right idiom (e.g. dedicated output TQue flushed after the int8 store, or a separate
-  reduce-only pass emitting `oscale`).
+- **Refined root cause (isolated in toy kernels)**: the failure mode is a **small MTE3 GM store
+  that interleaves with MTE2 GM→UB loads, at low/medium blockdim**. Reproduced minimally:
+  a kernel that does a few `DataCopy(GM→UB)` loads then `DataCopy(UB→GM, 8..64 floats)` writes
+  **nothing at bd=1** but writes correctly at **bd=40**. Did NOT help: `PipeBarrier<PIPE_ALL>`,
+  explicit `MTE2_MTE3` SetFlag/WaitFlag, `DataCacheCleanAndInvalid<ENTIRE_DATA_CACHE>`, larger
+  write size, arg position, VECOUT TQue. The large int8 `out` store survives because it's big and
+  is the dominant MTE3 traffic; the tiny per-row `oscale` store gets lost in the load/store mix.
+- **Two clean sidesteps for the implementer (recommended over chasing the sync)**:
+  1. **Separate `oscale` into its own kernel** (read codes+scale → dequant → per-row amax → write
+     `oscale`), run at production blockdim. A loads+write kernel writes correctly at bd=40.
+  2. **Accumulate `oscale` per core in UB and write it ONCE as a large contiguous `DataCopy` at
+     kernel end** (block-partition rows so each core owns a contiguous `oscale` segment), instead
+     of a tiny per-row store interleaved with the int8 stores and input loads.
 
 ### (historical note) multi-core grid mapping
   needs proper inter-iteration sync (or restructure so each core owns disjoint rows cleanly).

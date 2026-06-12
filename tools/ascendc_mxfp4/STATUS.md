@@ -4,11 +4,23 @@
 see `doc/.../mxfp4_dequant_kernel_handoff.md` §11) by writing the dequant op in AscendC, where
 explicit tiling/pipelining/MTE control can approach the ~12ms HBM-bandwidth floor.
 
-## Status: WORKING end-to-end via TWO kernels (int8 + oscale). e2e cos 0.99999976 vs fp32 golden;
-## 165 ms/layer (E=256), 2.2x faster than the Triton 358 ms. The oscale GM-write quirk in the
-## single fused kernel was sidestepped, not solved (see below).
+## Status: DONE. FUSED single kernel works end-to-end. e2e cos 0.99999976 vs fp32 golden;
+## **82 ms/layer (E=256) — 4.4x faster than Triton 358 ms, ~2x under the 150 ms H2D budget.**
 
 > Authoritative agent-facing spec/golden/acceptance live in `tools/mxfp4_w8a8_op/`.
+
+### Final operator: `mxfp4_fused_kernel.cpp` (use this)
+One pass: reads MXFP4 once → int8 weight (two `[lo|hi]` planes, de-interleave in a torch post-step)
++ per-output-channel `oscale`. Correct single + multi core.
+- **The oscale GM-write quirk is solved**: block-partition rows, accumulate `oscale` per core in a
+  UB block (`acc`), and flush each ACC-row block as ONE large contiguous `DataCopy` — this survives
+  alongside the per-row int8 stores and input loads (small per-row scale stores do not).
+- Validation: `test_fused.py` (int8 eq-frac 0.90, oscale err 3.7e-6, single+multi core);
+  `test_fused_e2e.py` (real `npu_fused_experts`, cos 0.99999976 vs fp32 golden).
+- Timing full layer (E=256, bd=40): w13 48 ms + w2 34 ms = **82 ms/layer**.
+
+The two-kernel version (`mxfp4_dq_kernel.cpp` + `mxfp4_oscale_kernel.cpp`, 165 ms) is the
+historical stepping stone; the fused kernel supersedes it.
 
 ### Working operator (this dir)
 - `mxfp4_dq_kernel.cpp` — MXFP4 → int8 weight (two contiguous planes `[lo|hi]`; de-interleave in a

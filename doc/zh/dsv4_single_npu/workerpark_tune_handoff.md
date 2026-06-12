@@ -1,8 +1,14 @@
 # Handoff — worker 线程池 park 阈值优化（Session F）：消除 decode 冷启/抖动掉速
 
-> **状态**：开放（Session F 起点）｜**日期**：2026-06-11｜**隔离 worktree**：`/workspace/code/kt-F-workerpark`
+> **状态**：**已关闭 — park 假说被受控 A/B 证伪（2026-06-12）。不要再走调阈值这条路。** 见文末「Closeout」。
+> ｜**日期**：2026-06-11 起 / 2026-06-12 结｜**隔离 worktree**：`/workspace/code/kt-F-workerpark`
 > **目标**：消除 decode 「冷启 ~8 → 连发升 16 → 空闲/抖动又掉回 8」的反复，让 serving 稳定在高 tps。
 > **基线**：主干 `dsv4_one_card_dev`（MXFP4，graph-on，稳态 ~16 tok/s）。
+
+> ⚠️ **结论先行**：把 `worker_pool.cpp:226/:402` 的 50ms 阈值拉到 2000ms（env 可配、两处都改、重编 .so），
+> 单变量同协议 A/B 显示**对 decode 吞吐/首 token 延迟/停顿后重发/稳态抖动均无可测差异**，且有**礼貌代价**
+> （sub-2s 间隔活动把 128 核钉死）。§1 的 park 机制（"稳态每 token 55ms gap 越线 park"）**实测为假**。
+> 代码已 **revert 回基线、.so 重编、git 干净**。下文 §1–§5 是原始假说（保留作记录），以文末 Closeout 为准。
 
 ---
 
@@ -104,3 +110,68 @@
 - 若做成可配，**与 E 线（开源 clean code，减 env）对齐**实现形态（优先构造参数，非新 env）。
 - 相关：[mxfp4_cpu_moe_handoff.md](mxfp4_cpu_moe_handoff.md)（带宽/瓶颈背景）、E 线
   `opensource_release_handoff.md`（已把本项列为 roadmap 待办）。
+
+---
+
+## Closeout（2026-06-12）— park 假说被受控 A/B 证伪，未合入任何改动
+
+**做法**：`worker_pool.cpp:226` 与 `:402` 两处 `duration > 50` 改成 `kt_park_idle_ms()`（env `KT_PARK_IDLE_MS`
+可配，默认 50 保持基线 bit 不变），重编 `.so`。单变量、真实权重（DSv4-Flash MXFP4，cpuinfer128，单卡 910B3）、
+同一 prompt/协议，A/B 对比 50ms vs 2000ms。env 生效已验证（见下）。
+
+**复现的现象（真实存在）**：`KT_DECODE_TIMING=1` 下，冷启/停顿后首 token `cpu_moe_wall` 尖峰 300–650ms，
+其后多 token ramp 回稳态 ~20–25ms；连续 decode ~12–15 tok/s。**关键**：`on_cpu`（host 侧 submit/wake）全程平 ~2ms，
+冷启成本全部落在 `off_cpu`/`sync`（worker 计算墙）——与 handoff §3 预测的"on_cpu 偏高"**相反**。
+
+**A/B 结果（50ms vs 2000ms，同协议）**：
+
+| 指标 | 50ms | 2000ms | 判定 |
+|---|---|---|---|
+| 连发 20-tok ×5（1s 停顿） | 2.78/2.13/2.00/2.05/1.87s | 2.75/2.14/1.95/1.92/2.25s | 噪声内相同 |
+| 背靠背 20-tok ×3 | 1.79/2.05/1.97s | 1.90/1.83/1.80s | 相同 |
+| 连续 150-tok 稳态 median | 24.1ms | 20.0ms / 另一次 25.0ms | 两次 2000ms 互差 ≥ 50↔2000 差 |
+| active-decode CPU | ~129 核 | ~129 核 | 相同 → 连续 decode 根本不 park |
+
+**为什么 park 机制是错的**：
+1. **连续 decode 根本不 park**：active CPU 两档都 ~129 核（满）。CPU MoE 每 token 按 43 层逐层 submit，
+   worker 两次 submit 间空闲 <50ms，永远到不了 park 阈值。§1 的"稳态每 token 55ms gap 越线 park"不成立。
+2. **首 token 尖峰不是 park**：300–650ms 尖峰在 50ms 和 2000ms **都在**（2000ms 下 worker 明明没 park）。
+   它是 prefill→decode 的 graph/transition 成本，阈值动不了。
+3. **env 确实生效**（排除"改了个寂寞"）：2000ms 下单 token 后 1s 窗口 scheduler 仍烧 **129.8 核**（worker 还在 spin 没 park）；
+   50ms 同窗口 ~1 核（已 park）。即阈值确实改变了 park 行为——只是这行为对吞吐无影响。
+
+**raise 阈值的唯一净效果 = 礼貌代价**：任何 sub-2s 间隔的活动会让 128 核全程 100%（共享 192 核机不友好），零吞吐收益。
+真正长空闲（>2s）两档都 park、都回到 ~1 核，所以拉阈值连"省冷启"都不省。
+
+**冷启 8↔16 的真因**（都不是 park）：① per-request 首 token transition；② 会话级 cache/TLB/NPU-graph 暖机
+（第一发慢、整会话渐热）；③ 共享机邻居争抢（实测 loadavg ~40/192、邻居 NPU 卡 AICore 100%）→ 大 run-to-run 方差。
+要治冷启应往 **keep-warm**（首 token transition / graph 常驻 / 会话级预热）方向，不是 park 阈值。
+
+**落地**：worker_pool.cpp 已 `git checkout` 回基线（两处 `> 50`、无 env）、`.so` 重编、`git status` 干净，无残留。
+建议 E 线 `opensource_release_handoff.md` 把"park 阈值可配"从 roadmap **删除**。原始数据 `/tmp/wp/results.md`。
+（教训印证启动提示词的"别凭读码下结论"——读码看着像 park，实测不是。）
+
+---
+
+## Follow-up（2026-06-12）— 去掉 `--skip-server-warmup` 实测救开机冷启 −37%（已采纳）
+
+park 证伪后顺着 keep-warm 方向查：当前 `tools/p27_launch_ds4flash_npu.sh` 一直传 `--skip-server-warmup`，
+即**跳过 sglang 开机预热**。去掉它 → 开机时多跑一次 dummy decode pass，把 NPU graph + cache 提前暖好。
+
+**A/B（20-tok 请求，每臂 boot 两次，card 4 vs 6，同协议）**：
+
+| 请求 | skip（基线）run1/run2 | warmup 开启 run1/run2 |
+|---|---|---|
+| **req1（开机第一发）** | 3.43 / 3.31s（~3.37） | **2.28 / 1.98s（~2.13）** |
+| req2 | 3.28 / 2.13 | 1.86 / 1.74 |
+| req3 | 2.63 / 1.70 | 1.84 / 1.59 |
+| 60-tok 吞吐 | 11.0 tok/s | 13.9 tok/s |
+
+**结论**：开机第一发 **−37%（~1.2s）**，两次 boot 区间不重叠；到稳态从 req4 提前到 req2。开机冷启的慢**不在
+cpu_moe_wall**（skip req1 的 cpu_moe_wall 仍只 25–65ms），在 NPU 侧 graph/prefill 一次性建立——正是 warmup 救的。
+
+**边界**：server warmup 只在**开机跑一次**，所以只治**开机冷启**；对会话中"空闲一下又掉回 8"的复发冷启**无效**
+（那需要周期性 keep-warm ping，另做）。代价：开机多几秒一次性预热，无运行时代价。
+
+**落地**：脚本 `--skip-server-warmup` 已改为 `${SKIP_WARMUP:-1}` 门控——**默认 1 保持基线**，serving 建议设
+`SKIP_WARMUP=0` 开预热。这是本任务唯一保留的改动（worker_pool.cpp 已 revert）。数据见 `/tmp/wp/results.md`。

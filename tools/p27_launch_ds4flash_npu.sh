@@ -163,6 +163,13 @@ EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 if [[ -n "${EXTRA_FLAGS}" ]]; then
   echo "[p27] EXTRA_FLAGS=${EXTRA_FLAGS}"
 fi
+# SKIP_WARMUP=1（默认，保持基线）传 --skip-server-warmup 跳过开机预热；=0 则开启预热（A/B 用）。
+SKIP_WARMUP="${SKIP_WARMUP:-1}"
+WARMUP_FLAG="--skip-server-warmup"
+if [[ "${SKIP_WARMUP}" == "0" ]]; then
+  WARMUP_FLAG=""
+fi
+echo "[p27] SKIP_WARMUP=${SKIP_WARMUP} (warmup_flag='${WARMUP_FLAG}')"
 # shellcheck disable=SC2086
 exec "${PYTHON_BIN}" -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
@@ -179,7 +186,7 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --max-prefill-tokens 65535 \
   --context-length 65536 \
   --watchdog-timeout 18000 \
-  --skip-server-warmup \
+  ${WARMUP_FLAG} \
   --kt-method LLAMAFILE \
   --kt-num-gpu-experts 32 \
   --kt-weight-path "$KT_GGUF_TEMPLATE" \

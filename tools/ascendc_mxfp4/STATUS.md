@@ -4,40 +4,44 @@
 see `doc/.../mxfp4_dequant_kernel_handoff.md` §11) by writing the dequant op in AscendC, where
 explicit tiling/pipelining/MTE control can approach the ~12ms HBM-bandwidth floor.
 
-## Status: WORK IN PROGRESS — not yet end-to-end correct. Do NOT wire into production.
+## Status: WIP. The int8 weight output is CORRECT (single + multi core); only the per-channel
+## `oscale` GM write is unresolved. Do NOT wire into production until oscale is fixed.
 
-The **toolchain and 3 of 4 compute stages are verified correct**; the requant→int8 output path
-has a stubborn non-determinism, and multi-core needs sync hardening.
+> Authoritative agent-facing spec/golden/acceptance live in `tools/mxfp4_w8a8_op/` — use those
+> to (re)implement. This dir is the WIP reference kernel + hard-won findings.
 
-### ✅ Proven (this session)
+### ✅ Working (verified this session)
 1. **Toolchain end-to-end**: bisheng compiles AscendC (`-x asc --cce-aicore-arch=dav-c220`) device
    kernel + host `<<<>>>` launcher into a `.so`; called from Python via **ctypes** passing
-   `tensor.data_ptr()` + `torch.npu.current_stream().npu_stream`. A minimal `addone` kernel ran
-   bit-exact. Build line:
+   `tensor.data_ptr()` + `torch.npu.current_stream().npu_stream`. Build line:
    ```
    bisheng -x asc --cce-aicore-arch=dav-c220 -O2 -std=c++17 -fPIC -shared \
      -I$TK/tikcfw -I$TK/tikcfw/impl -I$TK/tikcfw/interface -I$TK/tikcfw/lib -I$CANN/aarch64-linux/include \
      mxfp4_dq_kernel.cpp -o libmxfp4dq.so -L$CANN/aarch64-linux/lib64 -lruntime -lascendcl
    ```
-2. **Decode** (FP4 e2m1 via 256-entry byte-indexed `Gather` LUT): **bit-exact** vs `dequant_native`.
+2. **Decode** (FP4 e2m1 via 256-entry byte-indexed `Gather` LUT): **bit-exact** vs golden.
 3. **Scale** (e8m0 via `lutE8` gather + `scOff` broadcast gather, `Mul`): **bit-exact**.
-4. **amax reduce** (max(|lo|,|hi|) + non-in-place ping-pong fold to 8 + scalar tail): the stored
-   per-channel `oscale = amax/127` matches the CPU reference to **1.86e-6** (single core).
+4. **amax reduce** (max(|lo|,|hi|) + non-in-place ping-pong fold to 8 + scalar tail): correct.
+5. **requant → int8 output**: **correct and deterministic, single AND multi-core**
+   (`int8 eq-frac 0.90 vs bf16 golden, max|dq|=1`; reconstruction cos ≈ 1.0). The earlier
+   non-determinism was the cast chain — **`f32→half→int8` is correct; `f32→i32→i16→i8` is NOT**.
+   Output is stored as two contiguous planes `[lo | hi]`; interleave deferred to a torch post-step
+   (`out[...,0::2]=lo; out[...,1::2]=hi`) — in-kernel `Gather` interleave is unusable (small src cap).
 
-### ❌ Remaining (the blockers)
-- **requant→int8 output is non-deterministic** (changes run-to-run) even single-core, while the
-  scale is deterministic+correct. So the bug is in the `Muls(inv)`→clamp→`Cast f32→i32→i16→i8`
-  path or the reduce→requant transition. Suspected scalar↔vector (`inv`) sync or a WAR hazard in
-  the two-plane output cast (shared `off`/`q16` temps reused for lo then hi without a barrier).
-  Tried & did NOT fix: V_S/S_V `SetFlag`/`WaitFlag` (both `FetchEventID` and fixed `EVENT_ID`),
-  `PipeBarrier<PIPE_ALL>`. Next: bisect with the working `scaledbg`-style harness — add reduce,
-  then requant, then output, one at a time, dumping floats each step.
-- **Interleave**: in-kernel `Gather` interleave fails — `Gather`'s src appears capped to a small
-  window (~1KB; worked for the 256-elem decode LUT, fails reading the 16KB `comb`). Current code
-  sidesteps it by storing two contiguous planes `[lo | hi]` and deferring the interleave to a cheap
-  torch post-step (`out[...,0::2]=lo; out[...,1::2]=hi`). A fully in-kernel interleave needs a
-  strided `DataCopyPad` or `Transpose`, not `Gather`.
-- **Multi-core**: with `blockdim>1` the scale also goes flaky → the per-row reduce/scalar path
+### ❌ The one remaining blocker — `oscale` GM write
+The per-output-channel `oscale = amax/127` write to GM **lands in every isolation test but writes
+nothing when embedded in the full compute kernel** (RAW buffer 0 bytes changed, single & multi core),
+while the int8 `out` (same VECOUT-TQue + `DataCopy` idiom) writes 100% correctly in the same kernel.
+- Tried (all fail in-kernel): scalar `SetValue`, `DataCopyPad` single-float, bare `DataCopy` of an
+  8-float `[R,8]` cache-line slot (vector-`Duplicate`-filled), and the full VECOUT-`TQue` idiom.
+- Tried (all pass in isolation, including with ~120KB UB pressure and a parallel int8 TQue write):
+  the `[R,8]` `Duplicate`+`DataCopy`. So it is **not** the mechanism, UB pressure, or arg position —
+  it is some interaction with the compute ops (gather/reduce/requant) preceding the write.
+- Likely a pipe/sync ordering issue specific to this op mix; the expert AscendC agent should solve
+  with the right idiom (e.g. dedicated output TQue flushed after the int8 store, or a separate
+  reduce-only pass emitting `oscale`).
+
+### (historical note) multi-core grid mapping
   needs proper inter-iteration sync (or restructure so each core owns disjoint rows cleanly).
 
 ### Verified AscendC hw pitfalls (reusable; see also memory `triton-ascend-kernel-gotchas`)

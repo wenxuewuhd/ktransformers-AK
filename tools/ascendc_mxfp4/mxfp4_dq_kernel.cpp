@@ -1,10 +1,10 @@
 // AscendC fused MXFP4 -> int8 (+ per-output-channel scale) dequant/requant kernel.
 // One output row (channel) per grid-stride iteration.
 //
-// STATUS: WORK IN PROGRESS (see STATUS.md). Toolchain + decode + scale + amax-reduce are
-// VERIFIED CORRECT in isolation (single core). The requant->int8 output path is still
-// non-deterministic (suspected event-pool exhaustion from per-iteration FetchEventID, or a
-// scalar<->vector sync gap) and multi-core needs sync hardening. NOT yet end-to-end correct.
+// STATUS: WIP (see STATUS.md). int8 weight output is CORRECT single+multi core (decode/scale/
+// reduce/requant all verified; cast must be f32->half->int8). The per-channel `oscale` GM write
+// is the one unresolved piece (lands in isolation, writes nothing embedded in the full kernel).
+// Authoritative spec/golden/acceptance: tools/mxfp4_w8a8_op/.
 //
 // Host-uploaded byte-indexed LUTs keep the kernel to count-form vector ops only:
 //   lutLo[b]=FP4[b&0xF]  lutHi[b]=FP4[b>>4]  lutE8[b]=2^(b-127)   (256 f32 each)
@@ -44,20 +44,19 @@ extern "C" __global__ __aicore__ void mxfp4_dq(
 
     TPipe pipe;
     TQue<QuePosition::VECIN, 1> qCodes, qScale;
-    TQue<QuePosition::VECOUT, 1> qOut;
+    TQue<QuePosition::VECOUT, 1> qOut, qOsc;
     pipe.InitBuffer(qCodes, 1, HALF_MAX * sizeof(uint8_t));
     pipe.InitBuffer(qScale, 1, (NB_MAX + 32) * sizeof(uint8_t));
     pipe.InitBuffer(qOut, 1, IN_MAX * sizeof(uint8_t));
+    pipe.InitBuffer(qOsc, 1, 32);
 
-    TBuf<TPosition::VECCALC> tLutLo, tLutHi, tLutE8, tScOff, tGidxF;
-    TBuf<TPosition::VECCALC> tComb, tOutF, tOff, tOffH, tQ16, tScI, tScF, tScHalf, tAbs, tWork;
+    TBuf<TPosition::VECCALC> tLutLo, tLutHi, tLutE8, tScOff;
+    TBuf<TPosition::VECCALC> tComb, tOff, tOffH, tQ16, tScI, tScF, tScHalf, tAbs, tWork, tOsc;
     pipe.InitBuffer(tLutLo, 256 * sizeof(float));
     pipe.InitBuffer(tLutHi, 256 * sizeof(float));
     pipe.InitBuffer(tLutE8, 256 * sizeof(float));
     pipe.InitBuffer(tScOff, HALF_MAX * sizeof(uint32_t));
-    pipe.InitBuffer(tGidxF, IN_MAX * sizeof(uint32_t));
     pipe.InitBuffer(tComb, 2 * HALF_MAX * sizeof(float));   // vlo || vhi
-    pipe.InitBuffer(tOutF, IN_MAX * sizeof(float));
     pipe.InitBuffer(tOff, IN_MAX * sizeof(int32_t));
     pipe.InitBuffer(tOffH, HALF_MAX * sizeof(half));
     pipe.InitBuffer(tQ16, IN_MAX * sizeof(int16_t));
@@ -66,14 +65,13 @@ extern "C" __global__ __aicore__ void mxfp4_dq(
     pipe.InitBuffer(tScHalf, HALF_MAX * sizeof(float));
     pipe.InitBuffer(tAbs, HALF_MAX * sizeof(float));
     pipe.InitBuffer(tWork, HALF_MAX * sizeof(float));
+    pipe.InitBuffer(tOsc, 256 * sizeof(float));
 
     LocalTensor<float> lutLo = tLutLo.Get<float>();
     LocalTensor<float> lutHi = tLutHi.Get<float>();
     LocalTensor<float> lutE8 = tLutE8.Get<float>();
     LocalTensor<uint32_t> scOff = tScOff.Get<uint32_t>();
-    LocalTensor<uint32_t> gidxF = tGidxF.Get<uint32_t>();
     LocalTensor<float> comb = tComb.Get<float>();
-    LocalTensor<float> outF = tOutF.Get<float>();
     LocalTensor<int32_t> off = tOff.Get<int32_t>();
     LocalTensor<half> offH = tOffH.Get<half>();
     LocalTensor<int16_t> q16 = tQ16.Get<int16_t>();
@@ -82,13 +80,14 @@ extern "C" __global__ __aicore__ void mxfp4_dq(
     LocalTensor<float> scHalf = tScHalf.Get<float>();
     LocalTensor<float> absb = tAbs.Get<float>();
     LocalTensor<float> work = tWork.Get<float>();
+    LocalTensor<float> oscBuf = tOsc.Get<float>();
 
     DataCopy(lutLo, gLutLo, 256);
     DataCopy(lutHi, gLutHi, 256);
     DataCopy(lutE8, gLutE8, 256);
     DataCopy(scOff, gScOff, HALF);
-    DataCopy(gidxF, gGidxF, IN);
     PipeBarrier<PIPE_ALL>();
+
 
     const uint32_t scLoad = (NB + 31) / 32 * 32;
     for (uint32_t r = blkid; r < R; r += nblk) {
@@ -136,36 +135,44 @@ extern "C" __global__ __aicore__ void mxfp4_dq(
             PipeBarrier<PIPE_V>();
             LocalTensor<float> tmp = fa; fa = fb; fb = tmp;
         }
-        SetFlag<HardEvent::V_S>(EVENT_ID0);
-        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        PipeBarrier<PIPE_ALL>();
         float amax = fa.GetValue(0);
         for (int i = 1; i < 8; i++) { float v = fa.GetValue(i); if (v > amax) amax = v; }
         if (amax < 1e-8f) amax = 1e-8f;
-        gOscale.SetValue(r, amax / 127.0f);
         float inv = 127.0f / amax;
+        // oscale through the same VECOUT TQue idiom as the int8 output (proven robust multi-core);
+        // per-row 8-float (cache-line) slot in a [R,8] oscale layout.
+        PipeBarrier<PIPE_ALL>();
+        LocalTensor<float> oscV = qOsc.AllocTensor<float>();
+        Duplicate(oscV, amax / 127.0f, 8);
+        qOsc.EnQue(oscV);
+        LocalTensor<float> oscVU = qOsc.DeQue<float>();
+        DataCopy(gOscale[(uint64_t)r * 8], oscVU, 8);
+        qOsc.FreeTensor(oscVU);
 
-        // S->V sync: the scalar `inv` must be visible to the vector Muls below
-        SetFlag<HardEvent::S_V>(EVENT_ID1);
-        WaitFlag<HardEvent::S_V>(EVENT_ID1);
+        PipeBarrier<PIPE_ALL>();  // S->V: scalar inv visible to vector Muls
 
         // requant in float (in-place on comb), clamp
         Muls(vlo, vlo, inv, HALF);
         Muls(vhi, vhi, inv, HALF);
+        PipeBarrier<PIPE_V>();
         Mins(vlo, vlo, 127.0f, HALF); Maxs(vlo, vlo, -127.0f, HALF);
         Mins(vhi, vhi, 127.0f, HALF); Maxs(vhi, vhi, -127.0f, HALF);
-        PipeBarrier<PIPE_ALL>();
+        PipeBarrier<PIPE_V>();
 
         // store TWO CONTIGUOUS PLANES: out[r,0:HALF]=qlo, out[r,HALF:IN]=qhi (no in-kernel
         // interleave -> avoids Gather's small-src cap). Interleave deferred to a cheap torch
         // post-step: out_correct[...,0::2]=plane_lo, [...,1::2]=plane_hi.
         LocalTensor<uint8_t> outrow = qOut.AllocTensor<uint8_t>();
         LocalTensor<int8_t> outI = outrow.ReinterpretCast<int8_t>();
-        Cast(off, vlo, RoundMode::CAST_RINT, HALF);
-        Cast(q16, off, RoundMode::CAST_NONE, HALF);
-        Cast(outI, q16, RoundMode::CAST_NONE, HALF);
-        Cast(off, vhi, RoundMode::CAST_RINT, HALF);
-        Cast(q16, off, RoundMode::CAST_NONE, HALF);
-        Cast(outI[HALF], q16, RoundMode::CAST_NONE, HALF);
+        Cast(offH, vlo, RoundMode::CAST_NONE, HALF);     // f32 -> half
+        PipeBarrier<PIPE_V>();
+        Cast(outI, offH, RoundMode::CAST_RINT, HALF);    // half -> int8 (round)
+        PipeBarrier<PIPE_V>();
+        Cast(offH, vhi, RoundMode::CAST_NONE, HALF);
+        PipeBarrier<PIPE_V>();
+        Cast(outI[HALF], offH, RoundMode::CAST_RINT, HALF);
+        PipeBarrier<PIPE_V>();
         qOut.EnQue(outrow);
         LocalTensor<uint8_t> outU = qOut.DeQue<uint8_t>();
         DataCopy(gOut[(uint64_t)r * IN], outU, IN);

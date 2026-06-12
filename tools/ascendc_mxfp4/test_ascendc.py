@@ -71,8 +71,8 @@ def main():
 
     cd = codes.reshape(R, HALF).contiguous().to(DEV)
     sd = scl.reshape(R, NB).contiguous().to(DEV)
-    out = torch.empty((R, IN), dtype=torch.int8, device=DEV)
-    osc = torch.empty((R,), dtype=torch.float32, device=DEV)
+    out = torch.full((R, IN), 99, dtype=torch.int8, device=DEV)
+    osc = torch.full((R * 8,), -999.0, dtype=torch.float32, device=DEV)
 
     def launch():
         lib.launch_mxfp4_dq(
@@ -85,6 +85,7 @@ def main():
 
     launch()
     torch.npu.synchronize()
+    _raw=(osc.cpu()!=-999.0).sum().item(); print(f'  RAW osc changed: {_raw}/{osc.numel()}'); _nw=(osc.cpu().reshape(R,8)[:,0]==-999.0).sum().item(); _ow=(out.cpu()==99).all(dim=1).sum().item(); print(f'  UNWRITTEN: oscale={_nw}/{R}, out-rows(all==99)={_ow}/{R}')
 
     # reference
     cd_h = cd.cpu().numpy()
@@ -101,7 +102,7 @@ def main():
     kq = torch.empty((R, IN), dtype=torch.int8)
     kq[:, 0::2] = out_planes[:, :HALFp]
     kq[:, 1::2] = out_planes[:, HALFp:]
-    ks = osc.cpu()
+    ks = osc.cpu().reshape(R,8)[:,0]
     eqf = (kq.int() == cpu_q.int()).float().mean().item()
     mx = (kq.int() - cpu_q.int()).abs().max().item()
     serr = (ks - cpu_s).abs().max().item()
@@ -118,6 +119,7 @@ def main():
     print(f"  reconstruction cos(kq*ks, true_weight) = {cosr:.6f}")
     print("  kq[0,:16] ", kq[0,:16].tolist())
     print("  cpuq[0,:16]", cpu_q[0,:16].tolist())
+
 
     if args.timing:
         for _ in range(3):

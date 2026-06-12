@@ -64,6 +64,32 @@ GGUF MXFP4 (DDR, ~137GB, CPU 也用这一份)
 精度:MXFP4→W8A8 经 agent 验证**近无损**(int8 足以承载 MXFP4 有效精度,cosine ~0.99994;参考
 `mxfp4_to_w8a8_accuracy.py`)。
 
+### 0.1 你的单点 = 这一个 kernel(别扩散)
+
+**你只做一件事:写出"MXFP4→int8(+per-channel scale)"的融合 NPU 算子,单层离线 bit-exact、且快到能藏在
+H2D 下面。** 做完做一个最小集成验证就收。以下**明确不是你的活**,别被带跑:
+
+- ❌ **追端到端 decode tok/s 的"干净数"**——Session C 已证这台共享机 NUMA 噪声击败小样本(`cpu_moe_wall`
+  单配置就 12–120ms 乱摆),要稳定 median 得 ≥500 token + 独占机。你拿不到也别试,**用组件级地板判定收益**。
+- ❌ **改 decode 编排 / submit-sync-overlap / MTP**——那是 Session B 的领地。
+- ❌ **整网调通后再验算子**——反了。**先离线单层 bit-exact,再碰整网**(NZ 切片坑见 §坑)。
+- ❌ **顺手优化 requant / nz**——它们是 NPU-native、已经够快(§2),不在瓶颈上,别动。
+
+判定你成没成,只看 §10 那四条;前两条(算子 bit-exact + 够快)是硬核,后两条是顺带。
+
+### 0.2 预期收益(量化;来源=Session C 实测 + 本算子 roofline)
+
+| 维度 | 现状(W8A8 池) | 消池后(本算子) | 收益来源 |
+|---|---|---|---|
+| **decode `cpu_moe_wall`** | streaming-pinned **39–55ms**(pin 税抬 2–3×) | 回到热专家地板 **~20ms** | 无池→无 pin 税(C §D 实测,runtime 去不掉) |
+| **decode tok/s** | ~7–8(被 pin 税压) | **~14–16 量级**(热专家应有值) | ↑ 同上;**注**:共享机测不准,以地板判 |
+| **prefill 流式** | 4096 ~14s / 32k ~13s(8–70×) | **保留,甚至略快** | 流式 4-bit MXFP4 比 8-bit W8A8 **H2D 减半**(§2) |
+| **DDR 占用** | **~414GB**(W8A8 池 277 + MXFP4 ~137) | **~137GB** | 砍掉 277GB W8A8 池;CPU/NPU **共用一份 MXFP4** |
+| **精度** | int8 | **不变**(近无损,cos 0.99994) | MXFP4→W8A8 lossless |
+
+> 一句话:**消掉 277GB 常驻池 → pin 税消失 → 热专家 + 流式两个收益第一次同框,DDR 还砍 2/3,精度不动。**
+> 这就是为什么值得为它写一个算子。
+
 ---
 
 ## 1. 工作区 / 隔离(已建好,2026-06-12)
@@ -99,11 +125,39 @@ Session C 实测(`KT_DECODE_TIMING`,见 C handoff §D):
 - **结论**:两个收益独立都真,合起来只被"W8A8 池要常驻+要 pin"卡住。**消池 = 同时解锁两者**。
 
 转换为什么必须写算子(agent 已定位):
-- 向量化 PyTorch 转换 = **3.4s/层**,比 H2D 地板 345ms 慢 **10×**;
+- 向量化 PyTorch 转换 = **3.4s/层**,比 H2D 地板 ~345ms 慢 **10×**;
 - 瓶颈在 **dequant 段**:nibble unpack + FP4 e2m1 + e8m0 per-block-32 scale,PyTorch 物化了 **int32
   flat-index** + **13GB bf16 中间量**,是 **launch / materialization-bound,不是带宽**;
 - 一个融合算子把这些留在片上、单趟过,就能压回 H2D 地板量级。
-- **requant + nz 不用动**:它们是 NPU-native 算子,已经快(C handoff 记的 requant ~196ms / nz ~599ms 量级)。
+- **requant + nz 不用动**:它们是 NPU-native 算子,已经快(C handoff 记的量级 requant ~196ms / nz ~599ms,
+  系**整模型 43 层合计**,非每层;换算每层 ~4.5 / ~14ms,远在预算内)。
+
+### 2.1 算子自己的 roofline:它只需要"藏得进 H2D",而预算极宽
+
+流式 pipeline 是双缓冲:**算第 L 层时 H2D 预取第 L+1 层**。所以本算子(dequant+requant+nz)只要满足
+**每层转换耗时 ≤ 每层 H2D 耗时**,转换就被完全掩盖 ≈ **免费**。算一下每层预算(DSv4-Flash,每层 E=256
+专家,W8A8 6.45GB / MXFP4 ~3.4GB @ 4.25 bit/weight):
+
+| 段 | 每层数据 / 带宽 | 每层耗时(估) | 说明 |
+|---|---|---|---|
+| **H2D(预算上限)** | MXFP4 ~3.4GB / PCIe ~19–23GB/s | **~150–180ms** | 流 4-bit,比 W8A8 6.45GB(~345ms)**减半** |
+| dequant+requant(本算子) | 读 3.4 + 写 6.45 ≈ 9.85GB / HBM ~1.3TB/s | **~8ms**(BW 地板),实测 ~12ms | HBM↔HBM,**纯带宽**;agent conv 地板 12ms |
+| native nz(不动) | ~6.45GB 重排 / HBM | **~14ms** | `npu_format_cast(·,29)` |
+
+**结论(robust,跟 nz 精确数无关)**:转换片上段 ~12+14 ≈ **26ms/层**,而 H2D 预算 **150–180ms/层**——
+转换只占 H2D 的 **~15%,藏得绰绰有余**,等于免费。**你不需要"最快",只需要"别病态"**:PyTorch 的 3.4s/层
+是 H2D 预算的 **~20×**,会把流水彻底撑爆(暴露在关键路径上)→ 流式收益归零。**桩3 的判据因此是"≲H2D 预算
+(~150ms),量级对就行",不是抠到地板。**
+
+> 顺带的 prefill 加成:流式 MXFP4(4-bit)比原 W8A8(8-bit)**H2D 减半**(345→~170ms/层),所以消池不仅不
+> 拖慢 prefill,反而**省一半 H2D 带宽**——这是之前 W8A8 池没有的额外便宜。
+
+### 2.2 为什么 decode 收益是真的(地板判定,不靠端到端)
+
+decode 大头是 `cpu_moe_wall`,而它被 W8A8 池的 pin 死死抬着:**no-stream 17–27ms → streaming-pinned
+39–55ms**(2–3× 就是 pin 税)。热专家把它的**下界**从 prefix-32 ~39ms 砍到 real-topK ~20ms。消池后没有池可
+pin → `cpu_moe_wall` 落在 ~20ms 那档而非 40–55 → decode 拿回热专家应有的速度。**这条不依赖端到端 tok/s**
+(共享机测不准),只依赖"pin 税真实 + 热专家砍半"这两个 C 已实测的组件事实。
 
 ---
 
@@ -206,6 +260,32 @@ decode 侧 `kt_ep_wrapper.py` / kt-kernel `experts_base.py` 的 submit/sync/comb
 
 ---
 
+## 8.5 坑(前序已踩,别重踩)
+
+按"会不会咬到你这个算子"排序:
+
+1. **NZ 只能在设备上、format-aware 地切/gather**(★ 最相关)。Session C 的 Goal-2 乱码根因就是:常驻权重
+   gather 切的是 **host 上的 NZ 池**,host 切片 format-unaware → 字节错乱。**你的算子输出喂 nz、以及任何对
+   W8A8-NZ 的 gather/slice,必须在 device 上做**(`npu_format_cast` ND↔NZ:`(t,2)`=NZ→ND,`(t,29)`=ND→NZ)。
+   离线对账时:先 NZ→ND 再切再 ND→NZ,或直接设备 fancy-index。参考 `nz_batched_gather_test.py`。
+2. **别复刻 PyTorch 转换的病态**。慢不是因为带宽,是它物化了 **int32 flat-index** + **13GB bf16 中间量** +
+   多次小 launch(launch/materialization-bound)。融合算子的全部意义就是**消掉这两个物化、单趟过**。首选
+   dequant+requant 一起融、连 bf16 中间量都不落地(§4 桩2)。
+3. **计时必须先 warmup**。无预热的首次触碰会给离谱假数(memory `npu-bandwidth-bench-needs-warmup`:曾因此
+   误判 side-stream 半带宽)。桩3 量 ms/层前先跑几轮丢弃。单变量受控对照。
+4. **子模块建池**:这台机 `submodule update` 走 SSH(`git@github`)host-key 失败、默认 `--local` 硬链接
+   clone 也挂。已用 `git clone --no-local <kt-C sibling>` 绕过(§1)。**含义**:合回 `longseq-sglang` 走本地
+   remote,不是 github。
+5. **pin 税 runtime 去不掉**(这是消池存在的理由,别再去试老路):torch pinned **caching allocator 不释放**,
+   `torch.npu.empty_cache` 只管 device,没有 host-cache-empty API;unpin 无 API;bounce(unpinned→pinned
+   memcpy)更慢;全程 unpinned 又把 prefill H2D 拖到 237s。**所以唯一出路是根本不建 W8A8 池**(=你做的)。
+6. **共享机 NUMA 噪声**:`cpu_moe_wall` 同一配置就在 12–120ms 乱摆,100–150 token 小样本测 decode tok/s
+   纯噪声。**别拿端到端 tok/s 当算子的验收**;算子验收看 §10.1/§10.2(离线、确定性)。
+7. **kt_kernel 导入**:单独跑脚本报 `No module named kt_kernel` 是包名没注册(`ln kt_kernel->python` 或
+   `ensure_kt_kernel.sh`);容器重启报 "kt_kernel is not installed" 先查 `libhwloc15`、`MODEL_PATH` 须显式传。
+
+---
+
 ## 9. 纪律(硬要求)
 
 - 快参考/数字**先实测**(输出非零、warmup 后)再信;别拿冷启动假象当结论。
@@ -223,11 +303,14 @@ decode 侧 `kt_ep_wrapper.py` / kt-kernel `experts_base.py` 的 submit/sync/comb
 
 ## 10. 验收(怎么算这个 session 成了)
 
-1. **算子**:单层离线,MXFP4→(算子)→int8+scale→native nz→`npu_fused_experts`,对参考路径 cosine ≈ 1.0,
-   且 dequant ≲ 345ms/层量级。
-2. **消池整网**:`kt_stream_prefill` 走 MXFP4 流式 + 现转,**不建 W8A8 池**;prefill 流式收益保留
-   (4096 prefill ~14s 量级)。
-3. **两个收益同框**:decode 开热专家常驻,`cpu_moe_wall` 不再被 pin 税抬(回到 ~20ms 量级而非 39-55),
-   decode tok/s 拿到热专家提速。**注意**:这台共享机 NUMA 噪声大,小样本测不准——要稳定 median 需
-   ≥500 token + 尽量独占窗口(C handoff §D-端到端测不准的教训)。
-4. **DDR**:`free`/进程 RSS 证 W8A8 池 277GB 已消,DDR 落到 ~137GB 量级。
+### 10.1 硬核(你的单点,必须达成)
+1. **算子 bit-exact**:单层离线,MXFP4→(算子)→int8+scale→native nz→`npu_fused_experts`,对参考路径
+   (`mxfp4_conv_vectorized_npu.py` 同 nz 同 GEMM)cosine ≈ 1.0。
+2. **算子够快**:dequant(+requant)片上段 **≲ H2D 每层预算(~150ms),量级对即可**(理论地板 ~8–12ms,
+   有 ~15× 余量;§2.1)。warmup 后量。
+
+### 10.2 顺带(算子过了之后的最小集成,能到就到,卡住先记录)
+3. **消池整网**:`kt_stream_prefill` 走 MXFP4 流式 + 现转,**不建 W8A8 池**;prefill 流式收益保留
+   (4096 prefill ~14s 量级);`free`/RSS 证 277GB W8A8 池已消、DDR 落到 ~137GB。
+4. **收益地板**:decode 开热专家常驻,`cpu_moe_wall` 回到 ~20ms 档(而非 39–55)。
+   **判定靠这个组件数,不靠 decode tok/s**——共享机 NUMA 噪声让小样本 tok/s 不可信(§坑6)。

@@ -47,6 +47,32 @@ historical stepping stone; the fused kernel supersedes it.
      the handoff's full benefit needs the NPU to share the CPU's MXFP4 (no separate pinned pool)
      or stream unpinned. The DDR win is delivered; the decode pin-tax win needs this.
 
+### Session C update (2026-06-13, card 7): dynamic-resident wired to MXFP4 pool (§D)
+**Done — dynamic-resident now works on the depool path, decode COHERENT.**
+- `kt_stream_prefill.py` `_apply_dynamic_residency`: under depool, the hot-K experts' MXFP4 codes
+  are plain packed bytes (NOT NZ), so a first-dim `[top]` slice is format-safe; convert just those
+  K via `mxfp4_layer_to_nz_slots` straight into the resident slots — no whole-pool H2D, no NZ
+  round-trip gather. Gate `_KT_DYN_RESIDENT and not _KT_MXFP4_DEPOOL` → `_KT_DYN_RESIDENT`.
+- **Correctness ✓**: switch applies cleanly (top-32×43, masks mask_sum=32/l2g=32/cpu=32), decode
+  output coherent ("Efficient inference in MoE models requires keeping active experts near the
+  compute unit while streaming idle ones..."). The old Goal-2 gibberish (host NZ slice) does NOT
+  recur — the MXFP4-byte slice is format-safe.
+- **off_cpu (§D judge)**: steady-state dynamic off_cpu **floor ~17ms** (near the ~20ms target),
+  but **median ~46ms dominated by shared-box NUMA noise** (one run hit a 2068ms GC spike; p90 ~85).
+  Static prefix-32 (no pool) floor ~20ms. **Cannot show a clean dynamic≪static median delta on this
+  shared box** — same wall the longseq handoff documents (needs ≥500 tok + exclusive machine).
+- **Pin tax NOT confirmed in steady state**: added `KT_MXFP4_POOL_NO_PIN=1` (unpinned pool);
+  unpinned dynamic off_cpu floor ~17ms / median ~46ms — **no clear improvement over pinned**, so
+  pinning is not the dominant decode cost here (post-switch transient spikes to 165–400ms were
+  contention, not steady state). Kept the flag opt-in; default pinned (faster prefill H2D).
+- **Switch is SLOW (~180s)**: profile H2D(slice)=71s + convert=113s. The 113s convert of 43×32
+  experts is pathological vs prefill's 82ms/256-expert — likely host-gather de-pinning + per-call
+  fixed overhead ×43. **Top follow-up**: stage hot-K MXFP4 into a pinned contiguous buffer before
+  H2D, and/or batch the 43 layer-converts. One-time cost (end of prefill), so it didn't block
+  correctness, but a 180s stall per long prefill is unshippable.
+- **Net**: §D code correct + coherent; component floor (~17ms) meets target; the clean median
+  benefit + switch speed are the open items (former is box-limited, latter is a code optimization).
+
 ### Working operator (this dir)
 - `mxfp4_dq_kernel.cpp` — MXFP4 → int8 weight (two contiguous planes `[lo|hi]`; de-interleave in a
   torch post-step). Correct single + multi core. Its own `oscale` output is broken/unused (ignored).

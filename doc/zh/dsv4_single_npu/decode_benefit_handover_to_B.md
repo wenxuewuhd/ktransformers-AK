@@ -105,3 +105,48 @@ C 的改动在分支 `mxfp4-dequant-kernel`(父)/ `mxfp4-dequant-kernel-sglang`(
 `dyn-resident-mechanics-proven`（W8A8 动态常驻已修复+机制）、`depool-dynresident-offcpu-floor-only`
 （本 A/B 结论）、`static-prefix-placement-is-random-level`、`mxfp4-cpu-moe-validated`、
 `npu-bandwidth-bench-needs-warmup`、`dsv4-server-launch-pitfalls`。
+
+---
+
+# MXFP4(depool)合并工作流 + C 分支清单（备查，2026-06-13）
+
+## 何时合 —— 两个触发,谁先到合谁
+1. **depool 的 DDR/prefill 收益要上生产** → 立刻合 C(gated 默认 off,低风险,不碰 int8 默认路)。
+2. **B 的 overlap 落地、想 MXFP4 路也吃 decode wall-clock** → B 先落,C 再 rebase 上去合（不急走这条更干净，
+   冲突面在 B 重改的 `kt_ep_wrapper`/`experts_base` 的 §D 钩子，让 C 适配 B 的最终版）。
+
+## 分阶段
+- **Phase 1（现在）**：C 收口。改动 commit 在分支、gated。B 交接完成。
+- **Phase 2**：B 在 int8 默认路做 overlap+MTP（用现有 W8A8 动态常驻），与 MXFP4 解耦、可独立推进。
+- **Phase 3（B 落地后，一次集成，建议单开集成 session 带双边上下文）**：
+  1. C 的 `mxfp4-dequant-kernel-sglang` rebase 到 B 落地后的 mainline；
+  2. 解冲突（只在 `kt_ep_wrapper`/`experts_base` 的 §D 钩子 vs B 的 overlap；`kt_stream_prefill` B 几乎不碰）；
+  3. **双路验收（硬动作）**：gate **off** → int8 路逐字节不变；gate **on**(`KT_MXFP4_DEPOOL=1`) →
+     cos 0.99999976 + DDR 省 137GB + prefill ~15-20s + §D 解码连贯 + 切换 ~8s；**独占窗口**复测
+     dynamic vs `KT_DYN_FORCE_PREFIX` 确认热专家地板 -45% 在两路兑现成 tokens/s。
+  4. 落 `longseq-mxfp4`。
+- **Phase 4**：默认决策——G 优化后 depool prefill ~15-20s 已接近 W8A8 预建池 14s 且省 137GB，验收过后
+  **depool 有资格转默认**（生产决策，Phase 3 数据齐了再拍，别提前）。
+
+## C 分支清单（按图索骥）
+**父仓 `mxfp4-dequant-kernel`**（从 `longseq-mxfp4` 切）— C 的 sglang 子模块指针 + 文档。
+**sglang `mxfp4-dequant-kernel-sglang`**（从 `longseq-sglang` 切）— depool/§D 主体，关键 commit：
+| commit | 作者 | 内容 |
+|---|---|---|
+| `7fc757933` | G | gated MXFP4 depool 路（存 MXFP4、现转 W8A8-NZ）|
+| `710bb2161` | C | §D 动态常驻接 MXFP4 池（热-K 现转进常驻槽，设备安全切片）|
+| `4a222a568` | C | `KT_MXFP4_POOL_NO_PIN` 标志（unpinned 池，opt-in）|
+| `e14203b2f` | C | 切换 H2D pinned-staging（`_stage_pin_h2d`，17.5→7s）|
+| 基线 `c850eea7e`/`9c8e0e70f` | C(旧) | W8A8 动态常驻 device-slice 修复 + ND-round-trip（已在 longseq-sglang）|
+
+## ⚠️ 合并前置（重要）
+- **G 的 230ms convert 优化当前 *未提交***（`tools/ascendc_mxfp4/mxfp4_fused_op.py` 工作区 `M`，
+  STATUS.md 已记其内容）。**合并前 G 必须先 commit 这个**，否则 prefill 收益（137→~15s）丢失、回到 3077ms。
+- kt-kernel ext + llama.cpp MXFP4 patch 容器重启会丢（见 `HANDOVER_SESSION_C.md` §C.0），集成机上须先补。
+
+## 🔜 G 可能还有更高效的算子（待 G 通知）
+G 那边可能再出**更高效的算子更新**（如 path-3 核子直写 FRACTAL_NZ，STATUS 估 ~113ms，省 transpose+format_cast）。
+**届时有了 G 会告知**，再评估怎么合回来。合的要点不变：**只要 `mxfp4_layer_to_nz_slots` / `convert_proj`
+的输出契约不变**（NZ-tagged `[E,IN,OUT]` int8 + bf16 `[E,OUT]`），**C 的 wiring（`kt_stream_prefill`）零改动**，
+直接 drop-in 受益；G 若改了输出格式，才需 C 同步改。所以新算子合并 = 替 `mxfp4_fused_op.py`/`mxfp4_*_kernel.cpp`
++ 跑 §A(cos) + §C(端到端) 验收，不动 §D。

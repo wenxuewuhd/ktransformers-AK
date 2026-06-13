@@ -22,6 +22,43 @@ One pass: reads MXFP4 once → int8 weight (two `[lo|hi]` planes, de-interleave 
 The two-kernel version (`mxfp4_dq_kernel.cpp` + `mxfp4_oscale_kernel.cpp`, 165 ms) is the
 historical stepping stone; the fused kernel supersedes it.
 
+### Whole-layer convert optimized 3077 -> 230 ms (13.4x), 2026-06-13
+Session C measured that the depool **whole-layer convert** (`mxfp4_layer_to_nz_slots`, E=256) was
+3077 ms — of which the kernel is only ~82 ms; the rest was the ND->NZ post-step in `mxfp4_fused_op.py`.
+Breakdown: de-interleave 2364 (79%!) / int8-transpose 578 / format_cast 24 / copy 29.
+Fixes (both in `convert_proj`, no API/contract change, cos 0.99999976 preserved, byte-identical):
+- **de-interleave**: the `[lo|hi]` plane scatter `q[:,0::2]=...` was a 1-byte strided write (~2.7 GB/s).
+  Replaced by a contiguous stack-interleave to `[E,OUT,IN]`.
+- **transpose**: an int8 OUT<->IN transpose degenerates to a 1-byte gather (~21 GB/s HW floor — even
+  `npu_transpose` is no faster). Killed via **fp16-transpose**: `q.to(fp16).transpose(1,2).contiguous()
+  .to(int8)` runs the vectorized transpose path; `int8->fp16->int8` is exact since `|q|<=127`. 620->67 ms.
+  (`.contiguous()` is mandatory — a transposed view to `format_cast` lays down wrong NZ bytes on device.)
+- Result: whole-layer **230 ms** (kernel ~89 + post ~127 + overhead), prefill ~137s -> ~12-17s. Hits target.
+- DEAD ENDS (don't retry): consumer-side transpose — production `npu_grouped_matmul` has no
+  `transpose_weight` (only `npu_grouped_matmul_add`/`npu_transpose_batchmatmul`, neither can do the
+  int8+scale grouped forward). Kernel-direct-NZ (`mxfp4_nz_kernel.cpp`, shelved WIP) targets ~113 ms but
+  needs a MXFP4-pool layout change (pre-transposed codes) + fractal GM writes — not worth it now that
+  fp16-transpose already hits target.
+
+### QUEUED UPGRADE: swap in the advance kernel (161 ms) after Session C validates benefits
+The "advance kernel" (separate repo `/workspace/code/ascend_c_dev/easyasc`, native device→device op)
+is verified faster: whole-layer convert **161.5 ms vs our 230 ms** (~30%), e2e cos 0.99993765 (PASS,
+slightly looser than our 0.99999976), two-shape single-process coexistence 16/16, tensorutils.h fix in
+its `main` (commit d5906fe). It is structurally leaner (kernel emits consecutive int8 — no de-interleave).
+Drop-in is **same signature/semantics** as ours (`mxfp4_layer_to_nz_slots(c13,s13,c2,s2,H,I) ->
+(w13_nz,s13b,w2_nz,s2b)`), so swapping is a clean follow-up that does NOT touch Session C's depool /
+dynamic-resident wiring. **Decision: keep OURS for now** (already integrated + server-validated + 230 ms
+already hits the prefill goal); swap theirs in as a deliberate, separate step once C has validated the
+DDR/decode benefits. Swap recipe:
+1. Vendor their kernel + dual-op build + `native_layer.py` into the kt repo (next to this dir); drop the
+   dependency on the easyasc dev repo.
+2. Point `_mxfp4_convert_fn()` (kt_stream_prefill.py) at their entry; add the vendor-env to the server
+   launch (`source vendors/customize/bin/set_env.bash`) and ensure commit d5906fe is present.
+3. E2E regression: cos >= 0.9999 + whole-layer ~161 ms + a depool server run (DDR unchanged, prefill
+   ~3 s faster). Confirm the accuracy didn't regress (their cos is the looser 0.99993765).
+Acceptance evidence (verified by us 2026-06-13, card 5): native_run_dual.py 16/16 + correctness <1%;
+native_layer.py --experts 32 cos 0.99993765 + 161.5 ms.
+
 ### Integrated into kt_stream_prefill (depool), gated
 - `mxfp4_fused_op.py` — runtime wrapper: builds (bisheng) + loads the fused `.so`, exposes
   `mxfp4_layer_to_nz_slots(c13,s13,c2,s2,H,I) -> (w13_nz, s13b, w2_nz, s2b)`.
@@ -72,6 +109,36 @@ historical stepping stone; the fused kernel supersedes it.
   correctness, but a 180s stall per long prefill is unshippable.
 - **Net**: §D code correct + coherent; component floor (~17ms) meets target; the clean median
   benefit + switch speed are the open items (former is box-limited, latter is a code optimization).
+
+### Session C re-validation on G's optimized algo + switch fix + controlled A/B (2026-06-13, card 7)
+After G's whole-layer convert dropped to **230ms** (3077→230, cos 0.99999976 — re-verified offline):
+- **Prefill streaming benefit RECOVERED**: depool prefill forward **137s → ~15-20s** (clean est;
+  measured ~40s in a 5×-contended window). G's convert was the lever; this was the benefit that
+  depool had traded away. Headline of the two-benefit goal — delivered.
+- **Switch made shippable**: the earlier "180s switch" was mostly a contended-window artifact.
+  Clean breakdown: convert dropped 99s→**1.3s** (G's optimization flows through `convert_proj`),
+  H2D was 17.5s because `c13[top]` (advanced indexing) is **unpinned** → no DMA. Fix landed
+  (`_stage_pin_h2d`, `kt_stream_prefill.py`): `index_select` the hot-K into a reused **pinned**
+  buffer → DMA, H2D 17.5s→**7s**. Whole switch **~8s clean** (one-time, end of prefill). Works
+  pinned or unpinned. Offline-verified.
+- **Controlled A/B (FORCE_PREFIX static vs dynamic, same pool/prompt/memory) — decode verdict**:
+  hot-expert selection works (activation share 0.134→0.586), and off_cpu **floor 18.8→10.3ms (−45%)**,
+  BUT p10/p25/median/p75 are **identical** (29→28 / 39→39 / 63→57 / 103→102). off_cpu =
+  ①expert-bandwidth (hot experts cut this, visible only at the floor) + ②per-layer CPU
+  dispatch/fork-join fixed overhead + ③neighbor noise. ②③ dominate p10↑ and don't move →
+  **net wall-clock decode speedup ≈ 0 on this shared box.**
+
+### Decode hot-expert benefit — where it goes next (NOT this session)
+The hot-expert **mechanism is done** (§D, necessary prerequisite). The remaining lever is the
+**per-layer CPU↔NPU dispatch/fork-join overhead** (dominates off_cpu above the floor) — that is
+**Session B's domain** (B owns submit/sync/overlap + MTP). Plus an **exclusive/unloaded machine**
+to let the −45% floor show through the neighbor noise. Neither is C's scope or the kernel's.
+**C↔B contract**: enable with `KT_MXFP4_DEPOOL=1 KT_DYNAMIC_RESIDENT=1`; resident set = prefill
+top-32 (share ~0.6); off_cpu floor is already −45% but dispatch-bound; B's overlap work is what
+converts the floor win into wall-clock. Shared files at merge: `kt_stream_prefill.py` (C),
+`kt_ep_wrapper.py` / `experts_base.py` (B).
+
+**Session C scope (depool + dynamic-resident + prefill streaming + DDR) is COMPLETE.**
 
 ### Working operator (this dir)
 - `mxfp4_dq_kernel.cpp` — MXFP4 → int8 weight (two contiguous planes `[lo|hi]`; de-interleave in a

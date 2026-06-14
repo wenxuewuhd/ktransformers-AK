@@ -33,17 +33,24 @@ overlap**,让热专家砍掉的那块带宽收益(地板 -45%)真正变成 token
 
 ---
 
-## 2. 瓶颈拆解（off_cpu 三段，你打中间那段）
+## 2. 两个杠杆，两个不同的 metric（B 2026-06-14 纠正 —— 用错 metric 会判错 overlap）
 
-`off_cpu`（KT_DECODE_TIMING 打的 CPU MoE wall）≈
-1. **专家带宽分量** —— 随上 CPU 的专家数。热专家把它砍了 → **地板 -45%**。✅ 已拿。
-2. **每层 dispatch / fork-join 固定开销** —— 43 层每层 submit→128 线程 fork-join→sync。**不随专家数缩**,
-   所以热专家碰不到。**p10 以上被它顶住。← 这是你的靶子。** （mxfp4 handoff 估 ~4.6ms dispatch + 每层 fork-join）
-3. **共享机邻居噪声** —— median 是地板的 2-5×,偶发 GC/争用尖峰(见过 2068ms / 6276ms 单 token)。
-   **不是代码问题,是测量条件**(见 §5)。
+> ⚠️ 本文旧版（§4/§7）说"看 off_cpu p10 是否往 ~10ms 收来判 overlap"——**category error，已改**。
+> off_cpu 对 overlap 不敏感，理由如下。
 
-**你的杠杆 = ②**：把 CPU MoE 的 submit/sync 跟 NPU 侧计算 overlap 起来,让 dispatch 不在关键路径上。
-②藏住后,①的 -45% 地板才会从 p10 显出来 → wall-clock 提速。
+**off_cpu = CPU MoE 一次 submit→sync 的【时长】**（workload-bound）。
+- 热专家砍 CPU【工作量】→ off_cpu **floor 真降**（本文 A/B 18.8→10.3，-45%）。**off_cpu floor 是热专家的判据，对。**
+
+**overlap 不动 off_cpu。** side-stream 把这段时长【藏到 NPU 计算背后】，不是【缩短】它——所以无论 overlap
+成不成，off_cpu **都不变**（B 实测 side 开/关，W8A8 prefix-32 534 token：off_cpu floor 57.1→58.4，没动；
+TPOT 9.1→9.35 tok/s，略快）。**overlap 的收益只在 TPOT(token 墙钟) floor/p10 上显。**
+
+**两个杠杆相乘，净值只在 TPOT 上量得到**：
+- side-stream 当前能藏的窗口 ≈ **GPU-experts matmul 5.6ms/token**（被逐层 CPU→merge→下一层 attention 的硬依赖卡死）。
+- off_cpu floor 57ms 时藏 5.6ms = wash；只有热专家把 floor 压到 ~10ms 后，藏 5.6ms 才是 ~50% 相对收益。
+- 所以 **decode 收益 = 热专家(降 off_cpu floor) × overlap(藏 TPOT 暴露)**，缺一不可。
+
+（共享机邻居噪声让 median 是地板的 2-5×、偶发尖峰——测量条件，见 §5；不是杠杆。）
 
 ---
 
@@ -62,16 +69,17 @@ overlap**,让热专家砍掉的那块带宽收益(地板 -45%)真正变成 token
 ## 4. 仪器 + 判据
 
 - `KT_DECODE_TIMING=1` → 每 token 打 `cpu_moe_wall=X (sync=.. on_cpu=.. off_cpu=..)`(`kt-kernel/python/experts_base.py`)。
-  - `off_cpu` = CPU MoE 算非常驻专家的 wall（你要藏的）。`on_cpu` = NPU 侧那部分（~2ms,小）。
-- **判据看 floor / p10,不看 median**（共享机 median 是噪声）。你的 overlap 成不成,看 **p10/p25 是否往地板(~10ms)收**。
-- 目标方向：让 decode 的 off_cpu **p10 从 ~29ms 往 ~10ms 收**(把 dispatch 藏掉),那就是把 -45% 地板兑现了。
+  - `off_cpu` = CPU MoE submit→sync 的【时长】= **热专家的判据**（floor 降=工作量降）。**不是 overlap 的判据。**
+- **overlap 成不成 = TPOT(每 token 墙钟) floor/p10**（用 tok/s 的 floor/p10，同窗口配对；overlap 把 off_cpu 藏到 NPU 背后，只在 TPOT 上显，off_cpu 永不显）。
+- **判据一律看 floor / p10，不看 median**（共享机 median 是噪声）。
+- 目标：**TPOT floor 往上走**（藏掉 ~5.6ms 暴露）；off_cpu floor 由热专家负责(已 -45%)。两者相乘，在 TPOT 上验。
 
 ---
 
 ## 5. 测量纪律（共享机，硬要求）
 
 - **floor/p10 robust,median 是噪声**；要稳定 median 需 **≥500 token + 尽量独占/空载窗口**。
-  -45% 的地板收益**只有在独占机上才显成 wall-clock**——安排一次空载窗口复测是值得的。
+  热专家×overlap 在 **TPOT** 上的相乘收益要在**独占/空载窗口**才量得干净（噪声会淹掉 ~5.6ms 量级的 TPOT 差）——安排一次值得。
 - 选 HBM<10% 的空卡(`npu-smi`,~3200/65536)；**不碰 card 2**(别的容器)。
 - **绝不 `pkill -f sglang.launch_server`**（打到别的 session）;只杀自己的 PID/PGID。
 - 停服务 **SIGTERM 不 SIGKILL**,重启前等 HBM 落基线。
@@ -95,9 +103,13 @@ C 的改动在分支 `mxfp4-dequant-kernel`(父)/ `mxfp4-dequant-kernel-sglang`(
 
 ## 7. 验收（你这条线算成了）
 
-- decode **off_cpu p10 从 ~29ms 往 ~10ms 收**(dispatch 藏进 overlap),且在**独占窗口**复测 dynamic vs
-  static(`KT_DYN_FORCE_PREFIX`)能看到 wall-clock decode tok/s 提升(热专家地板 -45% 兑现)。
-- 判据按 component(off_cpu floor/p10),不按共享机 median。
+- **overlap 成 = TPOT(token 墙钟) floor/p10 提升**（同窗口配对：dynamic+side-stream vs dynamic-no-side）。
+  off_cpu **不作 overlap 判据**（它对 overlap 不敏感）。
+- **热专家成 = off_cpu floor -45%**（已拿）。
+- **生产真值 = 热专家 × overlap 在 TPOT 上的相乘收益**：独占窗口复测 dynamic-resident + side-stream 的
+  TPOT floor/p10，对照 static / no-side。预期：热专家把 off_cpu floor 压到 ~10ms 后，side-stream 藏的
+  ~5.6ms 才显成 ~50% 量级的 TPOT 收益（B 的 Phase-3，frequency 静态放置 hit 0.44 先量 gradient）。
+- 判据一律 floor/p10，不看共享机 median。
 
 ---
 

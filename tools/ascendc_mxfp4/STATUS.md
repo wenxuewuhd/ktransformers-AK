@@ -40,11 +40,23 @@ Fixes (both in `convert_proj`, no API/contract change, cos 0.99999976 preserved,
   needs a MXFP4-pool layout change (pre-transposed codes) + fractal GM writes — not worth it now that
   fp16-transpose already hits target.
 
-### QUEUED UPGRADE: swap in the advance kernel (161 ms) after Session C validates benefits
+### QUEUED UPGRADE: swap in the advance kernel (115 ms) after Session C validates benefits
 The "advance kernel" (separate repo `/workspace/code/ascend_c_dev/easyasc`, native device→device op)
-is verified faster: whole-layer convert **161.5 ms vs our 230 ms** (~30%), e2e cos 0.99993765 (PASS,
-slightly looser than our 0.99999976), two-shape single-process coexistence 16/16, tensorutils.h fix in
-its `main` (commit d5906fe). It is structurally leaner (kernel emits consecutive int8 — no de-interleave).
+is verified faster. Two paths, same drop-in contract:
+- **fp16-transpose path** (`native_layer.py`): whole-layer **161 ms**, stable.
+- **cube-transpose path** (`native_layer_overlap.py`, --timeovl): whole-layer **~115 ms** (verified by us
+  2026-06-13: cos 0.99993765 PASS; SEQUENTIAL 116 ms = conv13 44.5 + conv2 27.4 + tr13 17.9 + tr2 8.7 +
+  fc 18.7). This is the upgrade target — ~2x our 230 ms.
+- **"94 ms is unreachable" — independently confirmed**: overlapping the vec convert (one stream) with the
+  cube transpose (another stream) measures wall = SUM not MAX (--concur: 2-stream 15.6 ≈ sum 15.9 vs
+  max 11.3) → the platform serializes separate kernels across streams, so the transpose cannot hide
+  behind convert. 115 ms is the sequential-sum floor for the two-kernel design. (The only theoretical
+  sub-115 path is fusing convert+transpose into ONE vec+cube kernel so AIV/AIC overlap intra-kernel — a
+  major rewrite, not worth it since both already beat target.)
+- Also landed 3 framework bug fixes (commits dcc42f7/d5906fe + a format_cast-3D fix): real bugs, keep them.
+e2e cos 0.99993765 (PASS, slightly looser than our 0.99999976), two-shape single-process coexistence
+16/16, tensorutils.h fix in its `main` (commit d5906fe). It is structurally leaner (kernel emits
+consecutive int8 — no de-interleave).
 Drop-in is **same signature/semantics** as ours (`mxfp4_layer_to_nz_slots(c13,s13,c2,s2,H,I) ->
 (w13_nz,s13b,w2_nz,s2b)`), so swapping is a clean follow-up that does NOT touch Session C's depool /
 dynamic-resident wiring. **Decision: keep OURS for now** (already integrated + server-validated + 230 ms
@@ -115,12 +127,24 @@ After G's whole-layer convert dropped to **230ms** (3077→230, cos 0.99999976 �
 - **Prefill streaming benefit RECOVERED**: depool prefill forward **137s → ~15-20s** (clean est;
   measured ~40s in a 5×-contended window). G's convert was the lever; this was the benefit that
   depool had traded away. Headline of the two-benefit goal — delivered.
-- **Switch made shippable**: the earlier "180s switch" was mostly a contended-window artifact.
-  Clean breakdown: convert dropped 99s→**1.3s** (G's optimization flows through `convert_proj`),
-  H2D was 17.5s because `c13[top]` (advanced indexing) is **unpinned** → no DMA. Fix landed
-  (`_stage_pin_h2d`, `kt_stream_prefill.py`): `index_select` the hot-K into a reused **pinned**
-  buffer → DMA, H2D 17.5s→**7s**. Whole switch **~8s clean** (one-time, end of prefill). Works
-  pinned or unpinned. Offline-verified.
+- **Switch — H2D fix is live-confirmed; the "8s" convert was OFFLINE-only (CORRECTED 2026-06-17 by Session B)**:
+  - **H2D fix is real and live-confirmed**: `c13[top]` (advanced indexing) is **unpinned** → no DMA;
+    `_stage_pin_h2d` (`kt_stream_prefill.py`) `index_select`s the hot-K into a reused **pinned** buffer
+    → DMA. Offline 17.5s→7s; **Session B live = 10.5s** (matches, the fix works in production).
+  - **⚠️ The convert "1.3s / whole switch ~8s" was OFFLINE-ISOLATED (idle card, isolated tensors), NOT a
+    live server switch.** My original LIVE switch was ~180s (H2D 71s + convert 113s, this section above).
+    **Session B live (2026-06-17, DEPOOL+side+hot): H2D 10.5s + convert 102.8s ≈ 113s** — i.e. B reproduced
+    the original live number, NOT the 8s. The offline→live extrapolation was wrong.
+  - **What b3d1a39 (G's post-step opt) actually buys live: only ~15s** (B: convert 118s→102.8s). It kills
+    the ND→NZ post-step, which is real — but the post-step was never the bulk of the LIVE convert.
+  - **The remaining ~93s live = per-call overhead ×86** (43 layers × w13/w2 `convert_proj`: kernel launch +
+    `format_cast` + device alloc, under post-prefill near-full HBM). This is exactly the **UNDONE follow-up**
+    flagged in the section above ("batch the 43 layer-converts"). The kernel compute is fine in isolation
+    (82ms/256-expert); the slowdown is the live call path, not the `.so` — confirm via
+    `test_fused_e2e.py --experts 32` on an idle card (expect ~30-230ms/layer).
+  - **So "8s switch" is an OPTIMIZATION TARGET, not a live-proven number.** To hit it: batch the converts +
+    preallocate `out_nz`/fp16 buffers (stop per-layer alloc+format_cast churn), and/or switch before HBM fills.
+    NOTE: one-time prefill-tail cost; does NOT touch decode throughput (B: ~18 tok/s either way).
 - **Controlled A/B (FORCE_PREFIX static vs dynamic, same pool/prompt/memory) — decode verdict**:
   hot-expert selection works (activation share 0.134→0.586), and off_cpu **floor 18.8→10.3ms (−45%)**,
   BUT p10/p25/median/p75 are **identical** (29→28 / 39→39 / 63→57 / 103→102). off_cpu =

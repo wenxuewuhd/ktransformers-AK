@@ -134,7 +134,7 @@ C 的改动在分支 `mxfp4-dequant-kernel`(父)/ `mxfp4-dequant-kernel-sglang`(
   1. C 的 `mxfp4-dequant-kernel-sglang` rebase 到 B 落地后的 mainline；
   2. 解冲突（只在 `kt_ep_wrapper`/`experts_base` 的 §D 钩子 vs B 的 overlap；`kt_stream_prefill` B 几乎不碰）；
   3. **双路验收（硬动作）**：gate **off** → int8 路逐字节不变；gate **on**(`KT_MXFP4_DEPOOL=1`) →
-     cos 0.99999976 + DDR 省 137GB + prefill ~15-20s + §D 解码连贯 + 切换 ~8s；**独占窗口**复测
+     cos 0.99999976 + DDR 省 137GB + prefill ~15-20s + §D 解码连贯 + 切换(live ~113s,8s 需 batch follow-up,见 §合并前置)；**独占窗口**复测
      dynamic vs `KT_DYN_FORCE_PREFIX` 确认热专家地板 -45% 在两路兑现成 tokens/s。
   4. 落 `longseq-mxfp4`。
 - **Phase 4**：默认决策——G 优化后 depool prefill ~15-20s 已接近 W8A8 预建池 14s 且省 137GB，验收过后
@@ -151,14 +151,21 @@ C 的改动在分支 `mxfp4-dequant-kernel`(父)/ `mxfp4-dequant-kernel-sglang`(
 | `e14203b2f` | C | 切换 H2D pinned-staging（`_stage_pin_h2d`，17.5→7s）|
 | 基线 `c850eea7e`/`9c8e0e70f` | C(旧) | W8A8 动态常驻 device-slice 修复 + ND-round-trip（已在 longseq-sglang）|
 
-## ✅ 合并前置（原雷已拆，2026-06-17）
-- **【已拆】G 的 230ms convert 优化已提交：commit `b3d1a39`（parent `mxfp4-dequant-kernel`）。**
-  原坑：该优化曾以工作区 `M` 悬着未提交，从已提交点 checkout 的 worktree 拿到旧版 `convert_proj`
-  →整层 convert 回到 3077ms、depool switch ~118s（**Session B 已实测复现 118s**，根因坐实=旧版
-  Python ND→NZ 后处理，**非** AscendC `.so` 没编对：B 的 H2D 7.9s 与 C 一致，差的只是 Python 后处理）。
-  现已 commit，worktree 共享 object store 可直接 `git cherry-pick b3d1a39`（或
-  `git checkout b3d1a39 -- tools/ascendc_mxfp4/mxfp4_fused_op.py`）取得，**纯 Python、不用重编 `.so`**；
-  补后 convert 118s→~1.3s、switch→~8s，cos 0.99999976 / 输出契约不变。
+## ✅ 合并前置（原雷已拆）+ ⚠️ switch 8s 更正（2026-06-17）
+- **【已拆】G 的 230ms convert 优化(post-step)已提交：commit `b3d1a39`（parent `mxfp4-dequant-kernel`）。**
+  worktree 共享 object store 可直接 `git cherry-pick b3d1a39`（或
+  `git checkout b3d1a39 -- tools/ascendc_mxfp4/mxfp4_fused_op.py`），**纯 Python、不用重编 `.so`**，
+  cos 0.99999976 / 输出契约不变。
+- **⚠️ 但「switch ~8s / convert 1.3s」是离线孤立数,不是 live(C 2026-06-17 自我更正)。**
+  - **b3d1a39 在 live 只买回 ~15s**(Session B 实测 convert 118s→102.8s):它砍的是 ND→NZ post-step,
+    post-step 从来不是 live convert 的大头。
+  - **live switch 仍 ~113s**(B: H2D 10.5s + convert 102.8s)≈ C 最早的 live 180s 数。剩余 ~93s =
+    **per-call 开销 ×86**(43 层 × w13/w2 `convert_proj` 的 launch + `format_cast` + 设备分配,prefill 后
+    HBM 近满)——即 STATUS 里**没做的 follow-up**「batch the 43 layer-converts」。
+  - **核本身不慢**(离线 82ms/256-expert);要排除 `.so` build 差异,在本 worktree 跑
+    `test_fused_e2e.py --experts 32`(空卡,应 ~30-230ms/层)即可一锤定音。
+  - **8s 是优化目标,不是 live 已验证数**。要拿到需:合批 convert + 预分配 `out_nz`/fp16 缓冲 / switch
+    提前到 HBM 未满时。**一次性 prefill 尾巴开销,不碰 decode 吞吐**(B: ~18 tok/s 两路一致)。
 - kt-kernel ext + llama.cpp MXFP4 patch 容器重启会丢（见 `HANDOVER_SESSION_C.md` §C.0），集成机上须先补。
 
 ## 🔜 G 可能还有更高效的算子（待 G 通知）

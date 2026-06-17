@@ -134,6 +134,21 @@ if [[ -f "${ASCEND_TOOLKIT_HOME}/set_env.sh" ]]; then
   source "${ASCEND_TOOLKIT_HOME}/set_env.sh" || true
 fi
 
+# ATB + 自定义算子 vendor 环境（best-effort）。让本脚本自包含，不再隐式依赖 shell profile
+# （.bashrc/profile 才 source 它们）：非交互/非登录 shell 或干净 container 直接拉起也能找到算子。
+# 机器无 vendors/config.ini，自定义算子靠 ASCEND_CUSTOM_OPP_PATH（由各 set_env.bash 设），故必须 source。
+ASCEND_OPP_VENDORS_DIR="${ASCEND_TOOLKIT_HOME}/opp/vendors"
+for _kt_env in \
+  /usr/local/Ascend/nnal/atb/set_env.sh \
+  "${ASCEND_OPP_VENDORS_DIR}/customize/bin/set_env.bash" \
+  "${ASCEND_OPP_VENDORS_DIR}/custom_transformer/bin/set_env.bash"; do
+  if [[ -f "${_kt_env}" ]]; then
+    # shellcheck source=/dev/null
+    source "${_kt_env}" || true
+  fi
+done
+unset _kt_env
+
 ulimit -n 65536 2>/dev/null || true
 
 if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then

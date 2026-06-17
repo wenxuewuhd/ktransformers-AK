@@ -165,7 +165,15 @@ C 的改动在分支 `mxfp4-dequant-kernel`(父)/ `mxfp4-dequant-kernel-sglang`(
   - **核本身不慢**(离线 82ms/256-expert);要排除 `.so` build 差异,在本 worktree 跑
     `test_fused_e2e.py --experts 32`(空卡,应 ~30-230ms/层)即可一锤定音。
   - **8s 是优化目标,不是 live 已验证数**。要拿到需:合批 convert + 预分配 `out_nz`/fp16 缓冲 / switch
-    提前到 HBM 未满时。**一次性 prefill 尾巴开销,不碰 decode 吞吐**(B: ~18 tok/s 两路一致)。
+    提前到 HBM 未满时。
+- **⚠️⚠️ 切换是【每请求】付,不是一次性(C 2026-06-17 全链 live bench 推翻"一次性"说法)**:
+  `_apply_dynamic_residency` 无 once-guard(`kt_stream_prefill.py:591`,每个 histogram 齐的 prefill 都重新挑
+  top-32 + 重 convert 43 层)。C 干净 live 跑(card5,**无 side-stream**)实测:拉起 201s;MXFP4 池**懒构建 347s
+  在首个长请求里**;流式 prefill forward ~20s;**切换每请求 ~108–117s**(`gather=99–108s` + `H2D=8.8–10s`,
+  连续两请求各付 109.0s/108.3s)→ **prefill TTFT ≈ 128s/请求**,被 convert 完全主导;decode off_cpu floor 14ms
+  (热专家有效)但 median 63 / p90 213 / max 930ms(共享机噪声),净 5–10 tok/s。
+  **结论:depool+动态常驻当前对 serving 不可发布——20s 流式收益被 108s/请求的 convert 淹没。** 合批 convert
+  不只是优化,是可发布性的闸门;并应加"top-K 基本没变就跳过重切换" + 把 347s 池构建挪到 startup。
 - kt-kernel ext + llama.cpp MXFP4 patch 容器重启会丢（见 `HANDOVER_SESSION_C.md` §C.0），集成机上须先补。
 
 ## 🔜 G 可能还有更高效的算子（待 G 通知）

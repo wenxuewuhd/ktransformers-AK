@@ -144,7 +144,35 @@ After G's whole-layer convert dropped to **230ms** (3077→230, cos 0.99999976 �
     `test_fused_e2e.py --experts 32` on an idle card (expect ~30-230ms/layer).
   - **So "8s switch" is an OPTIMIZATION TARGET, not a live-proven number.** To hit it: batch the converts +
     preallocate `out_nz`/fp16 buffers (stop per-layer alloc+format_cast churn), and/or switch before HBM fills.
-    NOTE: one-time prefill-tail cost; does NOT touch decode throughput (B: ~18 tok/s either way).
+
+### ⚠️⚠️ FULL LIVE SERVING BENCH — switch is PER-REQUEST, not one-time (Session C, 2026-06-17, card 5, clean, NO side-stream)
+Launched the real serving config (`KT_PREFILL_STREAM=1 KT_MXFP4_DEPOOL=1 KT_DYNAMIC_RESIDENT=1
+MEM_FRACTION=0.72 CHUNKED_PREFILL_SIZE=8192`) and timed every phase end-to-end. This is the clean
+live confirmation of B's number on my own box — AND it overturns "one-time prefill-tail cost":
+
+| phase | live time | nature |
+|---|---|---|
+| startup → "fired up" | **201s** (313s first run) | one-time. weight load 124s + KV pool + npu graph 9.4s; avail 15.8GB |
+| MXFP4 CPU pool build | **347s** | one-time but **LAZY — runs inside the FIRST long request**, not at startup |
+| streaming prefill forward | **~20s** | the real streaming benefit (TTFT − switch) |
+| **switch (hot-expert convert)** | **~108–117s, EVERY request** | H2D 8.8–10s + `gather(per-expert)` **99–108s** |
+| = **prefill TTFT per long req** | **~128–130s** | dominated by the 108s convert |
+| decode TPOT | floor 64ms / median 86–161ms / **5–10 tok/s** | off_cpu floor **14ms** (hot experts work) but median 63 / p90 213 / max 930ms = shared-box noise |
+
+- **THE switch has NO once-guard** (`kt_stream_prefill.py:591`: every prefill whose per-layer histogram
+  is complete calls `_apply_dynamic_residency()`). Measured: two consecutive warm requests EACH paid the
+  switch — `applied top-32 x 43 in 109.0s` then `108.3s`, `gather=99.0s/99.6s`, `H2D=10.0s/8.6s`. So the
+  prior "one-time prefill-tail cost" framing was WRONG: **in serving, every distinct long prompt re-picks
+  top-32 + re-converts 43 layers ≈ 108s.** prefill TTFT ≈ 128s for ANY long request.
+- **Verdict: depool + dynamic-resident is NOT serving-shippable as-is.** The 20s streaming-prefill win is
+  fully buried under the 108s per-request convert. The batch-convert + preallocate follow-up is not just an
+  optimization — it is the gate to shippability. (Also: cap/skip re-switch when top-K is ~unchanged, and
+  move the 347s pool build to startup for predictability.)
+- decode off_cpu floor 14ms re-confirms hot-experts work (≈ A/B 10.3ms); median 63 / p90 213 / max 930ms
+  re-confirms shared-box noise dominates net decode. Same story as the A/B.
+- NSA gotcha: a >`chunked_prefill_size` prompt crashes the DSv4 NSA indexer KV pool
+  (`AssertionError: loc.numel() vs cache.shape[0]` in `set_compress_buffer`) — set CHUNKED_PREFILL_SIZE
+  ≥ prompt so the prefill is one chunk. Orthogonal to depool, but blocks long-prompt bench otherwise.
 - **Controlled A/B (FORCE_PREFIX static vs dynamic, same pool/prompt/memory) — decode verdict**:
   hot-expert selection works (activation share 0.134→0.586), and off_cpu **floor 18.8→10.3ms (−45%)**,
   BUT p10/p25/median/p75 are **identical** (29→28 / 39→39 / 63→57 / 103→102). off_cpu =

@@ -151,9 +151,14 @@ C 的改动在分支 `mxfp4-dequant-kernel`(父)/ `mxfp4-dequant-kernel-sglang`(
 | `e14203b2f` | C | 切换 H2D pinned-staging（`_stage_pin_h2d`，17.5→7s）|
 | 基线 `c850eea7e`/`9c8e0e70f` | C(旧) | W8A8 动态常驻 device-slice 修复 + ND-round-trip（已在 longseq-sglang）|
 
-## ⚠️ 合并前置（重要）
-- **G 的 230ms convert 优化当前 *未提交***（`tools/ascendc_mxfp4/mxfp4_fused_op.py` 工作区 `M`，
-  STATUS.md 已记其内容）。**合并前 G 必须先 commit 这个**，否则 prefill 收益（137→~15s）丢失、回到 3077ms。
+## ✅ 合并前置（原雷已拆，2026-06-17）
+- **【已拆】G 的 230ms convert 优化已提交：commit `b3d1a39`（parent `mxfp4-dequant-kernel`）。**
+  原坑：该优化曾以工作区 `M` 悬着未提交，从已提交点 checkout 的 worktree 拿到旧版 `convert_proj`
+  →整层 convert 回到 3077ms、depool switch ~118s（**Session B 已实测复现 118s**，根因坐实=旧版
+  Python ND→NZ 后处理，**非** AscendC `.so` 没编对：B 的 H2D 7.9s 与 C 一致，差的只是 Python 后处理）。
+  现已 commit，worktree 共享 object store 可直接 `git cherry-pick b3d1a39`（或
+  `git checkout b3d1a39 -- tools/ascendc_mxfp4/mxfp4_fused_op.py`）取得，**纯 Python、不用重编 `.so`**；
+  补后 convert 118s→~1.3s、switch→~8s，cos 0.99999976 / 输出契约不变。
 - kt-kernel ext + llama.cpp MXFP4 patch 容器重启会丢（见 `HANDOVER_SESSION_C.md` §C.0），集成机上须先补。
 
 ## 🔜 G 可能还有更高效的算子（待 G 通知）

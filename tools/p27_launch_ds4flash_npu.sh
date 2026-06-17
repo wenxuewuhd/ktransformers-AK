@@ -128,26 +128,25 @@ if [[ "${SGLANG_NPU_PROFILE_ENABLE}" == "1" && "${EXTRA_FLAGS:-}" != *"--disable
   echo "[p27] SGLANG_NPU_PROFILE_ENABLE=1: auto append EXTRA_FLAGS=--disable-cuda-graph"
 fi
 
-# 可选：若机器上存在 CANN set_env，则加载（失败则忽略）。
-if [[ -f "${ASCEND_TOOLKIT_HOME}/set_env.sh" ]]; then
-  # shellcheck source=/dev/null
-  source "${ASCEND_TOOLKIT_HOME}/set_env.sh" || true
-fi
-
-# ATB + 自定义算子 vendor 环境（best-effort）。让本脚本自包含，不再隐式依赖 shell profile
-# （.bashrc/profile 才 source 它们）：非交互/非登录 shell 或干净 container 直接拉起也能找到算子。
+# CANN toolkit + ATB + 自定义算子 vendor 环境（best-effort）。让本脚本自包含，不再隐式依赖 shell
+# profile（.bashrc/profile 才 source 它们）：非交互/非登录 shell 或干净 container 直接拉起也能找到算子。
 # 机器无 vendors/config.ini，自定义算子靠 ASCEND_CUSTOM_OPP_PATH（由各 set_env.bash 设），故必须 source。
+# ⚠️ 这些 vendor 脚本不是 set -u 干净的（如 atb/set_env.sh 引用未定义的 ZSH_VERSION）→ 在本脚本的
+#    `set -euo pipefail` 下会触发 unbound variable 直接退出。故 source 期间临时放开 -e/-u，之后恢复。
+set +eu
 ASCEND_OPP_VENDORS_DIR="${ASCEND_TOOLKIT_HOME}/opp/vendors"
 for _kt_env in \
+  "${ASCEND_TOOLKIT_HOME}/set_env.sh" \
   /usr/local/Ascend/nnal/atb/set_env.sh \
   "${ASCEND_OPP_VENDORS_DIR}/customize/bin/set_env.bash" \
   "${ASCEND_OPP_VENDORS_DIR}/custom_transformer/bin/set_env.bash"; do
   if [[ -f "${_kt_env}" ]]; then
     # shellcheck source=/dev/null
-    source "${_kt_env}" || true
+    source "${_kt_env}"
   fi
 done
 unset _kt_env
+set -eu
 
 ulimit -n 65536 2>/dev/null || true
 

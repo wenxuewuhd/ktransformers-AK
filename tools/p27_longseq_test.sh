@@ -44,11 +44,13 @@ for TGT in ${TARGET_TOKENS_LIST}; do
     echo "[longseq][WARN] 档 ${TGT}: prompt + 输出(${MAX_NEW}) 可能 > context-length ${CONTEXT_LIMIT}；输出会被截或报错。建议 target ≤ $((CONTEXT_LIMIT - MAX_NEW))。"
   fi
   PF="/tmp/longseq_prompt_${TGT}.txt"; MA="/tmp/longseq_mA_${TGT}.json"; MC="/tmp/longseq_mC_${TGT}.json"
+  RQ1="/tmp/longseq_req1_${TGT}.json"; RQ2="/tmp/longseq_req2_${TGT}.json"
 
-  # ---- 构 prompt（去重事实句 + 唯一编号，避免被 prefix-cache 折叠；真正读长上下文的问题）----
-  "$PY" - "$TGT" "$PF" "$CHARS_PER_TOK" <<'PYEOF'
-import sys
+  # ---- 构 prompt + 两个请求体 JSON 直接写文件（curl -d @file，避开 Argument list too long）----
+  "$PY" - "$TGT" "$PF" "$CHARS_PER_TOK" "$MAX_NEW" "$RQ1" "$RQ2" <<'PYEOF'
+import sys, json
 target = int(sys.argv[1]); out = sys.argv[2]; cpt = float(sys.argv[3])
+maxn = int(sys.argv[4]); rq1 = sys.argv[5]; rq2 = sys.argv[6]
 facts = [
     "The Roman aqueducts carried water across vast distances using only gravity",
     "Beethoven composed his ninth symphony while almost completely deaf",
@@ -79,21 +81,19 @@ prompt = (
       "summary of the different topics covered.\nAnswer:"
 )
 open(out, "w").write(prompt)
+json.dump({"text": prompt, "sampling_params": {"max_new_tokens": 1, "temperature": 0}}, open(rq1, "w"))
+json.dump({"text": prompt, "sampling_params": {"max_new_tokens": maxn, "temperature": 0, "ignore_eos": True}}, open(rq2, "w"))
 print(f"[longseq] 档 {target}: built ~{clen} chars, {n} sentences", file=sys.stderr)
 PYEOF
-
-  PR="$("$PY" -c "import json;print(json.dumps(open('${PF}').read()))")"
 
   if [[ "${SKIP_PREFILL_PROBE}" != "1" ]]; then
     echo "[longseq] 档 ${TGT}: prefill 探针 (max_new_tokens=1) ..."
     curl -s -m 3600 -X POST "http://${HOST}:${PORT}/generate" -H 'Content-Type: application/json' \
-      -d "{\"text\": ${PR}, \"sampling_params\": {\"max_new_tokens\": 1, \"temperature\": 0}}" \
-      -o "${MA}" -w "  http %{http_code}  wall %{time_total}s\n"
+      -d @"${RQ1}" -o "${MA}" -w "  http %{http_code}  wall %{time_total}s\n"
   fi
   echo "[longseq] 档 ${TGT}: 全量生成 (max_new_tokens=${MAX_NEW}, ignore_eos) ..."
   curl -s -m 3600 -X POST "http://${HOST}:${PORT}/generate" -H 'Content-Type: application/json' \
-    -d "{\"text\": ${PR}, \"sampling_params\": {\"max_new_tokens\": ${MAX_NEW}, \"temperature\": 0, \"ignore_eos\": true}}" \
-    -o "${MC}" -w "  http %{http_code}  wall %{time_total}s\n"
+    -d @"${RQ2}" -o "${MC}" -w "  http %{http_code}  wall %{time_total}s\n"
 
   SUMMARY_ARGS+=("${TGT}" "${MA}" "${MC}")
 done

@@ -42,3 +42,9 @@ fusion_result.json
 kt-kernel/kt_kernel
 # Reproduce patch series must be tracked despite global *.patch ignore (line 19)
 !tools/kt_dsv4_npu_patches/**/*.patch
+
+# longseq expert-hist: keep canonical realtext data + resident table; ignore scratch/derived
+tools/longseq_dbg/expert_hist.pt
+tools/longseq_dbg/expert_hist_top*.pt
+tools/longseq_dbg/*_summary_top*.json
+!tools/longseq_dbg/expert_hist_realtext_summary_top32.json

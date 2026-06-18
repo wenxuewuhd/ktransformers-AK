@@ -1,0 +1,41 @@
+{
+  "artifact": "expert_hist_realtext.pt",
+  "what": "prefill 期 per-layer routed-expert 命中直方图(DeepSeek-V4-Flash, 43 层 MoE, 256 routed experts, top-6)",
+  "produced_by": {
+    "code": "third_party/sglang .../layers/moe/kt_ep_wrapper.py  (KT_PREFILL_EXPERT_HIST=1)",
+    "sglang_commit": "d8c460d6b",
+    "repro": "tools/longseq_dbg/gen_expert_hist.sh"
+  },
+  "config": {
+    "launch": "tools/p27_launch_ds4flash_npu.sh",
+    "kt_num_gpu_experts": 32,
+    "kt_expert_placement_strategy": "prefix",
+    "kt_cpuinfer": 128,
+    "chunked_prefill_size": 32768,
+    "npu_card": 5, "port": 8013, "date": "2026-06-10"
+  },
+  "prompt": {
+    "kind": "real-text (repo docs/zh/**/*.md + sglang model *.py, ~60000 chars, repeated)",
+    "note": "真实多样 token;早期混入过一次 8192 全同 filler(退化路由,~44 专家),已用 4x 真实文本冲淡(<9%)"
+  },
+  "schema_pt": {
+    "format": "torch.save dict",
+    "layers": "int64[L]  实际出现的 layer_idx(升序)",
+    "counts": "int64[L, num_experts]  counts[i,e]=第 layers[i] 层 expert e 的累计命中(token-assignment)数",
+    "tokens": "int64[L]  每层累计的 token-row 数",
+    "num_experts": "int  =256"
+  },
+  "caveats": [
+    "直方图跨请求全局累加(非按请求复位)——真实现需按请求清零(prefill 开始)+ 结束 dump 该请求池",
+    "只记 eager prefill(M>1);graph capture / 单 token decode 被 guard 跳过(避免 D2H memcpy 107030)",
+    "counts 是 LOGICAL expert id(router 原始 topk_ids,未经 gpu_experts_mask 重映射)"
+  ],
+  "measured": {
+    "total_hits": 23033984, "tokens_per_layer_mean": 89279,
+    "cold_experts_per_layer": 0.0,
+    "dynamic_top32_share_mean": 0.3945,
+    "static_prefix32_share": 0.1284,
+    "skew_ratio_vs_even": 3.16,
+    "summary_json": "expert_hist_realtext_summary_top32.json"
+  }
+}

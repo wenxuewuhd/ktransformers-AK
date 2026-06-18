@@ -13,7 +13,8 @@
 # 常用覆盖（环境变量）：
 #   REPO              默认本脚本所在仓库根
 #   MODEL_PATH        默认 /workspace/models/DeepSeek-V4-Flash-W8A8
-#   KT_GGUF_TEMPLATE  默认 /workspace/models/cache/dsv4_layer{layer_idx}.gguf（勿在 ``${var:-...}`` 默认值里写花括号）
+#   KT_GGUF_TEMPLATE  默认 dsv4_layer{layer_idx}.gguf(Q8_0);KT_MXFP4_DEPOOL=1 时默认改 _mxfp4.gguf
+#                     (CPU MoE 带宽bound,Q8_0 让 depool decode 慢~2×;见 memory depool-decode-needs-mxfp4-gguf)
 #   PORT              默认 8000
 #   ASCEND_TOOLKIT_HOME  默认 /usr/local/Ascend/ascend-toolkit/latest
 #   NPU_DEVICE_ID     可选，物理 NPU 序号（如 2）。设置后会 export ASCEND_RT_VISIBLE_DEVICES=$NPU_DEVICE_ID。
@@ -77,7 +78,14 @@ MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8}"
 # 默认 Q8_0（批量 convert 输出 dsv4_layer{L}.gguf）。须先 cp 新 kt_kernel_ext.so 到 kt-kernel/python/（手册 §2.4）。
 # BF16 回退：export KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
 if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
-  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
+  if [[ "${KT_MXFP4_DEPOOL:-}" == "1" ]]; then
+    # depool：NPU 侧本就 MXFP4，CPU 专家也走 MXFP4 GGUF（3.4GB/层 vs Q8_0 6.8GB/层）。CPU MoE 是
+    # 内存带宽 bound，Q8_0 默认会让 depool decode off_cpu ~2×(22 vs 14ms,13 vs 16tps);MXFP4 ≈ plain。
+    # 见 memory depool-decode-needs-mxfp4-gguf。显式 export KT_GGUF_TEMPLATE 仍优先(不被本默认覆盖)。
+    KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf'
+  else
+    KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
+  fi
 fi
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 QUANTIZATION="${QUANTIZATION:-compressed-tensors}"

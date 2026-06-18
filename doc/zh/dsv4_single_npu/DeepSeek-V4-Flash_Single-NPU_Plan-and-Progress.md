@@ -411,10 +411,14 @@ HBM 总可用 **60.50 GB**（64GB − 驱动 ~3.5GB）。拉起日志实测：
 
 | 临时块 | Prefill | Decode |
 |---|---|---|
-| activation（中间张量） | **大，∝ chunk token 数**：32k 单 chunk ~7GB / **64k ~14GB** | **极小（M=1，MB 级）** |
-| depool 流式 NZ staging slot | **~4 GB** | 不需要 |
+| activation（中间张量） | **单层 forward 的瞬时峰值**（逐层 buffer 复用，**非 43 层累加**），∝ chunk token 数：attention QKV 投影 / NSA-indexer 打分 / MoE `[tok×2048]` 中间都随 token 数放大 | **极小（M=1，MB 级）** |
+| depool 流式 NZ staging slot | ~4 GB（重试时） | 不需要 |
 | 实际 KV 填充 | prompt KV（64k 也才 ~0.5GB） | 随生成增长，压缩后 ~MB |
-| **临时小计 vs 剩 15.8GB** | 32k ~11GB ✅ / **64k ~18GB ❌（超 ~2GB → OOM → hybrid fallback）** | **<1GB → 永不 OOM** |
+| **临时峰值 vs 剩 15.8GB** | 32k ✅ / **64k 实测峰值 ~14GB（OOM 刻 allocated 58.74 − 静态 44.7 反推）且仍要更多 → OOM → hybrid fallback** | **<1GB → 永不 OOM** |
+
+> ⚠️ 精度：静态 44.7GB / 剩 15.8GB / 64k OOM 刻 allocated 58.74GB 是**实测**；64k 临时峰值 ~14GB 由 allocated−静态
+> **反推**；其内部 activation vs 流式 slot 的拆分、及 32k 的 ~7GB **是估算**（∝token 线性外推），未分项实测。
+> activation 是**单层瞬时**（层间复用），不是整网累加。
 
 **结论**：
 - **瓶颈在 prefill 阶段的 activation + 流式 slot，不是 KV、不是 mem-fraction。** decode 阶段 HBM 极宽裕 → 长上下文 decode 不掉、不 OOM（32k decode 实测 15.3 tok/s ≈ 短上下文）。

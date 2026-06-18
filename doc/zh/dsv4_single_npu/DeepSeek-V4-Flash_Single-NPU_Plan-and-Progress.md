@@ -323,7 +323,7 @@ CPU MoE 是内存带宽瓶颈,旧 `--kt-cpuinfer 24` 只用 24/192 核。提到 
 |---|---|---|
 | P1 | 热专家放置（EPLB 动态） | 当前硬编码前 32;按 activation 频次取最热 → 更多 top-6 命中 NPU、CPU 搬字节再降 |
 | P2 | CPU↔NPU overlap | MXFP4 后 CPU MoE ~17–27ms vs NPU ~50ms,NPU 成主导,overlap 价值上升（Session B 线） |
-| P3 | 长序列 prefill 流式加载 + 热专家常驻 | Session C 线;流式搬的也是 MXFP4 GGUF（字节减半直接利好） |
+| P3 | 长序列 prefill 流式加载 + 热专家常驻 | **部分已落地（§6.9，merge `a65995b`）**：depool 池 model-load 并行构建 + 流式 prefill + dynamic-resident 已进主干（opt-in）；实时 cache/evict 策略仍待续 |
 | P4 | 预取距离扫描 / down 短行 | 512B 未调优;down nrc=2、跨专家预取已试为负结果（Session D 收口） |
 
 ### 6.7 🔥 CPU MoE 原生 MXFP4（Session D，2026-06-11 合入 `91b9c92`）
@@ -354,6 +354,28 @@ CPU MoE 是内存带宽瓶颈,旧 `--kt-cpuinfer 24` 只用 24/192 核。提到 
   脚本已 `${SKIP_WARMUP:-1}` 门控（默认 1 保基线，serving 设 0）。**边界**：只治开机冷启，不治会话中途空闲后又掉速
   （那是 per-request 首 token transition + 邻居争抢，需周期性 keep-warm）。
 - 完整数据/机制见 [workerpark_tune_handoff.md](workerpark_tune_handoff.md) 的 Closeout + Follow-up。
+
+### 6.9 🔀 G 线合入主干（2026-06-18 merge `a65995b`）：depool + 流式 prefill + AscendC MXFP4 kernel
+
+G 线 `mxfp4-dequant-kernel`（与 dev 在 `4755d7f` 分叉）真三方 merge 进主干。带入：
+- **depool（MXFP4 池 model-load 时并行 O_DIRECT 构建）**：在加载阶段并行构建 MXFP4 专家池（overlap 在 load 内，
+  **122s** 完成、在 fired up 前），取代老的「第一个请求里懒构建 347s」。主干复测：池 122s、prefill(n=1) 19.56s、
+  inline dynamic-resident `top-32×43 share=0.553`、回答正确。
+- **⚠️ depool 必须用 MXFP4 CPU GGUF（commit `76304bd` 修复）**：launch 脚本现在 `KT_MXFP4_DEPOOL=1` 时
+  `KT_GGUF_TEMPLATE` **默认 `_mxfp4.gguf`**（原默认 Q8_0）。根因：CPU MoE 是带宽 bound，depool 默认走 Q8_0 CPU GGUF
+  会让 decode off_cpu **~2×**（22 vs 16.8ms、13 vs **15.5 tok/s**）、CPU 池 6.8 vs 3.4GB/层。改默认 MXFP4 后 **≈ plain**。
+  （这正是「merge 后 decode 变慢」调查的真因 = 纯配置；非 plain 回归、非 dynamic-resident。memory `depool-decode-needs-mxfp4-gguf`。）
+- **流式 prefill 逐层加载**（`KT_PREFILL_STREAM`）、**AscendC MXFP4 dequant/NZ kernel**（`tools/ascendc_mxfp4/`，
+  device→device、ctypes 调，首 import 自动 bisheng 编译）、longseq 调试工具。仅改 `experts_base.py`（Python，**.so 不重编**）。
+- **merge 细节**：唯一冲突 `p27_launch_ds4flash_npu.sh`，解为「取 G 的 depool-MXFP4 默认块 + 保 dev 的
+  SKIP_WARMUP/custom-op-source/set+eu/param」；sglang 子模块 ff 到 **`8ff3924a9`**（是 dev `456687a0f` 的直接后代）。
+- 来龙去脉见随 merge 带入的 [longseq_prefill_handoff.md](longseq_prefill_handoff.md)、
+  [mxfp4_dequant_kernel_handoff.md](mxfp4_dequant_kernel_handoff.md)、`tools/ascendc_mxfp4/HANDOVER_SESSION_C.md`。
+  **depool 是 opt-in 实验路径，默认生产路径仍是 MXFP4 GGUF（§4.4）。**
+
+> **每个 request 的首 40-token 窗口偏慢（~14 vs 稳态 ~16 tok/s）是正常现象**：prefill→decode transition（首 decode
+> token 的 KV 转换 + 首次 graph replay + cache 重热，~0.3–0.5s 一次性）摊进第一个 40-token 日志窗口。每 request 一次，
+> 生成越长占比越小。已证与 worker park（§6.8）/ TASK_QUEUE 无关。`SKIP_WARMUP=0` 只治开机第一发，治不了 per-request transition。
 
 ---
 

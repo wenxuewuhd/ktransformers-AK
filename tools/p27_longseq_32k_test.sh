@@ -3,11 +3,15 @@
 # 报 prefill TTFT / decode（长上下文下的 ms·token 与 tok/s）/ 总吞吐。用于量长序列推理性能。
 #
 # 前提：服务已起，且 context-length ≥ prompt+输出（默认 launch 是 65536，32k+1000 够）。
-#   depool/长上下文拉起（CHUNKED_PREFILL_SIZE 控制 prefill 分块；32k 会被分块跑）：
+#   ⚠️ 32k 必须 CHUNKED_PREFILL_SIZE >= 实际 prompt_tokens（单 chunk），否则撞 compressor 跨 chunk bug
+#      （报错 loc.numel()=1024 vs cache.shape[0]=513，见 runbook）。8192 会分 4 块 → 会 bug。
+#      实际 prompt_tokens 须 ≤ CHUNKED_PREFILL_SIZE；本脚本按 ~3.8 char/token 估，故给 40960 留余量。
+#      上限：--max-prefill-tokens 65535 / --context-length 65536；chunk 须为 page-size=128 倍数，勿 -1。
+#   depool/长上下文拉起：
 #     export KT_MXFP4_CKPT=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash
 #     export KT_MXFP4_OP_DIR=/workspace/code/kt-G-mxfp4kernel/tools/ascendc_mxfp4
 #     KT_PREFILL_STREAM=1 KT_MXFP4_DEPOOL=1 KT_MXFP4_NZ_CHUNK=32 KT_DYNAMIC_RESIDENT=1 \
-#     MEM_FRACTION=0.72 NPU_DEVICE_ID=<空卡> PORT=8200 CHUNKED_PREFILL_SIZE=8192 \
+#     MEM_FRACTION=0.72 NPU_DEVICE_ID=<空卡> PORT=8200 CHUNKED_PREFILL_SIZE=40960 \
 #       bash tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/serve.log
 #   （普通 MXFP4 GGUF 也可，把 depool env 去掉、显式 KT_GGUF_TEMPLATE=..._mxfp4.gguf）
 #

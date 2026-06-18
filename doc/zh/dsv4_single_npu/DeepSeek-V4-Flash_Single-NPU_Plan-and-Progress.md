@@ -252,6 +252,34 @@ curl -sS -X POST http://127.0.0.1:8020/generate -H 'Content-Type: application/js
 > ⚠️ **`--max-running-requests 1`，别并发多发**（并发撞争抢窗口会触发 NPU runtime 失稳崩）。单发顺序跑稳。
 > 收服务：跑服务的终端 `Ctrl-C`（优雅释放 HBM）;**绝不 `pkill -f sglang.launch_server`**（杀别 session + 自杀 shell）。
 
+### 4.6 编译 depool 的 AscendC MXFP4 算子（**仅 depool 路径需要**；普通 MXFP4 GGUF 路径不用）
+
+depool（`KT_MXFP4_DEPOOL=1`）用一个 **AscendC device kernel**（MXFP4 dequant + NZ 转换，device→device、ctypes 调）。
+**源码随 G 合入已 tracked**：`tools/ascendc_mxfp4/`（`mxfp4_{fused,dq,nz,oscale}_kernel.cpp` + host launcher `mxfp4_fused_op.py`
++ 测试 + `HANDOVER_SESSION_C.md`）。**编译产物 `*.so` 被 gitignore（不入库），换机/首跑须现编。**
+
+一次性环境（bisheng/tikcpp 头文件来源）：
+```bash
+export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.0
+export ASCEND_RT_VISIBLE_DEVICES=<空卡>      # npu-smi 选空卡，避开 card 2
+```
+
+- **方式 1（推荐，自动）**：depool 服务首次用到算子时**按需 bisheng 编译并缓存**（源码比 `.so` 新会自动重编）。
+  启动时 `KT_MXFP4_OP_DIR` 指向 `$REPO/tools/ascendc_mxfp4`（**指主干自己的目录，别再指 kt-G worktree**，G worktree 会删）。什么都不用做。
+- **方式 2（手动，想自己确认编译链）**：
+  ```bash
+  cd tools/ascendc_mxfp4
+  CANN=$ASCEND_TOOLKIT_HOME; TK=$CANN/aarch64-linux/tikcpp
+  bisheng -x asc --cce-aicore-arch=dav-c220 -O2 -std=c++17 -fPIC -shared \
+    -I$TK/tikcfw -I$TK/tikcfw/impl -I$TK/tikcfw/interface -I$TK/tikcfw/lib \
+    -I$CANN/aarch64-linux/include \
+    mxfp4_fused_kernel.cpp -o libmxfp4fused.so \
+    -L$CANN/aarch64-linux/lib64 -lruntime -lascendcl   # 无输出即成功
+  ```
+- **算子自验**（确认对，再集成）：`ASCEND_RT_VISIBLE_DEVICES=<空卡> python3 tools/ascendc_mxfp4/test_fused_e2e.py`
+  → 期望 `cos(fused, fp32-golden) = 0.99999976 PASS`。
+- AscendC 写核硬坑（UB 192KB、偏移须 int64、grid<65536、嵌套循环编译极慢等）见 `HANDOVER_SESSION_C.md` + memory。
+
 ---
 
 ## 5. 全坑汇总

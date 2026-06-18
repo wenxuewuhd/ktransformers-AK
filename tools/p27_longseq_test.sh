@@ -8,7 +8,7 @@
 #      OOM 就降 MEM_FRACTION 或去掉 64k 档。
 #   拉起（chunk 要覆盖 64k；65408 = 最大的 ≤ max-prefill-tokens(65535) 的 128 倍数）：
 #     export KT_MXFP4_CKPT=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash
-#     export KT_MXFP4_OP_DIR=/workspace/code/kt-G-mxfp4kernel/tools/ascendc_mxfp4
+#     export KT_MXFP4_OP_DIR=/workspace/code/ktransformers-AK/tools/ascendc_mxfp4   # 主干自己的目录（首跑自动 bisheng 编译，见总纲 §4.6）
 #     KT_PREFILL_STREAM=1 KT_MXFP4_DEPOOL=1 KT_MXFP4_NZ_CHUNK=32 KT_DYNAMIC_RESIDENT=1 \
 #     MEM_FRACTION=0.72 NPU_DEVICE_ID=<空卡> PORT=8200 CHUNKED_PREFILL_SIZE=65408 \
 #       bash tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/serve.log

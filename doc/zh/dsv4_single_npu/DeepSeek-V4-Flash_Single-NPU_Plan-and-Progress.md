@@ -389,11 +389,38 @@ G 线 `mxfp4-dequant-kernel`（与 dev 在 `4755d7f` 分叉）真三方 merge �
 | Graph capture | ~6.8s（bs=1，真实权重） |
 | 模型加载（MXFP4 138 GiB） | **~2–3.5 min**（热 cache，page cache 全驻;冷盘首启另加磁盘读） |
 | 开机第一发（20-tok）— `SKIP_WARMUP=1` 基线 / `=0` 预热 | req1 **2.1–2.5s → 1.8s**（清净窗口 load~21，§6.8;预热消掉冷启 ramp） |
-| HBM 占用（N=32） | ~16 GB expert + attention + KV |
+| HBM 占用（静态，N=32，见 §7.1） | **~44.7 GB**（模型 42.32 + KV pool 1.34 + graph 1.08）;拉起后剩 **~15.8 GB** |
 | DRAM 占用 | **~137 GiB（MXFP4）** / 275（Q8_0）/ 555（BF16） |
 
 > 共享机 load 长期 ~400 时所有绝对带宽是被邻居挤占后的下限;清净独占聚合 ~442 GB/s。decode 的
 > median−min 抖动主体是邻居噪声（G1，max-of-8-NUMA 放大）。
+
+### 7.1 HBM 预算与 prefill/decode 两阶段分布（实测 MEM_FRACTION=0.72 / N=32 / context 65536）
+
+HBM 总可用 **60.50 GB**（64GB − 驱动 ~3.5GB）。拉起日志实测：
+
+| 块 | 大小 | 性质 |
+|---|---|---|
+| **模型权重** | **42.32 GB** | 静态。常驻 32 专家（MXFP4 NZ，每个 ~20MB）+ MLA attention + shared + emb/lm_head + Lightning Indexer + router。**大头 70%** |
+| **KV pool**（预分配） | **~1.34 GB** | 静态。MLA+NSA+SWA 多池，容量 `max_total=172032 token` 却仅 1.3GB → **MLA+NSA 压缩极强，KV/token 极小** |
+| **NPU graph buffer** | **1.08 GB** | 静态（decode bs=1 图） |
+| **静态小计** | **~44.7 GB** | prefill/decode 都常驻 |
+| **拉起后剩余** | **~15.8 GB** | ← prefill/decode 的临时分配全从这出 |
+
+**两阶段临时分配（关键差异）**：
+
+| 临时块 | Prefill | Decode |
+|---|---|---|
+| activation（中间张量） | **大，∝ chunk token 数**：32k 单 chunk ~7GB / **64k ~14GB** | **极小（M=1，MB 级）** |
+| depool 流式 NZ staging slot | **~4 GB** | 不需要 |
+| 实际 KV 填充 | prompt KV（64k 也才 ~0.5GB） | 随生成增长，压缩后 ~MB |
+| **临时小计 vs 剩 15.8GB** | 32k ~11GB ✅ / **64k ~18GB ❌（超 ~2GB → OOM → hybrid fallback）** | **<1GB → 永不 OOM** |
+
+**结论**：
+- **瓶颈在 prefill 阶段的 activation + 流式 slot，不是 KV、不是 mem-fraction。** decode 阶段 HBM 极宽裕 → 长上下文 decode 不掉、不 OOM（32k decode 实测 15.3 tok/s ≈ 短上下文）。
+- **调 `mem-fraction-static` 无效**（印证 [dsv4-npu-expert-capacity]）：它管 KV pool，而 KV pool 才 1.34GB、没吃满额度，缩它腾不出空间；真正占 HBM 的是 42GB 模型权重。
+- **64k prefill 差 ~2GB**：唯一有效杠杆是**降 `KT_NUM_GPU_EXPERTS`**（每常驻专家 ~20MB，32→24 省 ~7GB → 够 64k）；代价 decode 略慢（更多专家落 CPU）。或减小 `CHUNKED_PREFILL_SIZE` 分块降 activation 峰值，但撞 compressor 跨 chunk bug（坑⑬同类，runbook `loc.numel` 报错）。
+- **32k 是单卡稳定上限**（验证过，临时 ~11GB < 15.8GB 余量足）。
 
 ---
 

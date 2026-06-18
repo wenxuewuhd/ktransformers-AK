@@ -273,6 +273,7 @@ curl -sS -X POST http://127.0.0.1:8020/generate -H 'Content-Type: application/js
 | **⑬** | **MXFP4 GGUF 输出乱码/对账偏** | **nibble 序：官方 consecutive vs GGUF half-block 未重排** | **转换器逐 32-group 重排 nibble（非 byte copy）;`verify_mxfp4_layer.py` bit-exact 闸门(§3.2)** |
 | ⑭ | 服务跑一会儿 `main process disappeared` | remote/后台拉的服务父进程上下文被回收 | **长跑服务在自己终端前台拉**（见 §4.4） |
 | ⑮ | 离线单层对账 cand 全零 | 孤立单层调用 stream-callback 路径不回写 | `KT_FORCE_SYNC_SUBMIT=1`（对账脚本已内置） |
+| ⑯ | **prompt > `chunked-prefill-size` 即崩** `loc.numel()=1024 vs cache.shape[0]=513` | **DSv4 NSA-Compressor 跨 chunk 索引对齐缺口**：分块 prefill 时带 prefix 的 chunk，Lightning Indexer 按逻辑长度选 `loc`，但压缩池(c4/c128)只增量建到当前 chunk → loc 数与压缩池长度脱节。压缩/稀疏簿记只在**单遍完整 prefill**成立（普通 MLA/MHA 无此问题） | **单 chunk 绕过**：`CHUNKED_PREFILL_SIZE ≥ prompt_len`（32k→32768）。⚠️ 与 64k OOM 是同一死结两面（单 chunk 避 bug 但 prefill activation 撑爆 HBM §7.1）。根治需修 ascend backend 的 c4/c128 跨 chunk 累积+loc 对齐（sglang 侧，见 §6.6 / 合 upstream 时检查） |
 
 ---
 
@@ -325,6 +326,7 @@ CPU MoE 是内存带宽瓶颈,旧 `--kt-cpuinfer 24` 只用 24/192 核。提到 
 | P2 | CPU↔NPU overlap | MXFP4 后 CPU MoE ~17–27ms vs NPU ~50ms,NPU 成主导,overlap 价值上升（Session B 线） |
 | P3 | 长序列 prefill 流式加载 + 热专家常驻 | **部分已落地（§6.9，merge `a65995b`）**：depool 池 model-load 并行构建 + 流式 prefill + dynamic-resident 已进主干（opt-in）；实时 cache/evict 策略仍待续 |
 | P4 | 预取距离扫描 / down 短行 | 512B 未调优;down nrc=2、跨专家预取已试为负结果（Session D 收口） |
+| P2 | **修 chunked prefill 跨 chunk（sglang 侧）** | 坑⑯：NSA-Compressor c4/c128 跨 chunk 累积 + indexer loc 对齐。修好 → 长 prompt 可分块 prefill → activation 峰值降 → **64k 不靠单 chunk 也能跑、不 OOM**（解 64k 的另一条路，对比降常驻专家）。⚠️ **合 sglang upstream 时优先查这条**：upstream 刚支持 ascend DSv4，看它的 chunked-prefill/compressor 是否已正确处理跨 chunk（若已修，直接采纳;若没修，把本问题反馈/PR 上去） |
 
 ### 6.7 🔥 CPU MoE 原生 MXFP4（Session D，2026-06-11 合入 `91b9c92`）
 

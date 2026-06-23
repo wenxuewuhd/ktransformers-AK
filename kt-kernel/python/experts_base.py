@@ -655,11 +655,20 @@ class BaseMoEWrapper(_MoEBase, ABC):
         if bypass:
             self.cpu_infer.submit(immediate_task)
         else:
+            # Correct + fast async path. ``submit_with_cuda_stream`` enqueues the
+            # CPU-MoE via an ACL host callback whose firing is not host-observable
+            # (NO_BLOCK) -> a later host-side drain can race ahead of it (empty
+            # queue -> stale output_cpu read by the H2D; nondeterministic on heavy
+            # prefill). Enqueue synchronously on this host thread instead (work is
+            # guaranteed submitted; it still runs on the WorkerPool and overlaps the
+            # GPU experts queued after). Keep subscribe_ascend_stream — that stream
+            # registration is what keeps decode's host-callback dispatch fast; the
+            # async submit itself is not required for it.
             if hidden_states.device.type == "npu" and hasattr(
                 kt_kernel_ext, "subscribe_ascend_stream"
             ):
                 kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
-            self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
+            self.cpu_infer.submit(immediate_task)
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         has_deferred = (
@@ -786,8 +795,11 @@ class BaseMoEWrapper(_MoEBase, ABC):
         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
 
         bypass = _should_bypass_stream_callback(hidden_states.device)
-        if bypass:
-            _wait_device(hidden_states.device)
+        # Both paths now submit the CPU-MoE synchronously on this host thread, which
+        # reads input_tensor_cpu immediately -> the input D2H (queued async on the
+        # stream by copy_inputs_to_cpu_buffers) MUST be finished first, else the CPU
+        # MoE reads a half-copied input. Wait unconditionally (bypass already did).
+        _wait_device(hidden_states.device)
 
         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
         immediate_task = self.moe.forward_task(
@@ -802,16 +814,24 @@ class BaseMoEWrapper(_MoEBase, ABC):
         if bypass:
             self.cpu_infer.submit(immediate_task)
         else:
+            # Correct + fast async path. ``submit_with_cuda_stream`` enqueues the
+            # CPU-MoE via an ACL host callback whose firing is not host-observable
+            # (NO_BLOCK) -> a later host-side drain can race ahead of it (empty
+            # queue -> stale output_cpu read by the H2D; nondeterministic on heavy
+            # prefill). Enqueue synchronously on this host thread instead (work is
+            # guaranteed submitted; it still runs on the WorkerPool and overlaps the
+            # GPU experts queued after). Keep subscribe_ascend_stream — that stream
+            # registration is what keeps decode's host-callback dispatch fast; the
+            # async submit itself is not required for it.
             if hidden_states.device.type == "npu" and hasattr(
                 kt_kernel_ext, "subscribe_ascend_stream"
             ):
                 kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
-            self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
+            self.cpu_infer.submit(immediate_task)
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         if deferred_ids is not None:
-            if bypass:
-                _wait_device(hidden_states.device)
+            _wait_device(hidden_states.device)
             deferred_task = self.moe.forward_task(
                 bsz_slot_tensor.data_ptr(),
                 deferred_experts_ids_cpu[current_slot].size(-1),
@@ -828,7 +848,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
                     kt_kernel_ext, "subscribe_ascend_stream"
                 ):
                     kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
-                self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
+                self.cpu_infer.submit(deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
     def copy_forward_output_to_device(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -880,7 +900,18 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 kt_kernel_ext, "subscribe_ascend_stream"
             ):
                 kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
-            self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+            # Correct async H2D ordering. ``sync_with_cuda_stream`` enqueues an ACL
+            # drain callback but does NOT make the stream's subsequent H2D wait for
+            # it (NO_BLOCK is fire-and-forget; ACL_CALLBACK_BLOCK only blocks the
+            # report thread, not the stream's device ops) -> copy_forward_output_to_
+            # device could read output_cpu mid-write (residual race; nondeterministic).
+            # Instead: wait the device (the GPU experts that overlapped the CPU-MoE
+            # are done), THEN drain the WorkerPool on this host thread. The CPU-MoE was
+            # submitted synchronously in submit_forward (still overlapping the GPU
+            # experts queued after it); only the racy callback-drain is replaced by a
+            # host-ordered drain, so the H2D below reads a fully-written output.
+            _wait_device(hidden_states.device)
+            self.cpu_infer.sync(allow_pending)
         if _KT_PREFILL_TIMING:
             _kt_pf_t1 = time.perf_counter_ns()
             _t0 = _kt_pf_t0.pop(self.layer_idx, _kt_pf_presync)

@@ -124,6 +124,12 @@ def main():
         a, b = a.reshape(-1).float(), b.reshape(-1).float()
         return float((a @ b) / (a.norm() * b.norm() + 1e-9))
 
+    # SMOKE_RESERVE_SLOT=1: reserve the streaming slot so _streaming_forward exercises the
+    # out_w13/out_w2 reserved-slot write path (the OOM fix) instead of the fresh-alloc path.
+    if os.environ.get("SMOKE_RESERVE_SLOT") == "1":
+        m.reserve_slot_depool(E, H, I, dev)
+        print(f"  [reserved ND slot: {tuple(m._SLOT['w13'].shape)}+{tuple(m._SLOT['w2'].shape)}]")
+
     # Warm up kernels/allocators/streams once (production's streaming convert always runs warm, after
     # model load + attention). Set SMOKE_NO_WARMUP=1 to test the cold path. Discard the result.
     if os.environ.get("SMOKE_NO_WARMUP") != "1":

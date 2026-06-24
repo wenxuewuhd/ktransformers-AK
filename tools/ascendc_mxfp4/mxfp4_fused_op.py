@@ -84,11 +84,16 @@ def _consts(HALF, NB, dev):
 _NZ_CHUNK = int(os.environ.get("KT_MXFP4_NZ_CHUNK", "32"))  # experts/chunk -> bounds HBM transient
 
 
-def convert_proj(codes_dev, scale_dev, IN, blockdim=40, packing="consecutive"):
+def convert_proj(codes_dev, scale_dev, IN, blockdim=40, packing="consecutive", out_nz=None):
     """One projection: MXFP4 codes/scale [E,OUT,*] -> (q_nz [E,IN,OUT] FRACTAL_NZ, oscale bf16 [E,OUT]).
 
     Chunked over experts so the transient (int8 planes + de-interleave + NZ cast) stays small —
     only the final [E,IN,OUT] NZ output is full-size (HBM-bounded like the W8A8 slot).
+
+    out_nz: optional pre-allocated FRACTAL_NZ [E,IN,OUT] int8 buffer to write into (the reserved
+      streaming slot). When given, no per-call ~GBs output allocation happens — the layer's NZ is
+      produced straight into the reused slot (HBM budgeted once at load). Must already be NZ-format
+      with matching shape. When None, a fresh buffer is allocated (back-compat).
 
     packing: nibble layout of the code bytes — how the kernel's lo/hi planes map back to K-positions.
       "consecutive" (native safetensors): byte j -> Kpos 2j (lo), 2j+1 (hi)  -> interleave.
@@ -106,7 +111,6 @@ def convert_proj(codes_dev, scale_dev, IN, blockdim=40, packing="consecutive"):
     st = torch.npu.current_stream().npu_stream
     P = lambda t: ctypes.c_void_p(t.data_ptr())
 
-    out_nz = None
     oscale = torch.empty((E, OUT), dtype=torch.bfloat16, device=dev)
     for c in range(0, E, _NZ_CHUNK):
         ce = min(c + _NZ_CHUNK, E)
@@ -152,10 +156,12 @@ def convert_proj(codes_dev, scale_dev, IN, blockdim=40, packing="consecutive"):
     return out_nz, oscale
 
 
-def mxfp4_layer_to_nz_slots(c13, s13, c2, s2, H, I, blockdim=40, packing="consecutive"):
+def mxfp4_layer_to_nz_slots(c13, s13, c2, s2, H, I, blockdim=40, packing="consecutive",
+                            out_w13=None, out_w2=None):
     """Full layer depool conversion -> (w13_nz, s13b, w2_nz, s2b), the exact tensors the streaming
     slot + npu_fused_experts consume (replacing the resident W8A8 pool). packing: see convert_proj
-    ("consecutive" for native safetensors codes, "halfblock" for GGUF block_mxfp4 codes)."""
-    w13_nz, s13b = convert_proj(c13, s13, H, blockdim, packing)
-    w2_nz, s2b = convert_proj(c2, s2, I, blockdim, packing)
+    ("consecutive" for native safetensors codes, "halfblock" for GGUF block_mxfp4 codes).
+    out_w13/out_w2: optional pre-reserved NZ slots to convert into (no per-layer output alloc)."""
+    w13_nz, s13b = convert_proj(c13, s13, H, blockdim, packing, out_nz=out_w13)
+    w2_nz, s2b = convert_proj(c2, s2, I, blockdim, packing, out_nz=out_w2)
     return w13_nz, s13b, w2_nz, s2b

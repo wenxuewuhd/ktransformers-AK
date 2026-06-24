@@ -84,11 +84,18 @@ def _consts(HALF, NB, dev):
 _NZ_CHUNK = int(os.environ.get("KT_MXFP4_NZ_CHUNK", "32"))  # experts/chunk -> bounds HBM transient
 
 
-def convert_proj(codes_dev, scale_dev, IN, blockdim=40):
+def convert_proj(codes_dev, scale_dev, IN, blockdim=40, packing="consecutive"):
     """One projection: MXFP4 codes/scale [E,OUT,*] -> (q_nz [E,IN,OUT] FRACTAL_NZ, oscale bf16 [E,OUT]).
 
     Chunked over experts so the transient (int8 planes + de-interleave + NZ cast) stays small —
-    only the final [E,IN,OUT] NZ output is full-size (HBM-bounded like the W8A8 slot)."""
+    only the final [E,IN,OUT] NZ output is full-size (HBM-bounded like the W8A8 slot).
+
+    packing: nibble layout of the code bytes — how the kernel's lo/hi planes map back to K-positions.
+      "consecutive" (native safetensors): byte j -> Kpos 2j (lo), 2j+1 (hi)  -> interleave.
+      "halfblock"   (GGUF block_mxfp4):   byte j -> Kpos g*32+jl (lo), +16 (hi) within its 32-group
+                                           -> per-group [lo0..15 | hi0..15] concat.
+    Both decode the SAME K-ordered weights bit-for-bit; the kernel and scale->block mapping (scOff)
+    are packing-agnostic, so only this post-step rearrange differs (no .so change)."""
     import torch_npu
     lib = get_lib()
     dev = codes_dev.device
@@ -112,6 +119,12 @@ def convert_proj(codes_dev, scale_dev, IN, blockdim=40):
         osc = torch.empty((Rp,), dtype=torch.float32, device=dev)
         lib.launch_mxfp4_fused(ctypes.c_void_p(st), blockdim, P(cd), P(sd), P(out), P(osc),
                                P(lutLo), P(lutHi), P(lutE8), P(scOff), Rc, HALF, NB, IN)
+        # The kernel is launched via a raw ctypes <<<stream>>> call that torch does not stream-order
+        # against the post-step ops reading `out`/`osc` below; without this sync the next chunk's
+        # caching-allocator reuse of `out` can race a still-running kernel (intermittent garbage,
+        # cos~0.1 — fires cold-start). One sync/chunk; negligible on the streaming path (chunk kernels
+        # were already serial). Applies to both packings.
+        torch.npu.synchronize()
         # De-interleave the [lo|hi] planes (contiguous stack) then transpose OUT<->IN. The old depool
         # hot spot was (a) a strided 1-byte de-interleave scatter (~2.4s/layer) and (b) an int8
         # transpose that degenerates to a 1-byte gather (~0.6s, ~20GB/s). (a) is gone via the
@@ -119,20 +132,30 @@ def convert_proj(codes_dev, scale_dev, IN, blockdim=40):
         # int8->fp16->int8 — exact because |q|<=127. Net post-step ~3s -> ~0.13s. The .contiguous()
         # is mandatory: feeding a transposed view to format_cast lays down WRONG NZ bytes on device
         # (looks fine via .cpu() which de-formats, but grouped_matmul reads garbage).
-        q = torch.stack([out[:, :HALFp], out[:, HALFp:]], dim=2).reshape(Ec, OUT, IN)  # [E,OUT,IN]
+        lo, hi = out[:, :HALFp], out[:, HALFp:]
+        if packing == "halfblock":
+            nb = HALFp // 16
+            q = torch.cat([lo.reshape(Rc, nb, 16), hi.reshape(Rc, nb, 16)], dim=2).reshape(Ec, OUT, IN)
+        else:
+            q = torch.stack([lo, hi], dim=2).reshape(Ec, OUT, IN)  # consecutive interleave [E,OUT,IN]
         nd = q.to(torch.float16).transpose(1, 2).contiguous().to(torch.int8)           # [E,IN,OUT]
         nz = torch_npu.npu_format_cast(nd, _NZ)
         if out_nz is None:
             out_nz = torch.empty((E,) + tuple(nz.shape[1:]), dtype=torch.int8, device=dev)
         out_nz[c:ce].copy_(nz)
         oscale[c:ce] = osc[:Rc].reshape(Ec, OUT).to(torch.bfloat16)
+        # Second sync: let the osc read (oscale assignment above) finish before the next chunk's
+        # `osc = torch.empty(...)` reuses that buffer and the next kernel (raw ctypes, unordered)
+        # overwrites it. Without it oscale races (w13 above is already drained by its post-step).
+        torch.npu.synchronize()
         del out, q, nd, nz, osc, cd, sd
     return out_nz, oscale
 
 
-def mxfp4_layer_to_nz_slots(c13, s13, c2, s2, H, I, blockdim=40):
+def mxfp4_layer_to_nz_slots(c13, s13, c2, s2, H, I, blockdim=40, packing="consecutive"):
     """Full layer depool conversion -> (w13_nz, s13b, w2_nz, s2b), the exact tensors the streaming
-    slot + npu_fused_experts consume (replacing the resident W8A8 pool)."""
-    w13_nz, s13b = convert_proj(c13, s13, H, blockdim)
-    w2_nz, s2b = convert_proj(c2, s2, I, blockdim)
+    slot + npu_fused_experts consume (replacing the resident W8A8 pool). packing: see convert_proj
+    ("consecutive" for native safetensors codes, "halfblock" for GGUF block_mxfp4 codes)."""
+    w13_nz, s13b = convert_proj(c13, s13, H, blockdim, packing)
+    w2_nz, s2b = convert_proj(c2, s2, I, blockdim, packing)
     return w13_nz, s13b, w2_nz, s2b

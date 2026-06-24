@@ -292,7 +292,7 @@ export ASCEND_RT_VISIBLE_DEVICES=<空卡>      # npu-smi 选空卡，避开 card
 | ④ | `--verify-sample` 报 `newbyteorder` removed | gguf-py NumPy 2.0 不兼容 | patch `0001`(只影响读取/校验) |
 | ⑤ | 启动崩 `quant fp8 != compressed-tensors` | sglang 切错 fork | 切 `dsv4_release@456687a0f` |
 | ⑥/⑥b | graph capture `aclrtMemcpy 107030` / 重放 `Unsupport run graph` | mask H2D 同步 / `@torch.compile` 跨 stream 子图 | **✅ 已修(06-08)**,见 §6.3 |
-| ⑦ | eager 出 token 但乱码 | CPU MoE async submit 未 flush → 全零 | eager 下 `KT_FORCE_SYNC_SUBMIT=1` |
+| ⑦ | eager 出 token 但乱码 | CPU MoE async submit 未 flush → 静默算错 | **✅ 已根治(e5f53ad,坑⑱)**;eager `force-sync=0` 即对 |
 | ⑧ | Q8_0 aarch64 NaN(历史) | iqk/tinyBLAS dotprod-only NaN | 回退 ggml `vec_dot_q8_0_q8_0`,Q8_0 可用 |
 | ⑨ | `--chunked-prefill-size -1` → malloc 越界 | `max_len=-1` 按 1 分配 | 默认 2048;`llamafile.py` ≤0 回落 |
 | ⑩ | GGUF layout 错 → 输出退化 | nibble/permute 与 pointer 算术不一致 | 去 permute、expert 维 axis=0(Q8_0);**MXFP4 见 ⑬** |
@@ -300,7 +300,7 @@ export ASCEND_RT_VISIBLE_DEVICES=<空卡>      # npu-smi 选空卡，避开 card
 | ⑫ | apt 镜像签名 403 | Huawei ports GPG | `--allow-unauthenticated -o Acquire::AllowInsecureRepositories=true` |
 | **⑬** | **MXFP4 GGUF 输出乱码/对账偏** | **nibble 序：官方 consecutive vs GGUF half-block 未重排** | **转换器逐 32-group 重排 nibble（非 byte copy）;`verify_mxfp4_layer.py` bit-exact 闸门(§3.2)** |
 | ⑭ | 服务跑一会儿 `main process disappeared` | remote/后台拉的服务父进程上下文被回收 | **长跑服务在自己终端前台拉**（见 §4.4） |
-| ⑮ | 离线单层对账 cand 全零 | 孤立单层调用 stream-callback 路径不回写 | `KT_FORCE_SYNC_SUBMIT=1`（对账脚本已内置） |
+| ⑮ | 离线单层对账 cand 全零 | 孤立单层调用 stream-callback 路径不回写 | 竞态已根治(e5f53ad);对账脚本仍内置 sync,无需手设 |
 | ⑯ | **prompt > `chunked-prefill-size` 即崩** `loc.numel()=1024 vs cache.shape[0]=513` | **DSv4 NSA-Compressor 跨 chunk 索引对齐缺口**：分块 prefill 时带 prefix 的 chunk，Lightning Indexer 按逻辑长度选 `loc`，但压缩池(c4/c128)只增量建到当前 chunk → loc 数与压缩池长度脱节。压缩/稀疏簿记只在**单遍完整 prefill**成立（普通 MLA/MHA 无此问题） | **单 chunk 绕过**：`CHUNKED_PREFILL_SIZE ≥ prompt_len`（32k→32768）。⚠️ 与 64k OOM 是同一死结两面（单 chunk 避 bug 但 prefill activation 撑爆 HBM §7.1）。根治需修 ascend backend 的 c4/c128 跨 chunk 累积+loc 对齐（sglang 侧，见 §6.6 / 合 upstream 时检查） |
 
 ---
@@ -534,8 +534,8 @@ NPU_DEVICE_ID=<空闲卡> PORT=8000 KT_CPUINFER=128 \
   bash tools/p27_launch_ds4flash_npu.sh
 # 默认 KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
 
-# eager 回退（仅对照/排障）：
-NPU_DEVICE_ID=<卡> KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" bash tools/p27_launch_ds4flash_npu.sh
+# eager 回退（仅对照/排障）：竞态已根治(e5f53ad),不再需要 force-sync=1
+NPU_DEVICE_ID=<卡> EXTRA_FLAGS="--disable-cuda-graph" bash tools/p27_launch_ds4flash_npu.sh
 ```
 
 **Q8_0 离线对账**：
@@ -549,6 +549,10 @@ PYTHONPATH="$PWD/third_party/sglang/python:$PWD/kt-kernel" /usr/local/python3.11
 
 **历史结论修正**：Spec/Handoff（05-12）的「Q8_0 在 aarch64 会 NaN」「MOE_INT8/KML 必须 BF16」已过时——
 实测 Q8_0(int8) CPU offload 可用（坑⑧ 已修，无 i8mm 时回退 `ggml_vec_dot_q8_0_q8_0`）。
+
+**坑⑰（modelslim 权重 + CPU GGUF 基底不一致 → 乱码）**：跑 modelslim checkpoint（`DeepSeek-V4-Flash-w8a8-mtp`，带 **quarot 全局旋转**）单卡时，**绝不能**复用从 native-MXFP4/W8A8 转的老 GGUF——NPU 侧是旋转基底、CPU 老 GGUF 是非旋转基底，224/256 专家算错 → 乱码（曾误判"attention 坏/不同模型"，实为基底不一致，raw 权重 cos≈0.01 是 quarot 旋转所致，非不同模型）。修法：用 `tools/convert_w8a8_to_gguf_q8_0.py` 给该 checkpoint 自己转一份 Q8_0 GGUF（mxfp4 converter 读不了 modelslim int8）。（注:旧版本曾加 `force-sync=1` 稳 greedy,竞态已根治 e5f53ad 后 `force-sync=0` 即对且确定,无需再加。）详见 [`modelslim_quarot_basis_gguf_pitfall.md`](./modelslim_quarot_basis_gguf_pitfall.md)。**换 NPU 侧 checkpoint，CPU GGUF 必须同步换成同一基底的。**
+
+**坑⑱（异步竞态已根治 —— `KT_FORCE_SYNC_SUBMIT=0` 现在又对又快，曾经的"必须开"已过时）**：早先 prefill 的 stream-callback 异步路径有竞态——`ACL_CALLBACK_NO_BLOCK` 的 host callback 非 host 可观测,H2D 偶发在 CPU 写完前读 `output_cpu` → 静默算错（关 force-sync 时 GPQA off 掉到 15%、temp=0 问 15×17 答 "245"）。**已被 commit `e5f53ad` 根治**：prefill 改同步 `cpu_infer.submit` + 无条件 `_wait_device`（等输入 D2H 拷完再读）+ 保留 `subscribe_ascend_stream`（这才是 decode 快的来源,不是异步 submit）。现在 **`KT_FORCE_SYNC_SUBMIT=0` 又对又快**：GPQA off **75.25%（prefix）/ 72.22%（depool）** 都对齐 PR 73.23%;decode 稳态 **16（prefix）/ 18.9（depool）**;与 force-sync 路径逐字对齐、bit 确定（含重 prefill）。`force-sync=1` 现在只是**慢路径**（关掉 NPU/CPU overlap → ~10 tok/s）、**不再是正确性必需**。详见 memory `prefill-async-race-fixed-forcesync-off-fast`、[`accuracy_report.md`](./accuracy_report.md)。
 
 ---
 

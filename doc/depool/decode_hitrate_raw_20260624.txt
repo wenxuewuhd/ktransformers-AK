@@ -1,0 +1,7 @@
+[KT_HITRATE] DECODE resident hit-rate 14.8% (2680/18060 top-k slots, 40 steps)
+[KT_HITRATE] DECODE resident hit-rate 14.5% (4104/28380 top-k slots, 80 steps)
+[KT_HITRATE] DECODE resident hit-rate 14.1% (5444/38700 top-k slots, 120 steps)
+[KT_HITRATE] PREFILL resident hit-rate 13.4% (58810/437826 top-k slots)
+[KT_HITRATE] DECODE resident hit-rate 15.5% (7579/49020 top-k slots, 160 steps)
+[KT_HITRATE] DECODE resident hit-rate 20.2% (12015/59340 top-k slots, 200 steps)
+[KT_HITRATE] DECODE resident hit-rate 23.6% (16418/69660 top-k slots, 240 steps)

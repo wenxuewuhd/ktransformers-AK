@@ -37,18 +37,6 @@ _FP4 = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], n
 # NO sync is needed (validated: deterministic + byte-equal, runs async -> fast). So only sync when
 # the task queue is on.
 _TQ_SYNC = os.environ.get("TASK_QUEUE_ENABLE", "1") != "0"
-# How to fence the raw ctypes kernel vs the torch post-step (TQ=1 dispatches torch ops async).
-# "full": device-wide synchronize (correct, but serialises a concurrent copy stream -> blocks H2D
-# overlap). "stream": fence only the current stream (kernel + post-step are both on it) -> still
-# fences the race, leaves other streams free for overlap. "none": no fence (racy at E=256).
-_CONVERT_SYNC = os.environ.get("KT_CONVERT_SYNC", "full")
-
-
-def _convert_fence():
-    if _CONVERT_SYNC == "stream":
-        torch.npu.current_stream().synchronize()
-    elif _CONVERT_SYNC != "none":
-        torch.npu.synchronize()
 
 _lib = None
 _lock = threading.Lock()
@@ -169,7 +157,7 @@ def convert_proj(codes_dev, scale_dev, IN, blockdim=40, packing="consecutive", o
         # ordered against the torch post-step reading `out`/`osc`). With it off, stream FIFO orders
         # them and we skip the host stall -> async convert, fast prefill.
         if _TQ_SYNC:
-            _convert_fence()
+            torch.npu.synchronize()
         # De-interleave the [lo|hi] planes (contiguous stack) then transpose OUT<->IN. The old depool
         # hot spot was (a) a strided 1-byte de-interleave scatter (~2.4s/layer) and (b) an int8
         # transpose that degenerates to a 1-byte gather (~0.6s, ~20GB/s). (a) is gone via the
@@ -191,7 +179,7 @@ def convert_proj(codes_dev, scale_dev, IN, blockdim=40, packing="consecutive", o
         oscale[c:ce] = osc[:Rc].reshape(Ec, OUT).to(torch.bfloat16)
         # Second sync (task-queue-on only): let the osc read finish before the next chunk reuses it.
         if _TQ_SYNC:
-            _convert_fence()
+            torch.npu.synchronize()
         del out, q, nd, nz, osc, cd, sd
     return out_nz, oscale
 
@@ -237,7 +225,7 @@ def convert_proj_blk(blocks_dev, IN, blockdim=40, out_nz=None):
                                    P(lutLo), P(lutHi), P(lutE8), P(scOff), P(codeOff), P(scaleOff),
                                    Rc, HALF, nb, IN)
         if _TQ_SYNC:
-            _convert_fence()
+            torch.npu.synchronize()
         lo, hi = out[:, :HALFp], out[:, HALFp:]
         nbb = HALFp // 16
         q = torch.cat([lo.reshape(Rc, nbb, 16), hi.reshape(Rc, nbb, 16)], dim=2).reshape(Ec, OUT, IN)
@@ -248,7 +236,7 @@ def convert_proj_blk(blocks_dev, IN, blockdim=40, out_nz=None):
         out_nz[c:ce].copy_(nz)
         oscale[c:ce] = osc[:Rc].reshape(Ec, OUT).to(torch.bfloat16)
         if _TQ_SYNC:
-            _convert_fence()
+            torch.npu.synchronize()
         del out, q, nd, nz, osc, bd
     return out_nz, oscale
 

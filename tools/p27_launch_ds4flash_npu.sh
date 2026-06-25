@@ -185,13 +185,22 @@ EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 if [[ -n "${EXTRA_FLAGS}" ]]; then
   echo "[p27] EXTRA_FLAGS=${EXTRA_FLAGS}"
 fi
-# SKIP_WARMUP=1（默认，保持基线）传 --skip-server-warmup 跳过开机预热；=0 则开启预热（A/B 用）。
+# SKIP_WARMUP=1 传 --skip-server-warmup 跳过开机预热；=0 开启预热。
+# 流式自暖（2026-06-25）：流式 prefill 从不跑 CPU MoE(kt_kernel)，所以 stream-everything 的服务会一直
+# 冷、decode ~11 而非 ~18（drop_caches 证明是 kt_kernel 进程内状态、非页缓存）。修法=启动时用一发
+# 强制-hybrid 的 forward 把 kt_kernel 暖起来：开 sglang 内部 warmup(SKIP_WARMUP=0) + 强制那一发走
+# hybrid(KT_STREAM_WARMUP=1)。端到端实测：之后第一发长 prompt 也能流式且 decode ~18；暖机一发即够、
+# 终生不复冷。故 KT_PREFILL_STREAM=1 时两者默认开（均可被显式覆盖；非流式跑维持基线 warmup 关）。
+if [[ "${KT_PREFILL_STREAM:-}" == "1" ]]; then
+  SKIP_WARMUP="${SKIP_WARMUP:-0}"
+  export KT_STREAM_WARMUP="${KT_STREAM_WARMUP:-1}"
+fi
 SKIP_WARMUP="${SKIP_WARMUP:-1}"
 WARMUP_FLAG="--skip-server-warmup"
 if [[ "${SKIP_WARMUP}" == "0" ]]; then
   WARMUP_FLAG=""
 fi
-echo "[p27] SKIP_WARMUP=${SKIP_WARMUP} (warmup_flag='${WARMUP_FLAG}')"
+echo "[p27] SKIP_WARMUP=${SKIP_WARMUP} (warmup_flag='${WARMUP_FLAG}') KT_STREAM_WARMUP=${KT_STREAM_WARMUP:-0}"
 # 可调 env（2026-06-11 加）：
 #   KT_NUM_GPU_EXPERTS  每层放 NPU 的 expert 数，默认 32。每多 1 个 ≈ +1.0GB HBM。
 #       实测上限（context 65536）：40 可起（KV max_total=135k，仍≥2×context），42 崩

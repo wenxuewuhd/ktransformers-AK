@@ -85,7 +85,8 @@ Levers (need measurement to confirm):
 ## Known issues / not done
 - decode is noisy/prompt-dependent; measure warm + median (a cold/peak single number misleads).
 - dynamic-resident decode-neutral (see #3) — revisit only if CPU-MoE becomes the decode bottleneck.
-- p27 prompt-5/6/7 (long-context discriminator) + the 8k case are UNCOMMITTED test-script edits.
+- p27 prompt-5/6/7 (long-context discriminator) are now committed (531a00e); the 8k/32k scale-up is
+  documented in the script comment only (not wired — needs chunked-prefill-size>=32768 + freed HBM).
 
 ## Diagnostics
 - `KT_HITRATE_PROBE=1` (+ `--disable-cuda-graph` so decode runs eager) -> per-step resident hit-rate,

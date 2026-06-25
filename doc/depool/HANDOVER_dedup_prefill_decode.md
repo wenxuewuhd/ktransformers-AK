@@ -55,11 +55,37 @@ ADD-THEN-REVERTED CHURN (net-zero; squash for a clean PR):
   (overlap shelved: primitive validated 1.6x but full-forward integration has an unresolved global
   slowdown; 3 hypotheses ruled out — see the reverted commits / memory if revisited)
 
+## Long-context retrieval — root-caused to NSA selection, NOT our stream/MoE path
+Needle-in-a-haystack A/B (tools/p27_curl_f2_prompts.sh prompts 5/6/7, same ~7k log, only the needle
+POSITION changes): short log (dense) retrieves the key; ~7k log with needle in the MIDDLE fails;
+~7k log with needle at the TAIL (inside NSA's recent/sliding dense window) retrieves it. Same length,
+position-dependent => the long-context "wrong answer" is **NSA sparse-block SELECTION dropping the
+middle block** (a shared attention-backend issue), not dedup, not streaming, not the base model.
+(memory: longcontext-needle-fail-is-nsa-selection.) The hybrid reference path shows the same -> not
+ours to fix in the prefill path.
+
+The long-context (NSA-selection) failure is a shared attention-backend workstream, separate from and
+not blocking the dedup/prefill/decode deliverable here.
+
+## 32k+ prefill: HBM budget (not done; levers documented)
+A single 32k chunk OOMs on the streaming convert (~0.9G short): model 42G + reserved slot 6.4G + KV
+pool (~9.8G at mem-frac 0.85 / context 65536) leaves ~1G for activation, and 32k activation + convert
+need ~2.6G -> OOM -> graceful hybrid fallback (slow CPU prefill, request still completes).
+Levers (need measurement to confirm):
+- `--context-length 34816` (just above the prompt) shrinks the KV pool to ~5G -> frees ~5G for
+  activation. THE right lever for a known max length. (memory: dsv4-npu-expert-capacity / hbm-budget)
+- `KT_NUM_GPU_EXPERTS=16` frees the resident pool (~3-6G).
+- lowering `--mem-fraction-static` frees activation BUT shrinks the KV pool below the 32k prompt's
+  ~33k-token need -> fails with "not enough tokens" instead. Trades one limit for another.
+- Multi-chunk (chunked-prefill-size 8192) is NOT a fix: prompt > chunk-size hits the cross-chunk NSA
+  crash (memory: chunked-prefill-compressor-crosschunk-bug; roadmap P2).
+- p27 prompt 5/6/7 are sized ~7k = single chunk (< 8192) so they run clean; the comment shows how to
+  scale to 32k (range~960 + chunked-prefill-size>=32768 + freed HBM).
+
 ## Known issues / not done
-- **32k+ prefill**: chunked-prefill cross-chunk NSA bug (prompt > CHUNKED_PREFILL_SIZE crashes;
-  roadmap P2). `tools/p27_curl_f2_prompts.sh` has an optional (commented) prompt-5 32k stress case.
 - decode is noisy/prompt-dependent; measure warm + median (a cold/peak single number misleads).
 - dynamic-resident decode-neutral (see #3) — revisit only if CPU-MoE becomes the decode bottleneck.
+- p27 prompt-5/6/7 (long-context discriminator) + the 8k case are UNCOMMITTED test-script edits.
 
 ## Diagnostics
 - `KT_HITRATE_PROBE=1` (+ `--disable-cuda-graph` so decode runs eager) -> per-step resident hit-rate,

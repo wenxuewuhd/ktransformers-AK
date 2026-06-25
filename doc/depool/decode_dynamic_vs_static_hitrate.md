@@ -45,3 +45,22 @@ having a 1.1-1.5 tok/s first batch then oscillating 9-20.
 Open: WHY does putting the HOT experts on NPU decode slower than random prefix-32?
 Counterintuitive (more NPU residency, less CPU-MoE, should be faster). Needs a decode
 profile (NPU resident GEMM vs CPU-MoE vs dispatch) per step for hot-32 vs prefix-32.
+
+## Decisive: it is the WRITE, not the experts (KT_DYN_FORCE_PREFIX)
+| config | decode median |
+|---|---|
+| static (no write), prefix-32                       | 18.0 |
+| exp2 (dynamic OFF, prefix-32, NOT written)         | 17.6 |
+| DYNAMIC + FORCE_PREFIX (prefix-32, WRITTEN via dyn) | 13.0 |
+| DYNAMIC hot-32 (written)                            | 12.0 |
+
+=> Writing the SAME prefix-32 experts via the dynamic index_select path is slow (13),
+   not 17.6. So the decode overhead is the dynamic-resident WRITE mechanism
+   (_apply_resident_layer_depool: torch.index_select(..., out=layer.w*_weight.data) per
+   prefill), INDEPENDENT of which experts / hit-rate. Hit-rate (43% vs 14%) is a red herring.
+   The caching-allocator remap fixed the prefill write-STALL (+100s) but a separate
+   LINGERING DECODE cost from the write remains (~17.6 -> 13, -26%).
+
+Next: pinpoint why a per-prefill index_select write into the resident param slows the
+subsequent (graph) decode GEMM that reads it (format descriptor? weight-region dirty?
+re-cast?). Then fix so the resident write does not regress decode.

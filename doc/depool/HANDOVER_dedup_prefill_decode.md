@@ -93,3 +93,40 @@ Levers (need measurement to confirm):
 - `KT_DYN_FORCE_PREFIX=1` (force resident = prefix 0..K-1; pre-existing, isolates experts-vs-write).
   (`KT_DEPOOL_RES_SKIP_WEIGHTS` was a temporary skip-weight-write probe, reverted after the A/B.)
 - `KT_STREAM_TIMING` was removed (was a per-phase wall-clock; sync-distorted, see history).
+
+## Streaming-prefill startup auto-warmup (second session on this worktree, committed)
+Chased "why does `KT_PREFILL_STREAM_THRESHOLD=1` (stream short prompts too) make decode slower than
+prefix/512 (~11 vs ~18)". Root-cause + fix, separate from the dedup deliverable above.
+
+**Root cause (controlled A/B)**: a streamed prefill computes all 256 experts on the NPU and NEVER
+invokes the CPU MoE (kt_kernel). So a stream-everything server (threshold=1, or a cold server's
+first requests) keeps kt_kernel cold and decode runs ~11 tok/s instead of ~18. The warming is
+**process-local kt_kernel state** (threadpool/buffers + first-touch), **NOT OS page cache**: the
+147G GGUF is already in buff/cache, `drop_caches` (dropped 611G) does NOT re-cool decode, and a
+fresh process is cold despite warm cache. Once warmed it does **not re-cool on idle**. A hybrid
+prefill (the <512 path) warms it as a side effect — which is why prefix/512 and stream-off already
+decode ~18.
+
+**Fix (committed)**: `KT_STREAM_WARMUP=N` forces the first N real (multi-token) prefills through the
+hybrid path to prime kt_kernel, placed BEFORE the threshold gate so the server's own small internal
+startup-warmup prefill (sglang warmup, `SKIP_WARMUP=0`) consumes the budget and real user prefills
+then stream. One forced-hybrid prefill is enough. `tools/p27_launch_ds4flash_npu.sh` now defaults
+`SKIP_WARMUP=0 + KT_STREAM_WARMUP=1` whenever `KT_PREFILL_STREAM=1` (both overridable; non-streaming
+runs keep warmup off / baseline). Validated end-to-end: with warmup a long first user prefill streams
+and decodes ~18; without (`SKIP_WARMUP=1 KT_STREAM_WARMUP=0`) it's ~11.
+- Commits: sglang `4ea20e5d3` (warmup logic) + parent `ea102c1` (launch default-on + submodule bump).
+- => threshold is decoupled from decode speed: long-prefill streaming win (137->14s) is kept AND
+  decode stays ~18 via the one-shot startup warmup. Best config unchanged: `THRESHOLD=512 +
+  KT_DYNAMIC_RESIDENT=1` (short->hybrid self-warms + correct, long streams).
+
+**Two things ruled out — do NOT redo (controlled)**:
+1. `_is_prefill()` adding `get_is_capture_mode()` was a fix for a NON-problem, REVERTED: the decode
+   graph's recorded capture forward has `is_capturing=True`, so the old code already returns hybrid —
+   the decode graph never captured streaming. Decode slowness was cold CPU, not the graph.
+2. Short-prompt (prompt 4) degeneration is **benign greedy divergence** (stream vs hybrid differ by
+   cos~0.999, enough to tip a base-model greedy decode), NOT "short seq can't fill the 32 hot experts"
+   (degenerates with `KT_DYNAMIC_RESIDENT=0` too) and NOT short-M precision loss (unit test: convert
+   is bit-exact cos=1.0 at M=1..1024). `THRESHOLD=512` (short->hybrid) is coherent.
+
+(memory: streaming-prefill-decode-cold-cpu-warmup.) Diagnostic env (`KT_STREAM_DIFF`,
+`KT_STREAM_GATE_DBG`) were used then deleted; `kt_ep_wrapper.py` is back to zero diff.

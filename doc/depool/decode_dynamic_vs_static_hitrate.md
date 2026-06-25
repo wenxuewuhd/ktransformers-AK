@@ -64,3 +64,13 @@ profile (NPU resident GEMM vs CPU-MoE vs dispatch) per step for hot-32 vs prefix
 Next: pinpoint why a per-prefill index_select write into the resident param slows the
 subsequent (graph) decode GEMM that reads it (format descriptor? weight-region dirty?
 re-cast?). Then fix so the resident write does not regress decode.
+
+## ROOT CAUSE + FIX (confirmed)
+The slow case = mask rewrite (KT_DEPOOL_RES_SKIP_WEIGHTS still slow 12.4; weight write NOT the cause).
+The remap to caching-allocator (maybe_reserve_slot) only covered the WEIGHT params; the resident
+MASK buffers (gpu_experts_mask, logical_to_gpu_index) were left on the weight region, so
+_set_resident_masks rewriting them every prefill triggered the NSA decode stall.
+
+FIX: clone gpu_experts_mask / logical_to_gpu_index to caching-allocator at load (before graph
+capture), same as the weights. Result: dynamic hot-32 decode 12 -> 16.4 (median, +37%), max 20.2
+(now ABOVE prefix-32's 17.6 -> the 3x hit-rate benefit finally materialises), arith 255 correct.

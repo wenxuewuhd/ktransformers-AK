@@ -74,6 +74,22 @@ if [[ -n "${1:-}" && "$1" =~ ^[0-9]+$ && -z "${NPU_DEVICE_ID:-}" ]]; then
 fi
 
 MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8}"
+
+# ---------- KT MoE 最优全量默认（2026-06 验证；任一可被显式 env 覆盖）----------
+# 全开 = depool + dynamic-hot + 流式prefill + side-stream + GGUF dedup：
+#   * 精度对齐 PR（GPQA off 72–75%，commit e5f53ad 根治异步竞态后 force-sync=0 即对）；
+#   * decode ~18 tok/s（dynamic 热专家 + side-stream 重叠 + mask-remap 修复）；
+#   * host DDR ~146G（dedup 复用 CPU 已 mmap 的 GGUF，省 ~137G；NPU 常驻从同源 mxfp4 现转 → 与 CPU 逐 bit 同）。
+#   * KT_FORCE_SYNC_SUBMIT 不设（=0）：异步竞态已根治，关 = 又对又快；设 1 只是慢路径。
+# 想要轻量 prefix-32 baseline（~16 tok/s、不建 mxfp4 池）：
+#   显式 KT_MXFP4_DEPOOL=0 KT_MXFP4_GGUF_DEDUP=0 KT_DYNAMIC_RESIDENT=0 KT_PREFILL_STREAM=0
+# 见 memory depool-dynamic-correct-convert-folded / gguf-dedup-saves-137g / prefill-async-race-fixed。
+export KT_MXFP4_DEPOOL="${KT_MXFP4_DEPOOL:-1}"
+export KT_MXFP4_GGUF_DEDUP="${KT_MXFP4_GGUF_DEDUP:-1}"   # 依赖 depool；默认 GGUF 模板下面会选 mxfp4
+export KT_DYNAMIC_RESIDENT="${KT_DYNAMIC_RESIDENT:-1}"
+export KT_PREFILL_STREAM="${KT_PREFILL_STREAM:-1}"
+export KT_SIDE_STREAM="${KT_SIDE_STREAM:-1}"
+
 # 勿用 KT_GGUF_TEMPLATE="${KT:-...dsv4_layer{layer_idx}.gguf}"：bash 会把 {layer_idx} 的第一个 ``}`` 当成 ``${...:-}`` 的结束符，路径会变成 ``...{layer_idx.gguf}``。
 # 默认 Q8_0（批量 convert 输出 dsv4_layer{L}.gguf）。须先 cp 新 kt_kernel_ext.so 到 kt-kernel/python/（手册 §2.4）。
 # BF16 回退：export KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
@@ -87,7 +103,7 @@ if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
     KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
   fi
 fi
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"   # ≥ 常见 prompt(GPQA max 2577)，避坑⑯ NSA 跨 chunk 崩；32k/64k 长序列须显式调更大
 QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
 # CPU MoE is memory-bandwidth-bound; scale threads to raise effective DDR bandwidth.
 # Default is now 128 (16/NUMA). Isolated decode micro-bench (tools/p27_cpu_moe_bw_bench.py,

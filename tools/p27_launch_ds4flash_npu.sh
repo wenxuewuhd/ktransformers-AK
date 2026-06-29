@@ -103,6 +103,9 @@ if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
     KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
   fi
 fi
+# ★必须 export：除了 --kt-weight-path（CPU MoE）外，GGUF dedup（KT_MXFP4_GGUF_DEDUP=1）从
+# os.environ 读 KT_GGUF_TEMPLATE 来复用 CPU 的 mmap GGUF；不 export → dedup 报 "template empty" 回退建 codes 池。
+export KT_GGUF_TEMPLATE
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"   # ≥ 常见 prompt(GPQA max 2577)，避坑⑯ NSA 跨 chunk 崩；32k/64k 长序列须显式调更大
 QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
 # CPU MoE is memory-bandwidth-bound; scale threads to raise effective DDR bandwidth.

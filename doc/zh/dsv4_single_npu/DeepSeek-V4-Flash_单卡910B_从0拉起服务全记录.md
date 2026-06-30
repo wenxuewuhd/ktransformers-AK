@@ -3,9 +3,12 @@
 > 本文档记录在**干净 container** 上,从源码出发把 DeepSeek-V4-Flash 单卡 Ascend 910B + KT CPU MoE
 > 推理服务拉起来的**全部实际操作**(编译 → 转权重 → 拉起 → 使用 + 踩坑)。命令可直接复制执行。
 >
-> **现行生产路径(2026-06-11)**:**NPU 侧 W8A8 + CPU offload 侧原生 MXFP4 GGUF + graph-on**。
-> decode **~13–16 tok/s**(清净窗口),DRAM **~137 GiB**。下面正文按 MXFP4 主线写;
-> **旧的 int8(Q8_0)CPU 路径转换与使用见[附录 A](#附录-a旧路径int8q8_0-cpu-权重)。**
+> **现行生产路径(2026-06-29,主干已全量合入最优配置)**:**NPU W8A8(attention)+ CPU MXFP4 GGUF + graph-on**,
+> 默认全开 **depool + dynamic-hot + 流式prefill + side-stream + GGUF-dedup**(no-arg launcher 即最优,见总纲/memory `trunk-full-optimal-noarg-default`)。
+> decode **~16(prefix-32)/ ~18.9(depool 默认)tok/s**(清净窗口),host DDR **~146 GiB**(dedup 复用 GGUF、省 ~137G);
+> GPQA off **75.25%(prefix)/ 72.22%(depool)**,均对齐 PR 73.23%(见 `accuracy_report.md`)。
+> ★**`KT_FORCE_SYNC_SUBMIT` 不再需要**——异步竞态已根治(commit `e5f53ad`),force-sync=0 即又对又快。
+> 下面正文按 MXFP4 主线写;**旧的 int8(Q8_0)CPU 路径见[附录 A](#附录-a旧路径int8q8_0-cpu-权重)。**
 >
 > - 仓库根:`/workspace/code/ktransformers-AK`
 > - NPU 权重(W8A8):`/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8`
@@ -19,16 +22,56 @@
 
 ---
 
+## 🆕 新机/裸 clone 一键引导(全新服务器从这里走)
+
+> ⚠️ 下面 §0–§3 是按 **`/workspace` 已持久**(submodule/patch/`.so`/GGUF 都在)写的——**全新服务器没有这些**,
+> 先按本节线性把环境建起来,再到 §4 拉起。(已持久的老机器可跳过本节。)
+
+```bash
+# 0. 系统依赖(每容器;CANN 8.5.0 / NNAL-ATB / torch_npu 定制build / transformers 锁版本见 memory cann-image-extra-deps-for-dsv4)
+apt-get install -y libhwloc-dev libhwloc15
+
+# 1. 拉主仓 + 所有 submodule(钉到主仓记录的 SHA)
+cd /workspace/code/ktransformers-AK
+git pull origin dsv4_one_card_dev
+git submodule update --init --recursive
+#   sglang → 4ea20e5d3(.gitmodules 已配 branch=dsv4_release)；llama.cpp → b3173；pybind11；custom_flashinfer
+#   ★ sglang 是 SSH(git@github.com:wenxuewuhd/sglang-dsv4.git),新机需你的 key;无 key 改 HTTPS:
+#     git config submodule.third_party/sglang.url https://github.com/wenxuewuhd/sglang-dsv4.git && git submodule update --init third_party/sglang
+
+# 2. ★llama.cpp 打 patch(不在 submodule 里,红线 R7,每次裸 clone 必打 — 这步最易漏)
+cd third_party/llama.cpp
+git apply -p1 ../../tools/kt_dsv4_npu_patches/llama_cpp/0001-fix-gguf-NumPy-2-GGUFReader.patch
+git apply -p1 ../../tools/kt_dsv4_npu_patches/llama_cpp/0002-add-ggml-type-mxfp4.patch
+git status --short    # 应见 ggml-common.h / ggml-quants.{c,h} / ggml.c 等改动
+cd ../..
+
+# 3. 编 kt-kernel .so
+cd kt-kernel
+CPUINFER_USE_ASCEND_NPU=1 /usr/local/python3.11.14/bin/python3.11 setup.py build_ext --inplace
+cd ..
+
+# 4. 备权重:运行需 W8A8 checkpoint + mxfp4 GGUF;后者转见 §2(或从老机拷 138G)。dedup 默认开→运行时不读 native MXFP4
+# 5. 拉起(no-arg=最优,首次自动 bisheng 编 depool 算子)→ 见 §4
+NPU_DEVICE_ID=<空闲卡> PORT=8020 bash tools/p27_launch_ds4flash_npu.sh
+```
+
+> depool 的 AscendC 算子(`tools/ascendc_mxfp4`)首次拉起自动 bisheng 编,需 bisheng 工具链在 PATH(见总纲 §4.6)。
+
+---
+
 ## 0. 开工前环境体检
 
 | 项 | 状态 | 备注 |
 |---|---|---|
 | `/workspace` 持久化 | ✅ | 代码、子模块(含 patch 态)、`.so`、GGUF 权重都在;新 container 通常只缺 hwloc |
 | hwloc(libhwloc-dev/15) | ⚠️ 非持久 | **每容器重装**;`import kt_kernel` 运行期依赖 `libhwloc.so.15` |
-| sglang / llama.cpp 子模块 | ✅ | sglang `dsv4_release@456687a0f`;llama.cpp b3173 + patch 0001+0002 |
+| sglang / llama.cpp 子模块 | ✅ | sglang `dsv4_release@4ea20e5d3`(干净 clone 时 `git submodule update --init` 自动钉到主仓记录的 SHA);llama.cpp b3173 + patch 0001+0002 |
 | `kt_kernel_ext*.so` | 视情况 | 持久化;改 C++/换 patch 后需重编 |
-| **原生 MXFP4 模型** | 需在位 | `/workspace/models/DeepSeekV4/DeepSeek-V4-Flash`(46 shard,每层专家独占一 shard) |
-| MXFP4 GGUF | 视情况 | `/workspace/models/cache/dsv4_layer{0..42}_mxfp4.gguf`(每层 3.42 GiB,合计 138 GiB) |
+| **depool AscendC 算子** | 首次自动编 | depool(默认开)首次用到时 bisheng 自动编 `tools/ascendc_mxfp4` 并缓存;需 bisheng 工具链。见**总纲 §4.6** |
+| **原生 MXFP4 模型** | 转 GGUF 需在位 | `/workspace/models/DeepSeekV4/DeepSeek-V4-Flash`(46 shard;**只在转 GGUF 时需要**,dedup 默认开后运行时不读它) |
+| MXFP4 GGUF | 运行必需 | `/workspace/models/cache/dsv4_layer{0..42}_mxfp4.gguf`(每层 3.42 GiB,合计 138 GiB;CPU MoE + depool 现转都用它) |
+| **W8A8 checkpoint** | 运行必需 | `/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8`(attention/非MoE/serving;`--model-path`) |
 
 ```bash
 apt-get install -y libhwloc-dev libhwloc15                    # ① 每容器必做
@@ -143,29 +186,28 @@ $PY -c "import importlib.util as u; print('kt_ep_wrapper:', u.find_spec('sglang.
 
 ```bash
 cd /workspace/code/ktransformers-AK
-NPU_DEVICE_ID=<空闲卡> PORT=8020 \
-  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' \
-  KT_CPUINFER=128 KT_DECODE_TIMING=1 SKIP_WARMUP=0 \
-  MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
-  bash tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/kt_mxfp4_serve.log
+# ★ no-arg launcher 即最优全量(depool+dynamic+流式prefill+side+dedup 全默认开,force-sync=0)
+NPU_DEVICE_ID=<空闲卡> PORT=8020 bash tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/kt_serve.log
 ```
 
-- `KT_GGUF_TEMPLATE` **必须指 `_mxfp4` 模板**(否则脚本默认走 Q8_0 的 `dsv4_layer{layer_idx}.gguf`)。
-- `MODEL_PATH` 指 **W8A8**(NPU 侧 attention/shared/router/常驻专家)。两份权重缺一不可。
-- `KT_CPUINFER` 默认 128(每 NUMA 16 线程,留 8 核给 NPU host;**勿 192 满核会 thrash**)。
-- **`SKIP_WARMUP=0` 开机预热(serving 建议开)**:去掉脚本默认的 `--skip-server-warmup`,开机时多跑一次 dummy
-  decode pass 暖 NPU graph/cache → **开机第一发不再冷**(实测 req1 2.1–2.5s→1.8s,两臂区间不重叠;预热 pass
-  仅 ~5s,几乎零 boot 代价)。脚本默认 `SKIP_WARMUP=1`(保持基线)。⚠️ 只治开机冷启,不治会话中途空闲后又掉速
-  (那是 per-request 首 token transition + 邻居争抢,需周期性 keep-warm;**调 worker park 阈值已证伪无效**)。
+- **不用再传任何 KT_ env**——launcher 默认就是全优化(2026-06 合入)。默认会:选 mxfp4 GGUF、开 depool 现转、
+  开 dynamic 热专家、开流式 prefill + 启动暖 CPU MoE、开 side-stream、开 GGUF dedup(复用 GGUF 省 ~137G)、
+  chunked-prefill-size=8192;`KT_FORCE_SYNC_SUBMIT` 不设(=0,根治后又对又快)。任一可显式 env 覆盖。
+- **两份权重缺一不可**:`MODEL_PATH`(默认 W8A8,attention/非MoE)+ mxfp4 GGUF(CPU MoE + depool 现转,depool 默认下自动选 `_mxfp4` 模板)。**dedup 默认开 → 运行时不读 native MXFP4**(从 GGUF 拿)。
+- **首次拉起会 bisheng 自动编 depool 的 AscendC mxfp4 算子**(`tools/ascendc_mxfp4`,缓存;源比 .so 新会自动重编)。需 bisheng 工具链,见总纲 §4.6。
+- **轻量 prefix-32 baseline**(~16 tok/s、不建 mxfp4 池、占内存少):显式加
+  `KT_MXFP4_DEPOOL=0 KT_MXFP4_GGUF_DEDUP=0 KT_DYNAMIC_RESIDENT=0 KT_PREFILL_STREAM=0`。
+- `KT_CPUINFER` 默认 128(每 NUMA 16 线程,留 8 核给 NPU host;勿 192 满核 thrash)。
+- 流式 prefill 默认开时,launcher 自动 `SKIP_WARMUP=0` + `KT_STREAM_WARMUP=1`(暖 CPU MoE,否则流式不调 CPU→decode 冷,见 memory `streaming-prefill-decode-cold-cpu-warmup`)。
 - graph-on 是默认(坑⑥/⑥b 已修,见总纲 §6.2),勿传 `--disable-cuda-graph`。
 
 ### 坑 ⑤:`Quantization method (fp8) does not match (compressed-tensors)`
-sglang 子模块切错 fork(无 KT 补丁)。修:切 `dsv4_release@456687a0f`(含 graph 修复 + KT EP wrapper)。
+sglang 子模块切错 fork(无 KT 补丁)。修:钉 `dsv4_release@4ea20e5d3`(干净 clone `git submodule update --init` 自动钉到主仓记录的 SHA;含 graph 修复 + KT EP wrapper + depool/dynamic/dedup/流式)。
 核对:`grep -rl SGLANG_APPLY_CONFIG_BACKUP third_party/sglang/python/` 应为空。本仓已固化。
 
 ### 坑 ⑥/⑥b/⑦:graph capture / 重放 / eager 乱码
-均已闭合(2026-06-08),现**默认 graph-on 即端到端跑通**。根因与改动见
-[总纲 §6.2](DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md)。eager 回退(仅排障)需 `KT_FORCE_SYNC_SUBMIT=1`(坑⑦,附录 A)。
+均已闭合,现**默认 graph-on 即端到端跑通**。根因见[总纲 §6.2](DeepSeek-V4-Flash_Single-NPU_Plan-and-Progress.md)。
+★坑⑦(eager async 竞态)已**根治**(commit `e5f53ad`,见总纲坑⑱):eager/serving `force-sync=0` 即对,**不再需要 `KT_FORCE_SYNC_SUBMIT=1`**。
 
 ### 4.2 端到端验证(✅ 通过)
 
@@ -179,9 +221,9 @@ curl -sS -m 300 -X POST http://127.0.0.1:8020/generate -H 'Content-Type: applica
 grep -E "KT_DECODE_TIMING|gen throughput" /tmp/kt_mxfp4_serve.log | tail
 ```
 
-**实测(2026-06-11,中等争抢窗口 load~84–134)**:四 prompt 连贯("Transformer 架构是一种革命性的模型...
-自注意力机制(Self-Attention)和位置编码");**decode 13.4–14.7 tok/s,cpu_moe_wall min 17.2 / median 22.6ms**
-(p90 120ms 是邻居尖峰)。清净独占窗口可达 ~16 tok/s。
+**实测**:四 prompt 连贯;decode **清净窗口 ~16(prefix-32)/ ~18.9(depool 默认)tok/s**(争抢窗口会假性掉到 ~10,
+**测吞吐务必空载**)。dedup 默认开,host DDR 增量 ~146G(非回退建 codes 池的 ~283G;★省内存看 system used 非进程 RSS,
+pinned 不进 RSS)。GPQA off 见 `accuracy_report.md`。
 
 > ⚠️ **`--max-running-requests 1`,别并发多发**(并发撞争抢窗口会触发 NPU runtime 失稳崩,坑⑭ 同源)。
 > 收服务:跑服务的终端 `Ctrl-C`(优雅释放 HBM);**绝不 `pkill -f sglang.launch_server`**(杀别 session、自杀 shell、留孤儿占 HBM)。
@@ -197,8 +239,9 @@ grep -E "KT_DECODE_TIMING|gen throughput" /tmp/kt_mxfp4_serve.log | tail
 | ③ | `undefined symbol: iqk_mul_mat_moe_arm82` | 取消 `iqk_mul_mat_arm82.cpp` 两行注释 + 重编(已 commit) |
 | ④ | `--verify-sample` 报 `newbyteorder` | patch `0001`(NumPy2) |
 | MXFP4 | CPU MoE 吃 MXFP4 需类型注册 | patch `0002`(`GGML_TYPE_MXFP4=39` + NEON kernel,硬依赖) |
-| ⑤ | `quant fp8 != compressed-tensors` | sglang 切 `dsv4_release@456687a0f` |
-| ⑥/⑥b/⑦ | graph capture/重放崩 / eager 乱码 | 已修(总纲 §6.2);默认 graph-on |
+| ⑤ | `quant fp8 != compressed-tensors` | sglang submodule 钉 `dsv4_release@4ea20e5d3`(干净 clone 自动) |
+| ⑥/⑥b | graph capture/重放崩 | 已修(总纲 §6.2);默认 graph-on |
+| ⑦/⑱ | eager async 乱码 / serving 静默算错 | **已根治(e5f53ad)**;force-sync=0 即对,不再需要 force-sync=1 |
 | ⑬ | MXFP4 输出乱码/对账偏 | nibble 序逐 32-group 重排;`verify_mxfp4_layer.py` bit-exact 闸门 |
 | ⑭ | 服务跑一会儿 `main process disappeared` | 长跑服务在自己终端前台拉 |
 
@@ -211,12 +254,10 @@ grep -E "KT_DECODE_TIMING|gen throughput" /tmp/kt_mxfp4_serve.log | tail
 ```bash
 cd /workspace/code/ktransformers-AK
 apt-get install -y libhwloc-dev libhwloc15                # 每容器
-# 自己终端前台拉(MXFP4,graph-on);先 npu-smi info 选空闲卡
-NPU_DEVICE_ID=<空闲卡> PORT=8020 \
-  KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' \
-  KT_CPUINFER=128 MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 \
-  bash tools/p27_launch_ds4flash_npu.sh
-# 等加载 → health 200 → PORT=8020 bash tools/p27_curl_f2_prompts.sh
+git submodule update --init third_party/sglang           # 钉 dsv4_release@4ea20e5d3
+# 自己终端前台拉(no-arg=最优全量);先 npu-smi info 选空闲卡。首次会 bisheng 自动编 depool 算子
+NPU_DEVICE_ID=<空闲卡> PORT=8020 bash tools/p27_launch_ds4flash_npu.sh
+# 等加载 → health 200 → 自检 15×17=255 → PORT=8020 bash tools/p27_curl_f2_prompts.sh
 ```
 
 ---
@@ -245,11 +286,11 @@ NPU_DEVICE_ID=<空闲卡> PORT=8000 KT_CPUINFER=128 \
 # 默认 KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
 ```
 
-**坑 ⑦(eager 乱码)**:eager 路径 CPU MoE async submit 未 flush → 输出全零("我,我,我…"退化)。
-graph-on 走 host-callback 不涉此坑;仅 eager 回退需 `KT_FORCE_SYNC_SUBMIT=1`:
+**坑 ⑦(eager 乱码)—— 已根治**:eager 路径 CPU MoE async submit 竞态曾致静默算错。**commit `e5f53ad` 已根治**
+(prefill 改同步 submit + 无条件 _wait_device + 保留 subscribe),现在 eager 回退也**不需要 `KT_FORCE_SYNC_SUBMIT=1`**:
 
 ```bash
-NPU_DEVICE_ID=<卡> KT_FORCE_SYNC_SUBMIT=1 EXTRA_FLAGS="--disable-cuda-graph" \
+NPU_DEVICE_ID=<卡> EXTRA_FLAGS="--disable-cuda-graph" \
   MODEL_PATH=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8 bash tools/p27_launch_ds4flash_npu.sh
 ```
 

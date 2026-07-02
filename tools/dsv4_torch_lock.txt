@@ -1,0 +1,8 @@
+# pip constraints:锁死已就位的 torch 全家,任何 sglang 依赖都不许动它们。
+# 用法:  pip install ... -c tools/dsv4_torch_lock.txt
+# 若某依赖硬要求更高 torch,pip 会在这里报冲突(而不是静默升级)——那才是该停下来看的点。
+# 这套版本是本次 910C(A3) + CANN 9.0.0 实测跑通的组合。
+torch==2.8.0+cpu
+torch_npu==2.8.0.post4
+torchvision==0.23.0
+torchaudio==2.11.0+cpu

@@ -1,5 +1,9 @@
 # DeepSeek-V4-Flash 单卡 910B 从 0 拉起服务 —— 全过程实录
 
+> **★ 新机器(910C/A3, W8A8)复现请先看 [`A3_W8A8_数值对齐调查.md`](A3_W8A8_数值对齐调查.md)** —— 2026-07-01 在新 910C(A3)裸机上已把
+> 编译 / 依赖 / 权重 / 算子 / 服务 / **端到端正确输出**全部打通(`The capital of France is`→` Paris.`、`15 * 17 = `→`255`)。
+> 那篇记录了本机专属的环境差异(Python 路径、gcc-13、triton-ascend 版本、custom_transformer/customize 两 vendor、`p27_launch` 的 MODEL_PATH/KT_GGUF_TEMPLATE 必须显式给等)与 NSA 数据对齐改动。本文正文是原参考镜像(910B)的主线。
+>
 > 本文档记录在**干净 container** 上,从源码出发把 DeepSeek-V4-Flash 单卡 Ascend 910B + KT CPU MoE
 > 推理服务拉起来的**全部实际操作**(编译 → 转权重 → 拉起 → 使用 + 踩坑)。命令可直接复制执行。
 >
@@ -92,8 +96,30 @@ CPUINFER_USE_ASCEND_NPU=1 /usr/local/python3.11.14/bin/python3.11 setup.py build
 # 产物 kt-kernel/python/kt_kernel_ext*.so;import 无 undefined symbol
 ```
 
+> ⚠️ **换机提示**:Python 与编译器路径**因机而异**。本镜像 Python 在 `/usr/local/python3.11.14/...`;
+> 别的新机(如某些 910C 主机)可能在 `/opt/buildtools/Python-3.11.4/bin/python3.11`——用 `which python3.11` 找。
+> 默认 gcc 也可能不同,**默认 `gcc --version` < 10 的机器必须显式指定 gcc-13**,见**坑(新机·gcc<10)**。
+
 > ggml 源里 `GGML_TYPE_MXFP4 not handled in switch` 警告**良性**(非 MoE 路径 op 不需 mxfp4 分支)。
 > 换 patch / 改 moe.hpp 后**必须重编**。
+
+### 坑(新机·gcc<10):默认 gcc 9.x → `-std=gnu++20` / `+bf16+i8mm` 编不过
+新机若 `gcc --version` < 10(如 Ubuntu 20.04 默认 gcc-9.4),`setup.py build_ext` 会报两类错:
+`g++: unrecognized command line option '-std=gnu++20'`(gcc-9 只认 `gnu++2a`),以及——若该 CPU 实带
+`bf16/i8mm/sve`(比手册的 Kunpeng 920 更新)——`cc1plus: invalid feature modifier 'bf16' in '-march=...+bf16+i8mm'`
+(`+bf16/+i8mm` modifier 需 gcc ≥ 10)。修:**用 gcc-13/g++-13 重编**(系统装了即可,运行期 `libstdc++.so.6`
+≥ 6.0.30 才能加载 gcc-13 产物;本机已是 6.0.35):
+
+```bash
+cd kt-kernel && rm -rf build/temp.linux-aarch64-cpython-311   # 清掉旧 gcc 的 CMake cache
+CC=/usr/bin/gcc-13 CXX=/usr/bin/g++-13 CPUINFER_USE_ASCEND_NPU=1 \
+  /opt/buildtools/Python-3.11.4/bin/python3.11 setup.py build_ext --inplace
+```
+
+> `CMakeLists.txt` 原先用 `CACHE ... FORCE` 把编译器硬钉 `/usr/bin/gcc`,会**吞掉 `CC/CXX`**;已改为**优先尊重显式
+> `CC/CXX`**(不设时仍回退 `/usr/bin/gcc`,旧环境零回归)。默认 gcc ≥ 10 的机器(手册原镜像)**无需任何额外设置**。
+> 备选:不想换编译器,可 `CPUINFER_ARM_BF16=OFF CPUINFER_ARM_I8MM=OFF CPUINFER_ARM_SVE=OFF` 用 gcc-9 走 NEON
+> baseline(即手册 K920 路径),但放弃该 CPU 的 bf16/i8mm 加速。
 
 ### 坑 ①:hwloc 缺失 → CMake configure 失败
 `CMakeLists.txt` 把 hwloc 设 `REQUIRED`,系统未装则 `None of the required 'hwloc' found`。
@@ -234,6 +260,7 @@ pinned 不进 RSS)。GPQA off 见 `accuracy_report.md`。
 
 | # | 现象 | 修复 |
 |---|------|------|
+| 新机·gcc | `unrecognized '-std=gnu++20'` / `invalid feature modifier 'bf16'` | 默认 gcc<10:`CC=/usr/bin/gcc-13 CXX=/usr/bin/g++-13` 重编(先 `rm -rf build/temp.*`) |
 | ① | CMake 找不到 hwloc | `apt-get install -y libhwloc-dev libhwloc15`(每容器) |
 | ② | llamafile `ggml-impl.h: No such file` | 钉 llama.cpp b3173(`a94e6ff`) |
 | ③ | `undefined symbol: iqk_mul_mat_moe_arm82` | 取消 `iqk_mul_mat_arm82.cpp` 两行注释 + 重编(已 commit) |

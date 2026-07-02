@@ -58,8 +58,15 @@ if(USE_CONDA_TOOLCHAIN)
     set(CMAKE_C_COMPILER   ${CONDA_CC}  CACHE FILEPATH "C compiler" FORCE)
     set(CMAKE_CXX_COMPILER ${CONDA_CXX} CACHE FILEPATH "C++ compiler" FORCE)
 else()
-    # Prefer system compilers explicitly to avoid accidentally picking conda wrappers from PATH
-    if(EXISTS "/usr/bin/gcc" AND EXISTS "/usr/bin/g++")
+    # Prefer system compilers explicitly to avoid accidentally picking conda wrappers from PATH.
+    # Honor an explicit CC/CXX first: some boxes (e.g. newer Kunpeng/910C hosts on Ubuntu 20.04)
+    # default /usr/bin/gcc to gcc-9, which is too old for -std=gnu++20 and the +bf16/+i8mm
+    # -march modifiers this CPU actually supports. Pass CC=gcc-13 CXX=g++-13 to use a newer gcc.
+    if(DEFINED ENV{CC} AND DEFINED ENV{CXX})
+        set(CMAKE_C_COMPILER   "$ENV{CC}"  CACHE FILEPATH "C compiler" FORCE)
+        set(CMAKE_CXX_COMPILER "$ENV{CXX}" CACHE FILEPATH "C++ compiler" FORCE)
+        message(STATUS "Honoring explicit CC=$ENV{CC} CXX=$ENV{CXX}")
+    elseif(EXISTS "/usr/bin/gcc" AND EXISTS "/usr/bin/g++")
         set(CMAKE_C_COMPILER   "/usr/bin/gcc" CACHE FILEPATH "C compiler" FORCE)
         set(CMAKE_CXX_COMPILER "/usr/bin/g++" CACHE FILEPATH "C++ compiler" FORCE)
     endif()

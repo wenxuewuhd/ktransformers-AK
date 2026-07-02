@@ -155,8 +155,11 @@ torch.ops.custom.* 全部就位 OK   # compressor / npu_sparse_attn_sharedkv / n
 ## 4. 装完拉服务(冒烟)
 ```bash
 cd /mnt/workspace/gitCode/ktransformers-AK
-# ★两个默认路径脚本里写死成 /workspace,本机在 /mnt/workspace,必须显式给:
+# ★两个默认路径脚本里写死成 /workspace,本机在 /mnt/workspace,必须显式给;
+# ★CANN 9.0.0 走公开 single-state compressor,必须 export KT_NSA_COMPRESSOR_MODE=single
+#   (默认是 split=旧 8.5.0 私有算子;不设会崩在 compressor 参数不匹配)。
 NPU_DEVICE_ID=1 PORT=8020 SKIP_WARMUP=1 KT_STREAM_WARMUP=0 \
+  KT_NSA_COMPRESSOR_MODE=single \
   MODEL_PATH='/mnt/workspace/models/DeepSeek-V4-Flash-W8A8' \
   KT_GGUF_TEMPLATE='/mnt/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf' \
   EXTRA_FLAGS="--disable-cuda-graph" \

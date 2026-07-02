@@ -238,6 +238,12 @@ NPU_DEVICE_ID=<空闲卡> PORT=8020 \
 - **`SKIP_WARMUP=0` serving 建议开**：去掉脚本默认的 `--skip-server-warmup`，开机暖一次 NPU graph/cache →
   开机第一发不再冷（§7 实测 req1 2.1–2.5→1.8s，两臂区间不重叠，预热 pass 仅 ~5s）。默认 `SKIP_WARMUP=1` 保持基线。
 - graph-on 是默认（勿传 `--disable-cuda-graph`）。eager 回退见[附录 A](#附录-aint8q8_0-cpu-权重旧路径附录) / §6.3。
+- **`KT_NSA_COMPRESSOR_MODE`（跨 CANN 版本兼容开关，`split` 默认 | `single`）**：NSA compressor
+  有两套互斥 ABI —— **CANN 8.5.0** 用私有 19 参 split-state（两个分开的 kv/score buffer），
+  **CANN 9.0.0+** 用公开 18 参 single-state（一个交织 `[kv|score]` state_cache）。纯环境变量选择、
+  **不自动探测**。**本镜像(8.5.0)不设即默认 `split` = 原行为**;若在 **9.0.0** 机器上必须
+  `export KT_NSA_COMPRESSOR_MODE=single`(否则崩在 compressor 参数不匹配)。实现见
+  `hardware_backend/npu/nsa_compressor_mode.py`,细节见 `A3_W8A8_数值对齐调查.md`。
 
 ### 4.5 验证（加载 ~2–3.5 min 热 cache）
 

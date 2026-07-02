@@ -226,6 +226,11 @@ NPU_DEVICE_ID=<空闲卡> PORT=8020 bash tools/p27_launch_ds4flash_npu.sh 2>&1 |
 - `KT_CPUINFER` 默认 128(每 NUMA 16 线程,留 8 核给 NPU host;勿 192 满核 thrash)。
 - 流式 prefill 默认开时,launcher 自动 `SKIP_WARMUP=0` + `KT_STREAM_WARMUP=1`(暖 CPU MoE,否则流式不调 CPU→decode 冷,见 memory `streaming-prefill-decode-cold-cpu-warmup`)。
 - graph-on 是默认(坑⑥/⑥b 已修,见总纲 §6.2),勿传 `--disable-cuda-graph`。
+- **`KT_NSA_COMPRESSOR_MODE`(跨 CANN 版本兼容开关,`split` 默认 | `single`)**:NSA compressor 有两套互斥 ABI——
+  **CANN 8.5.0**(本镜像)用私有 19 参 split-state(kv/score 两个分开 buffer),**CANN 9.0.0+** 用公开 18 参
+  single-state(一个交织 `[kv|score]` state_cache)。纯环境变量选、**不自动探测**。**本镜像(8.5.0)不设即默认 `split`
+  = 原行为**;在 **9.0.0** 机器上必须 `export KT_NSA_COMPRESSOR_MODE=single`(否则崩在 compressor 参数不匹配)。
+  实现 `hardware_backend/npu/nsa_compressor_mode.py`,细节见 [`A3_W8A8_数值对齐调查.md`](A3_W8A8_数值对齐调查.md)。
 
 ### 坑 ⑤:`Quantization method (fp8) does not match (compressed-tensors)`
 sglang 子模块切错 fork(无 KT 补丁)。修:钉 `dsv4_release@4ea20e5d3`(干净 clone `git submodule update --init` 自动钉到主仓记录的 SHA;含 graph 修复 + KT EP wrapper + depool/dynamic/dedup/流式)。

@@ -165,6 +165,13 @@ echo "[p27] ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME}（ATB/vendors 由此派�
 _KML_LIB_DIR="${KML_LIB_DIR:-/usr/local/kml/lib}"
 [[ -d "${_KML_LIB_DIR}" ]] && export LD_LIBRARY_PATH="${_KML_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 
+# Drop any inherited proxy. sglang's startup warmup (SKIP_WARMUP=0) POSTs to the server's OWN
+# port; with http_proxy=127.0.0.1:7890 set, that localhost call is intercepted -> 502 ->
+# "warmup error: AssertionError res=<Response [502]>" -> Initialization failed (server exits).
+# This is exactly why warmup kept being disabled with SKIP_WARMUP=1. A local inference server
+# never needs an outbound proxy, so just unset them (also spares every curl the --noproxy dance).
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+
 # 与 script/launch_ds4flash_sglang.sh 对齐：单卡省略 HCCL/DeepEP/MTP 等；保留 CPU/Ascend 与融合 kernel。
 export SGLANG_SET_CPU_AFFINITY="${SGLANG_SET_CPU_AFFINITY:-1}"
 export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"

@@ -5,6 +5,8 @@
 #endif
 #include <numa.h>
 #include <numaif.h>
+#include <sys/mman.h>  // madvise / MADV_WILLNEED (warm the aliased GGUF mmap into page cache)
+#include <unistd.h>    // sysconf(_SC_PAGESIZE)
 
 #include <algorithm>
 #include <cassert>
@@ -421,6 +423,29 @@ class LLAMA_MOE_TP {
       m_local_up_proj_ = up_proj;
       m_local_down_proj_ = down_proj;
       m_weights_aliased_ = true;
+
+      // Aliasing skips the memcpy that used to (as a side effect) read the whole GGUF into page
+      // cache at load. Restore that warming WITHOUT copying: MADV_WILLNEED kicks off async
+      // readahead of the aliased expert tensors, so by the time traffic arrives the CPU-MoE /
+      // streaming-prefill shared page cache is hot (else the first long prefill pays a one-time
+      // cold read). Non-blocking, best-effort (page-align the start; ignore errors).
+      const size_t gate_bytes = (size_t)config.expert_num * config.intermediate_size * config.hidden_size *
+                                ggml_type_size((ggml_type)config.gate_type) /
+                                ggml_blck_size((ggml_type)config.gate_type);
+      const size_t up_bytes = (size_t)config.expert_num * config.intermediate_size * config.hidden_size *
+                              ggml_type_size((ggml_type)config.up_type) / ggml_blck_size((ggml_type)config.up_type);
+      const size_t down_bytes = (size_t)config.expert_num * config.hidden_size * config.intermediate_size *
+                                ggml_type_size((ggml_type)config.down_type) /
+                                ggml_blck_size((ggml_type)config.down_type);
+      const long pg = sysconf(_SC_PAGESIZE);
+      auto warm = [pg](void* p, size_t n) {
+        if (!p || !n || pg <= 0) return;
+        uintptr_t a = (uintptr_t)p, start = a & ~((uintptr_t)pg - 1);
+        madvise((void*)start, n + (a - start), MADV_WILLNEED);  // best-effort readahead
+      };
+      warm(m_local_gate_proj_, gate_bytes);
+      warm(m_local_up_proj_, up_bytes);
+      warm(m_local_down_proj_, down_bytes);
       return;
     }
 

@@ -75,6 +75,14 @@ fi
 
 MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8}"
 
+# Streaming-prefill checkpoints (only read when KT_PREFILL_STREAM=1). kt_stream_prefill.py
+# reads config.json / model.safetensors.index.json from these; its own defaults are the old
+# image's /workspace/... paths, so DERIVE them from MODEL_PATH here (any new container just
+# needs MODEL_PATH). _CKPT = the W8A8 serving ckpt = MODEL_PATH; _MXFP4_CKPT = the native
+# MXFP4 source = sibling dir with the -W8A8 suffix stripped. Explicit env still wins.
+export KT_PREFILL_STREAM_CKPT="${KT_PREFILL_STREAM_CKPT:-$MODEL_PATH}"
+export KT_MXFP4_CKPT="${KT_MXFP4_CKPT:-${MODEL_PATH%-W8A8}}"
+
 # ---------- KT MoE 最优全量默认（2026-06 验证；任一可被显式 env 覆盖）----------
 # 全开 = depool + dynamic-hot + 流式prefill + side-stream + GGUF dedup：
 #   * 精度对齐 PR（GPQA off 72–75%，commit e5f53ad 根治异步竞态后 force-sync=0 即对）；
@@ -106,6 +114,25 @@ fi
 # ★必须 export：除了 --kt-weight-path（CPU MoE）外，GGUF dedup（KT_MXFP4_GGUF_DEDUP=1）从
 # os.environ 读 KT_GGUF_TEMPLATE 来复用 CPU 的 mmap GGUF；不 export → dedup 报 "template empty" 回退建 codes 池。
 export KT_GGUF_TEMPLATE
+
+# Prewarm the MXFP4 GGUF into page cache in the BACKGROUND, overlapping the ~min-long model load.
+# With the single-NUMA weight-alias (kt-kernel moe.hpp), the GGUF page cache IS the CPU-MoE weight
+# store and streaming-prefill's source; if it's cold the FIRST request pays a one-time ~full-GGUF
+# disk read (observed 193s vs 20s warm). Reading it here (cat -> /dev/null) makes the cache hot by
+# the time the server accepts traffic, so no request eats the warm-up. Skip with KT_PREWARM_GGUF=0.
+if [[ "${KT_PREWARM_GGUF:-1}" == "1" && -n "${KT_GGUF_TEMPLATE:-}" ]]; then
+  _gguf_dir="$(dirname "${KT_GGUF_TEMPLATE}")"
+  _gguf_glob="$(basename "${KT_GGUF_TEMPLATE}")"; _gguf_glob="${_gguf_glob/\{layer_idx\}/*}"
+  if compgen -G "${_gguf_dir}/${_gguf_glob}" > /dev/null 2>&1; then
+    _gguf_sz="$(du -shc ${_gguf_dir}/${_gguf_glob} 2>/dev/null | tail -1 | cut -f1)"
+    echo "[p27] prewarming page cache (bg): ${_gguf_dir}/${_gguf_glob} (~${_gguf_sz})"
+    ( cat ${_gguf_dir}/${_gguf_glob} > /dev/null 2>&1 ) &
+    _KT_PREWARM_PID=$!
+  else
+    echo "[p27][warn] KT_PREWARM_GGUF=1 but no files match ${_gguf_dir}/${_gguf_glob}; skip prewarm"
+  fi
+fi
+
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"   # ≥ 常见 prompt(GPQA max 2577)，避坑⑯ NSA 跨 chunk 崩；32k/64k 长序列须显式调更大
 QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
 # CPU MoE is memory-bandwidth-bound; scale threads to raise effective DDR bandwidth.
@@ -121,10 +148,41 @@ QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
 # live-server-contention artifact, not intrinsic. Override with KT_CPUINFER (160 fine too).
 # (profiling: doc/zh/dsv4_single_npu/graph_decode_bandwidth_handoff.md, 2026-06-09)
 KT_CPUINFER="${KT_CPUINFER:-128}"
+# kt-kernel builds one NUMA subpool per threadpool_count and binds subpool i to NUMA
+# node i (numa_nodes defaults to 0,1,...,count-1). MUST equal the box's NUMA node count,
+# else you get "NUMA node N not found" + set_mempolicy failures for the missing nodes.
+# Reference image = 8 NUMA nodes (default 8). Single-NUMA boxes (e.g. 40-core/1-node 910C
+# A3 host): set KT_THREADPOOL_COUNT=1 and KT_CPUINFER<=cores (~32). threads/subpool =
+# KT_CPUINFER / KT_THREADPOOL_COUNT.
+KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-8}"
 PORT="${PORT:-8000}"
-ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
+# ASCEND_TOOLKIT_HOME is the SINGLE anchor — ATB(nnal), opp vendors, custom-op paths all derive
+# from it. Take it from the environment (CANN's set_env.sh exports both ASCEND_TOOLKIT_HOME and
+# ASCEND_HOME_PATH); if absent, auto-detect known layouts; if still not found, HARD-FAIL with
+# guidance instead of silently using a wrong hardcoded path (that's what broke on new containers).
+if [[ -z "${ASCEND_TOOLKIT_HOME:-}" ]]; then
+  ASCEND_TOOLKIT_HOME="${ASCEND_HOME_PATH:-}"
+fi
+if [[ -z "${ASCEND_TOOLKIT_HOME:-}" ]]; then
+  for _cand in /usr/local/Ascend/ascend-toolkit/latest \
+               "${HOME}"/Ascend/ascend-toolkit/latest \
+               /home/developer/Ascend/cann-9.0.0 \
+               /home/*/Ascend/cann-* ; do
+    [[ -f "${_cand}/set_env.sh" ]] && { ASCEND_TOOLKIT_HOME="${_cand}"; break; }
+  done
+  unset _cand
+fi
+if [[ -z "${ASCEND_TOOLKIT_HOME:-}" || ! -f "${ASCEND_TOOLKIT_HOME}/set_env.sh" ]]; then
+  echo "[p27][ERROR] 未拿到有效的 ASCEND_TOOLKIT_HOME(CANN 根)。请显式设置,或先 source CANN 的 set_env.sh:" >&2
+  echo "  export ASCEND_TOOLKIT_HOME=/home/developer/Ascend/cann-9.0.0   # ← 按本机实际路径" >&2
+  exit 1
+fi
 export ASCEND_TOOLKIT_HOME
-export LD_LIBRARY_PATH="/usr/local/kml/lib:${LD_LIBRARY_PATH:-}"
+echo "[p27] ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME}（ATB/vendors 由此派生）"
+# KML (Kunpeng Math Library) — only on Kunpeng hosts; prepend only if present so a missing
+# dir doesn't sit dead in LD_LIBRARY_PATH. Override with KML_LIB_DIR.
+_KML_LIB_DIR="${KML_LIB_DIR:-/usr/local/kml/lib}"
+[[ -d "${_KML_LIB_DIR}" ]] && export LD_LIBRARY_PATH="${_KML_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 
 # 与 script/launch_ds4flash_sglang.sh 对齐：单卡省略 HCCL/DeepEP/MTP 等；保留 CPU/Ascend 与融合 kernel。
 export SGLANG_SET_CPU_AFFINITY="${SGLANG_SET_CPU_AFFINITY:-1}"
@@ -162,9 +220,24 @@ fi
 #    `set -euo pipefail` 下会触发 unbound variable 直接退出。故 source 期间临时放开 -e/-u，之后恢复。
 set +eu
 ASCEND_OPP_VENDORS_DIR="${ASCEND_TOOLKIT_HOME}/opp/vendors"
+# ATB (nnal) set_env location is NOT under the toolkit dir and differs per image:
+#   reference image /usr/local/Ascend/nnal/...  vs  this box /home/developer/Ascend/nnal/...
+# It's the sibling `nnal/atb` of the Ascend root (= dir that holds the toolkit). Honor an
+# explicit ATB_SET_ENV, else search derived + known locations; silent-skip only if none exist
+# (then ATB ops won't register — set ATB_SET_ENV to fix).
+if [[ -z "${ATB_SET_ENV:-}" ]]; then
+  _ascend_root="$(dirname "${ASCEND_TOOLKIT_HOME}")"                 # e.g. /home/developer/Ascend/cann-9.0.0 -> .../Ascend
+  [[ "$(basename "${_ascend_root}")" == "ascend-toolkit" ]] && _ascend_root="$(dirname "${_ascend_root}")"  # /usr/local/Ascend/ascend-toolkit -> /usr/local/Ascend
+  for _atb in "${_ascend_root}/nnal/atb/set_env.sh" \
+              /home/developer/Ascend/nnal/atb/set_env.sh \
+              /usr/local/Ascend/nnal/atb/set_env.sh; do
+    [[ -f "${_atb}" ]] && { ATB_SET_ENV="${_atb}"; break; }
+  done
+fi
+[[ -n "${ATB_SET_ENV:-}" ]] && echo "[p27] ATB set_env: ${ATB_SET_ENV}" || echo "[p27][warn] ATB set_env not found (ATB ops may be unavailable); set ATB_SET_ENV=<path> if needed"
 for _kt_env in \
   "${ASCEND_TOOLKIT_HOME}/set_env.sh" \
-  /usr/local/Ascend/nnal/atb/set_env.sh \
+  "${ATB_SET_ENV:-/nonexistent}" \
   "${ASCEND_OPP_VENDORS_DIR}/customize/bin/set_env.bash" \
   "${ASCEND_OPP_VENDORS_DIR}/custom_transformer/bin/set_env.bash"; do
   if [[ -f "${_kt_env}" ]]; then
@@ -172,7 +245,7 @@ for _kt_env in \
     source "${_kt_env}"
   fi
 done
-unset _kt_env
+unset _kt_env _atb _ascend_root
 set -eu
 
 ulimit -n 65536 2>/dev/null || true
@@ -246,7 +319,7 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --kt-method LLAMAFILE \
   --kt-num-gpu-experts "${KT_NUM_GPU_EXPERTS:-32}" \
   --kt-weight-path "$KT_GGUF_TEMPLATE" \
-  --kt-threadpool-count 8 \
+  --kt-threadpool-count "$KT_THREADPOOL_COUNT" \
   --kt-cpuinfer "$KT_CPUINFER" \
   --max-running-requests 1 \
   --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \

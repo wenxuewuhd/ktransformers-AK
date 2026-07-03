@@ -5,7 +5,17 @@
 set -euo pipefail
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
-PYBIN="${PYTHON_BIN:-${PYBIN:-/usr/local/python3.11.14/bin/python3.11}}"
+# Python: honor PYTHON_BIN/PYBIN, else the manual image path, else auto-detect
+# (new hosts differ, e.g. /opt/buildtools/Python-3.11.4/bin/python3.11).
+PYBIN="${PYTHON_BIN:-${PYBIN:-}}"
+if [[ -z "$PYBIN" || ! -x "$PYBIN" ]]; then
+  for cand in /usr/local/python3.11.14/bin/python3.11 \
+              /opt/buildtools/Python-3.11.4/bin/python3.11 \
+              "$(command -v python3.11 2>/dev/null)" \
+              "$(command -v python3 2>/dev/null)"; do
+    [[ -n "$cand" && -x "$cand" ]] && { PYBIN="$cand"; break; }
+  done
+fi
 
 "$PYBIN" - <<'PY'
 import json
@@ -91,7 +101,7 @@ prompts = [
         "Explain the difference between supervised and unsupervised learning in three short paragraphs.\n\n",
     ),
     (3, 80, "请用一句话解释什么是 transformer 模型："),
-    (4, 1024, "什么是 transformer 模型："),
+    (4, 256, "什么是 transformer 模型："),
     (5, 1024, _p5_short_text),  # SHORT-context needle probe (dense, NSA-safe) -- discriminator
     (6, 1024, _p6_text),  # ~7k prefill, needle at MIDDLE (Entry 105) -- NSA selection discriminator
     (7, 1024, _p7_tail_text),  # ~7k prefill, needle at TAIL (Entry 205, NSA dense window)

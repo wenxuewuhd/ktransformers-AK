@@ -464,6 +464,54 @@ HBM 总可用 **60.50 GB**（64GB − 驱动 ~3.5GB）。拉起日志实测：
 
 ---
 
+### 7.1.1 权重分布【正推】+ 激活线性模型（当前配置 mem-fraction-static=0.85 / N=32 / W8A8 / ctx 65536，2026-07-08）
+
+> 与 §7.1（旧 910B / 0.72 / MXFP4-NZ 常驻，数字多为反推/估算）不同：本节权重分项**逐张量正推**自 safetensors 头（dtype+shape），激活模型用一次 24K 单块 prefill 的实测峰值标定。当前配置常驻专家是 **W8A8 INT8（非 MXFP4-NZ）**，故权重更大。
+
+**A. 初始化实测（启动日志）**：HBM 可见 **61.03 GB**。
+
+| 块 | 大小 | 来源 |
+|---|---|---|
+| 模型权重（NPU 驻留） | **48.32 GB** | `Load weight end … mem usage=48.32, avail=12.71` |
+| KV pool（预分配，NSA 压缩） | **~3.66 GB** | avail 12.71→9.05；`max_total_num_tokens=577536` |
+| NPU graph buffer | **0.27 GB** | `Capture npu graph … mem usage=0.27` |
+| **初始化后剩余（激活全从这出）** | **~8.8 GB** | `avail mem=8.79` |
+
+**B. 48.32 GB 权重正推分解**（单专家 W8A8 = `3×hidden(4096)×moe_inter(2048)` = 25.17M 参数 = **25.2 MB**）：
+
+| 项 | 正推式 | 占用 |
+|---|---|---|
+| 驻留 routed 专家 32/层 | 32 × 43 × 25.2 MB | **34.67 GB** |
+| KT_STREAM depool 预留槽 | 一层 256 专家 staging(INT8)，shape `(256,4096,4096)+(256,2048,4096)` | **6.44 GB** |
+| 非专家层权重 × 43 | 158.4 MB/层 × 43 | **6.81 GB** |
+| embed + head（**未 tie**，各 1.06） | 129280×4096 BF16 ×2 | 2.12 GB |
+| **合计** | | **≈ 50**（实测 48.32，差 ~1.7 = 驻留专家与 depool 槽部分共享 staging） |
+| ~~MTP/nextn 草稿层~~ | `mtp.0.*` 含 256 专家 ~6.5GB | **非投机服务不加载** |
+
+- **每层非专家 158.4 MB 明细**：`attn.wo_a`(8192,4096)BF16 **67.1**（=NSA Lightning-Indexer 投影，8192=index_n_heads 64×index_head_dim 128）、`attn.wq_b`(32768,1024)I8 33.6、`attn.wo_b`(4096,8192)I8 33.6、`attn.wq_a` 8.4、`attn.wkv`(512,4096,KV 压到 512)4.2、`ffn.gate`+`tid2eid`+`hc_*`+norm ~11.3。**NSA indexer 无独立权重桶,投影就在 `attn.*` 里**。
+- **要点**：驻留专家 34.67 + depool 槽 6.44 = **41 GB(85%)**。
+
+**C. 激活(特征)vs 序列长度 —— 线性,不是 S²**（NSA 把每 token 注意力上限锁在 `index_topk=512`,消掉 S² 项）：
+
+- 标定：24K 单块 prefill 实测激活峰值 ≈ **7.5 GB**（allocated 52.5→59.97）⇒ **c ≈ 0.31 GB / 1K token**（~320 KB/token）。
+- 公式：**prefill 激活(S) ≈ 0.31 GB × S/1000**。构成:MoE top-6 中间 ~73KB/token + indexer ~16KB + 层间 hidden 8KB×多份 + KT_STREAM depool 瞬时缓冲。
+- 反推上限:余量 8.8 GB ÷ 0.31 ≈ **单块 prefill ≤ ~28K token** 才不 OOM（24K 已贴边;65536 单块要 ~21GB 必炸）。
+- KV **不随运行时增长**（启动一次性预留 3.66GB 固定池）⇒ 运行时 OOM 100% 来自 prefill 激活,与 KV 无关。
+
+**D. 长上下文两种失败模式(同一死结两面,均需修)**：
+
+| chunk 设置 | 结果 | 机理 |
+|---|---|---|
+| 65536(单块) | **OOM** → `KT_STREAM streaming failed → hybrid fallback` 死循环 | 激活 ~21GB ≫ 余量 8.8GB |
+| 8192(分块) | **AssertionError** `loc.numel vs cache.shape` 崩服务 | 坑⑯:NSA compressor 跨 chunk 索引对齐缺口(见 §6.6/坑⑯) |
+
+**E. 杠杆**（`mem-fraction-static` **无效**:只砍 KV 池,权重 48.32 死的,0.85→0.80 会把 KV 从 3.66 压到 ~0.7 撑不住 64k ctx）:
+- **降 `--kt-num-gpu-experts`**:32→16 省 **17.3 GB**(代价:更多专家落 CPU,decode 略慢);
+- **关 depool 流式槽**(`KT_PREFILL_STREAM=0`)省 6.44 GB(代价:prefill 慢);
+- 根治长上下文 = 修坑⑯(分块 compressor)让小 chunk 能跑 → 激活压到 ~2.6GB(8192)稳。
+
+---
+
 ## 8. 关键约束 / 红线
 
 | # | 红线 | 后果 |

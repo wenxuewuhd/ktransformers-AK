@@ -41,6 +41,11 @@ set -euo pipefail
 : "${SGLKNPU_URL:=https://github.com/sgl-project/sgl-kernel-npu.git}"
 : "${SGLKNPU_TAG:=2026.6.2}"
 
+# ★钉版本(可复现):三个三方仓都不跟随移动分支。ops-transformer 的 NSA 算子只在 master,
+#   但 master 会持续漂;下面钉的是**本项目实测编译+跑通的 commit**。想升级请改这里并重测。
+: "${OPS_TF_COMMIT:=dd9f31f34}"     # ops-transformer master 上实测可用的 commit
+: "${RECIPES_COMMIT:=c5cc95e}"      # cann-recipes-infer(当时的 origin/master)
+
 # pip 约束:锁死 torch 全家,任何依赖都不许动它们
 TORCH_LOCK="$(dirname "$(readlink -f "$0")")/dsv4_torch_lock.txt"
 
@@ -119,8 +124,12 @@ phase_sglang_deps(){
 # cann-recipes-infer 的融合算子:HcPre/HcPost/RmsNormDynamicQuant/
 # InplacePartialRotaryMul/SwigluClipQuant/MoeGatingTopKHash/... → vendor "customize"
 phase_vendor_customize(){
-  log "phase vendor_customize: 编 + 装 customize vendor(cann-recipes-infer)"
+  log "phase vendor_customize: 编 + 装 customize vendor(cann-recipes-infer @ $RECIPES_COMMIT)"
   [ -d "$RECIPES_REPO" ] || git clone "$RECIPES_URL" "$RECIPES_REPO"
+  # ★钉版本:不跟随 origin/master
+  git -C "$RECIPES_REPO" fetch --quiet origin || true
+  git -C "$RECIPES_REPO" checkout --quiet --detach "$RECIPES_COMMIT" \
+    || die "cann-recipes-infer checkout $RECIPES_COMMIT 失败(工作树脏?先 git -C $RECIPES_REPO status)"
   source "$CANN_HOME/set_env.sh"; umask 0022
   cd "$RECIPES_REPO/ops/ascendc"
   chmod -R go-w .                                  # ★坑:防 msopgen 安全校验 abort
@@ -149,12 +158,14 @@ phase_custom_ops(){
 # ★vendor 命名怪癖:ops-transformer 会给 vendor 名自动追加 "_transformer",
 #   所以传 --vendor_name=custom,最终得到 vendor "custom_transformer"。
 phase_vendor_transformer(){
-  log "phase vendor_transformer: 编 + 装 custom_transformer vendor(ops-transformer master)"
+  log "phase vendor_transformer: 编 + 装 custom_transformer vendor(ops-transformer @ $OPS_TF_COMMIT)"
   [ -d "$OPS_TF_REPO" ] || git clone "$OPS_TF_URL" "$OPS_TF_REPO"
-  # 用干净 worktree 编(master 工作树若脏会污染产物)
+  # 用干净 worktree 编(master 工作树若脏会污染产物)。★钉版本:worktree 直接 detach 到实测 commit,
+  #   不跟 master(NSA 算子只在 master,但 master 会持续漂,跟着走会编出没测过的算子)。
   if [ ! -d "$OPS_TF_WORKTREE" ]; then
     git -C "$OPS_TF_REPO" fetch origin master
-    git -C "$OPS_TF_REPO" worktree add "$OPS_TF_WORKTREE" master
+    git -C "$OPS_TF_REPO" worktree add --detach "$OPS_TF_WORKTREE" "$OPS_TF_COMMIT" \
+      || die "ops-transformer worktree @ $OPS_TF_COMMIT 创建失败"
   fi
   source "$CANN_HOME/set_env.sh"; umask 0022
   cd "$OPS_TF_WORKTREE"; chmod -R go-w .

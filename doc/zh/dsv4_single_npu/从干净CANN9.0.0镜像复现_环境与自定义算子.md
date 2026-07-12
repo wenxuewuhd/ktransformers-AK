@@ -34,12 +34,15 @@
 
 **四个仓库**(脚本缺失会自动 clone):
 
-| 用途 | 仓库 / 分支 | 说明 |
+| 用途 | 仓库 / **钉的版本** | 说明 |
 |---|---|---|
-| 主仓(kt-kernel + sglang 子模块) | `ktransformers-AK`;sglang 子模块 = `wenxuewuhd/sglang-dsv4 @ dsv4_release`(`4ea20e5d`) | NPU 主干 + CPU MoE 封装 |
-| NSA/DSA 算子 → **custom_transformer** vendor | `gitcode.com/cann/ops-transformer` **master** | compressor / sparse_attn_sharedkv / quant_lightning_indexer(9.0.0 分支已删,只在 master) |
-| 融合算子 → **customize** vendor + **custom_ops** binding | `gitcode.com/cann/cann-recipes-infer` | HcPre/HcPost/RmsNormDynamicQuant/… + `torch.ops.custom.*` 绑定 |
-| NPU 内核 | `github.com/sgl-project/sgl-kernel-npu` **tag 2026.6.2** | sgl_kernel_npu / deep_ep / attentions / torch_memory_saver |
+| 主仓(kt-kernel + sglang 子模块) | `ktransformers-AK`;sglang 子模块 @ `dsv4_release` | NPU 主干 + CPU MoE 封装 |
+| NSA/DSA 算子 → **custom_transformer** vendor | `gitcode.com/cann/ops-transformer` @ **`dd9f31f34`** | compressor / sparse_attn_sharedkv / quant_lightning_indexer。**只在 master 有**(9.0.0 分支已删),但 master 会漂 → **钉住实测 commit** |
+| 融合算子 → **customize** vendor + **custom_ops** binding | `gitcode.com/cann/cann-recipes-infer` @ **`c5cc95e`** | HcPre/HcPost/RmsNormDynamicQuant/… + `torch.ops.custom.*` 绑定 |
+| NPU 内核 | `github.com/sgl-project/sgl-kernel-npu` @ tag **`2026.6.2`** | sgl_kernel_npu / deep_ep / attentions / torch_memory_saver |
+
+> **三个三方仓全部钉版本、不跟随移动分支**(脚本里 `OPS_TF_COMMIT` / `RECIPES_COMMIT` / `SGLKNPU_TAG`)。
+> 想升级:改这三个变量并**重跑完整验证**(import gate + 冒烟 + 数值对齐),别直接跟 master。
 
 > **一句话架构**：三件套 = ① `customize` vendor(aclnn 融合算子.so)+ ② `custom_transformer` vendor(NSA 算子.so)+ ③ `custom_ops` python 绑定(把①②的 aclnn 暴露成 `torch.ops.custom.*`)。缺任一个,forward 就会在 `aclnnXxx not in libopapi.so` 或 `torch.ops.custom.xxx 不存在` 处崩。
 
@@ -90,6 +93,7 @@ bash tools/setup_dsv4_env_from_clean_cann.sh all      # 全量;或逐阶段跑(�
 
 ### 2.3 customize vendor(cann-recipes-infer)
 ```bash
+git -C cann-recipes-infer fetch origin && git -C cann-recipes-infer checkout --detach c5cc95e   # ★钉版本
 cd cann-recipes-infer/ops/ascendc
 source $CANN_HOME/set_env.sh; umask 0022; chmod -R go-w .
 bash build.sh -c ascend910_93            # A3;默认编全部融合算子
@@ -105,9 +109,11 @@ USE_NINJA=1 bash build_and_install.sh    # setup.py build_ext + bdist_wheel + pi
 → 装出 `custom_ops` wheel(本机 `custom_ops 1.0`)。它注册 `torch.ops.custom.*` 的 python binding,底层 aclnn 由上面两个 vendor 提供。
 
 ### 2.5 custom_transformer vendor（ops-transformer master）★最关键
-NSA/DSA 三个算子在 **9.0.0 分支被删了**,只在 **master** 的 `experimental/attention/`。用干净 worktree 编,避免脏工作树污染：
+NSA/DSA 三个算子在 **9.0.0 分支被删了**,只在 **master** 的 `experimental/attention/`。用干净 worktree 编,避免脏工作树污染；
+**并钉住实测 commit(master 会持续漂,跟着走会编出没测过的算子)**：
 ```bash
-git -C ops-transformer worktree add ../ops-transformer-master master
+git -C ops-transformer fetch origin master
+git -C ops-transformer worktree add --detach ../ops-transformer-master dd9f31f34   # ★钉版本
 cd ops-transformer-master
 source $CANN_HOME/set_env.sh; umask 0022; chmod -R go-w .
 bash build.sh --pkg --experimental --soc=ascend910_93 --vendor_name=custom \
@@ -181,14 +187,13 @@ launcher 需要**两份权重**,都不在仓库里,必须自备:
 
 | 权重 | 用途 | 从哪来 |
 |---|---|---|
-| **W8A8 safetensors**(`MODEL_PATH`) | NPU 侧(attention / 常驻专家 / embed / lm_head) | 官方 DeepSeek-V4-Flash checkpoint 经 **modelslim W8A8 量化** |
-| **43 层 MXFP4 GGUF**(`KT_GGUF_TEMPLATE`) | CPU offload MoE(kt-kernel)+ depool 流式 prefill | 由**官方原生 MXFP4 专家权重**无损 bit-repack |
+| **W8A8 safetensors**(`MODEL_PATH`) | NPU 侧(attention / 常驻专家 / embed / lm_head) | **直接下载官方开源的 W8A8 量化权重**(无需自己量化) |
+| **43 层 MXFP4 GGUF**(`KT_GGUF_TEMPLATE`) | CPU offload MoE(kt-kernel)+ depool 流式 prefill | 由**官方原生 MXFP4 专家权重**无损 bit-repack(本仓脚本转换) |
 
-> ### ⚠️ 硬约束:两份权重的「量化基底」必须一致(坑⑰)
-> CPU 侧 GGUF 与 NPU 侧 W8A8 **必须来自同一个量化基底**(quarot 旋转)。若你**自己**用 modelslim 量化 W8A8、
-> 而 GGUF 来自官方原生 MXFP4(未旋转),两边基底不一致 → **输出乱码**(且不报错,极难查)。
-> 详见 [`modelslim_quarot_basis_gguf_pitfall.md`](modelslim_quarot_basis_gguf_pitfall.md)。
-> **最稳妥:两份权重同源**(要么都用官方发布的,要么自量化时保证 GGUF 也走同一基底)。
+> ### ⚠️ 别自己重新量化 W8A8(坑⑰)
+> CPU 侧 GGUF 与 NPU 侧 W8A8 **必须同一量化基底**(quarot 旋转)。**直接用官方发布的 W8A8 就天然一致**;
+> 但如果你自己用 modelslim 重新量化 W8A8、而 GGUF 来自官方原生 MXFP4(未旋转基底),
+> **两边基底不一致 → 输出乱码,且不报错、极难查**。详见 [`modelslim_quarot_basis_gguf_pitfall.md`](modelslim_quarot_basis_gguf_pitfall.md)。
 
 **MXFP4 GGUF 转换 → 见 [`mxfp4_gguf_conversion.md`](mxfp4_gguf_conversion.md)**(独立完整指南:转换 + 三级校验 + kernel 数值对账)。要点:
 

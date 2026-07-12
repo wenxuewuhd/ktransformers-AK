@@ -48,3 +48,10 @@ tools/longseq_dbg/expert_hist.pt
 tools/longseq_dbg/expert_hist_top*.pt
 tools/longseq_dbg/*_summary_top*.json
 !tools/longseq_dbg/expert_hist_realtext_summary_top32.json
+.opencode/
+
+# 评测/实验产物(evalscope 输出、跑分日志)——不入库
+eval_gpqa_*/
+eval_gpqa_*.log
+rep10_clean.log
+evalscope/

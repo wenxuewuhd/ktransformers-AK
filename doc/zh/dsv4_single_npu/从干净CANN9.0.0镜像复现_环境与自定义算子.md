@@ -1,12 +1,23 @@
 # 从干净 CANN 9.0.0 镜像复现：DeepSeek-V4-Flash 单卡 910C(A3) 环境 + 自定义算子
 
-> 目标：在一台**只装了 CANN 9.0.0 的干净镜像**上,从 0 把 DSV4-Flash 单卡 W8A8 服务需要的
-> **自定义算子(三件套)+ sglang 依赖 + sgl_kernel_npu + kt-kernel** 全部装好,跑通 import gate。
-> 本文 = 本次在新 910C(A3) 裸机实测跑通的**确切步骤 + 每一步的坑**,配套脚本一键可跑:
+> 目标：在一台**只装了 CANN 9.0.0 的干净镜像**上,从 0 把 DSV4-Flash 单卡 W8A8 服务跑起来。
+> 本文 = 在新 910C(A3) 裸机实测跑通的**确切步骤 + 每一步的坑**。
+>
+> **⚠️ 完整链路 = 四段,缺一段服务起不来:**
+>
+> | # | 段 | 覆盖在哪 | 一键脚本 |
+> |---|---|---|---|
+> | 1 | **算子 + 依赖**(三件套 vendor / custom_ops / sgl_kernel_npu / kt-kernel / sglang deps) | §1–§2(本文主体) | `setup_dsv4_env_from_clean_cann.sh` |
+> | 2 | **depool 的 AscendC MXFP4 算子**(`KT_MXFP4_DEPOOL=1` 是 launcher **默认**,所以**默认必需**) | **§2.9**(新增) | 首次用到时自动 bisheng 编译 |
+> | 3 | **模型权重 + MXFP4 GGUF**(W8A8 ckpt + 43 层 GGUF;不备好 launcher 直接找不到权重) | **§3**(新增,链到转换指南) | `batch_convert_mxfp4_layers_mp.py` |
+> | 4 | 拉服务 + 冒烟 | §5 | `p27_launch_ds4flash_npu.sh` |
+>
+> 早期版本只写了第 1 段 —— **开源用户照着装完算子仍跑不起来**,故补齐 2/3 段。
 >
 > - 脚本:[`tools/setup_dsv4_env_from_clean_cann.sh`](../../../tools/setup_dsv4_env_from_clean_cann.sh)
 > - 依赖清单:[`tools/dsv4_sglang_base_reqs.txt`](../../../tools/dsv4_sglang_base_reqs.txt) · [`tools/dsv4_torch_lock.txt`](../../../tools/dsv4_torch_lock.txt)
-> - 装完拉服务:[`tools/p27_launch_ds4flash_npu.sh`](../../../tools/p27_launch_ds4flash_npu.sh)(见文末)
+> - 权重/GGUF:[`mxfp4_gguf_conversion.md`](mxfp4_gguf_conversion.md)(转换 + 三级校验,面向开源用户)
+> - 装完拉服务:[`tools/p27_launch_ds4flash_npu.sh`](../../../tools/p27_launch_ds4flash_npu.sh)(见 §5)
 > - 相关:memory `dsv4-910c-launch-blockers` / `sgl-kernel-npu-source-build-pitfalls` / `kt-kernel-gcc13-new-host-build`;数值正确性见 [`A3_W8A8_数值对齐调查.md`](A3_W8A8_数值对齐调查.md)。
 
 ---
@@ -61,6 +72,9 @@ bash tools/setup_dsv4_env_from_clean_cann.sh all      # 全量;或逐阶段跑(�
 | `sgl_kernel_npu` | 源码编 sgl_kernel_npu 全家(tag 2026.6.2) | 缺 `-ldl`;deep_ep 只读重装;别删 tracked 的 `attentions/build/` |
 | `kt_kernel` | 编 kt-kernel(gcc-13 + ARM 扩展全关) | SVE=ON → MXFP4 MoE `llamafile not supported` |
 | `verify` | import gate + `torch.ops.custom.*` 就位检查 | — |
+
+> ⚠️ **脚本只覆盖上表(= 第 1 段)。** 跑完 `verify` 通过 ≠ 能起服务,还差:
+> **§2.9 depool 的 AscendC MXFP4 算子**(默认路径必需)+ **§3 模型权重与 MXFP4 GGUF**。
 
 ---
 
@@ -137,9 +151,55 @@ source $CANN_HOME/opp/vendors/customize/bin/set_env.bash
 ```
 (`p27_launch_ds4flash_npu.sh` 已内置这些 source。)
 
+### 2.9 depool 的 AscendC MXFP4 算子 ★默认必需(setup 脚本不覆盖)
+
+`KT_MXFP4_DEPOOL` 在 launcher 里**默认 =1**,而 depool 需要一个 **AscendC device kernel**
+(MXFP4 dequant + ND→NZ,device→device,ctypes 调)。**`setup_dsv4_env_from_clean_cann.sh` 不编它**,
+必须单独处理,否则第一次长 prefill 就崩在找不到 `libmxfp4fused.so`。
+
+- **源码已入库**:[`tools/ascendc_mxfp4/`](../../../tools/ascendc_mxfp4/)(`mxfp4_{fused,dq}_kernel.cpp` + host launcher `mxfp4_fused_op.py` + 自验)。
+- **`.so` 被 gitignore(不入库)→ 换机/首跑必须现编。**
+- **方式 1(推荐,零操作)**:depool 首次用到算子时**自动 bisheng 编译并缓存**(源码比 `.so` 新会自动重编)。只需启动时让 `KT_MXFP4_OP_DIR` 指向本仓的 `tools/ascendc_mxfp4`(launcher 已默认)。
+- **方式 2(手动确认编译链)**:
+  ```bash
+  cd tools/ascendc_mxfp4
+  CANN=$CANN_HOME; TK=$CANN/aarch64-linux/tikcpp     # ★用 9.0.0 的 CANN_HOME(总纲 §4.6 里写的 8.5.0 路径已过时)
+  bisheng -x asc --cce-aicore-arch=dav-c220 -O2 -std=c++17 -fPIC -shared \
+    -I$TK/tikcfw -I$TK/tikcfw/impl -I$TK/tikcfw/interface -I$TK/tikcfw/lib \
+    -I$CANN/aarch64-linux/include \
+    mxfp4_fused_kernel.cpp -o libmxfp4fused.so \
+    -L$CANN/aarch64-linux/lib64 -lruntime -lascendcl    # 无输出即成功
+  ASCEND_RT_VISIBLE_DEVICES=<空卡> python3 test_fused_e2e.py   # 算子自验
+  ```
+- **不想用 depool**:显式 `KT_MXFP4_DEPOOL=0`,则不需要此算子(但会退回 277GB 常驻 W8A8 池,内存代价大)。详见总纲 §4.6。
+
 ---
 
-## 3. 验证 import gate
+## 3. 模型权重与 MXFP4 GGUF ★算子装完 ≠ 能跑
+
+launcher 需要**两份权重**,都不在仓库里,必须自备:
+
+| 权重 | 用途 | 从哪来 |
+|---|---|---|
+| **W8A8 safetensors**(`MODEL_PATH`) | NPU 侧(attention/常驻专家/embed) | 官方 DeepSeek-V4-Flash checkpoint 经 **modelslim W8A8 量化**得到;量化坑见 [`modelslim_quarot_basis_gguf_pitfall.md`](modelslim_quarot_basis_gguf_pitfall.md) |
+| **43 层 MXFP4 GGUF**(`KT_GGUF_TEMPLATE`) | CPU offload MoE(kt-kernel)+ depool 流式 prefill | 由**官方原生 MXFP4 专家权重**无损 bit-repack 而来 |
+
+**MXFP4 GGUF 转换 → 见 [`mxfp4_gguf_conversion.md`](mxfp4_gguf_conversion.md)**(独立完整指南:转换 + 三级校验 + kernel 数值对账)。要点:
+
+```bash
+# 依赖:llama.cpp 子模块(公开 tag b3173) + patch 0001(NumPy2) / 0002(MXFP4 类型)——见总纲 §4.2
+python3 tools/batch_convert_mxfp4_layers_mp.py --out-dir /path/to/cache ...   # 全量 43 层,多进程
+python3 tools/verify_mxfp4_gguf_set.py --dir /path/to/cache ...               # L1 齐全+尺寸 / L2 sha256 / L3 bit-exact
+```
+- 全程**无损 bit-repack**(不是再量化):GGUF 反量化与官方 checkpoint 反量化**逐元素 bit-exact**;
+- 校验清单 [`tools/mxfp4_gguf_sha256.txt`](../../../tools/mxfp4_gguf_sha256.txt) 可直接比对;
+- 换新机/改 kernel 后建议再跑一次 kernel 数值对账(cosine ≥ 0.999)。
+
+> **路径坑**:launcher 里 `KT_GGUF_TEMPLATE` 默认写死 `/workspace/models/cache/...`;若你的 GGUF 不在那,**必须显式 export**(`{layer_idx}` 是占位符,别用 `${...:-}` 包,bash 会把第一个 `}` 当结束符吃掉)。
+
+---
+
+## 4. 验证 import gate
 ```bash
 bash tools/setup_dsv4_env_from_clean_cann.sh verify
 ```
@@ -152,7 +212,7 @@ torch.ops.custom.* 全部就位 OK   # compressor / npu_sparse_attn_sharedkv / n
 
 ---
 
-## 4. 装完拉服务(冒烟)
+## 5. 装完拉服务(冒烟)
 ```bash
 cd /mnt/workspace/gitCode/ktransformers-AK
 # ★两个默认路径脚本里写死成 /workspace,本机在 /mnt/workspace,必须显式给;
@@ -173,7 +233,7 @@ curl --noproxy '*' http://127.0.0.1:8020/generate -H 'Content-Type: application/
 
 ---
 
-## 5. 与已有 patch 包的关系
+## 6. 与已有 patch 包的关系
 - 本文 = **环境/依赖 bring-up**(算子仓库都是**原样编译安装,C++ 源码零改动**;唯一的源码级修补是 sgl-kernel-npu 的 `-ldl` 和 kt-kernel 的 CMakeLists 认 CC/CXX)。
 - **模型代码改动**(sglang fork 相对开源基线的工程 patch)见 `tools/kt_dsv4_npu_patches/`。
 - **NSA 数值对齐**(单 state_cache 交织池 / fp32 norm-rope 等最小必要 3 文件)见 `A3_W8A8_数值对齐调查.md`。

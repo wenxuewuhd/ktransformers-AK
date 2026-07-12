@@ -1,128 +1,234 @@
 #!/usr/bin/env bash
-# 长序列测试用例：构多档长度的 prompt（默认 32k + 64k），各输出 ~MAX_NEW token，
-# 报每档 prefill TTFT / 长上下文 decode(ms·token, tok/s) / 总吞吐，最后汇总对比表。
+# 长序列测试用例：构多档长度的 prompt（默认 32k + 64k），先暖机再多次循环测【暖机后】的
+# 稳态 decode tps，报每档 prefill TTFT / 每次迭代的 decode(ms·token, tok/s) / 暖机后均值。
 #
-# 前提：服务已起，且 CHUNKED_PREFILL_SIZE >= 最长一档的实际 prompt_tokens（单 chunk，避 compressor 跨 chunk bug）。
-#   ⚠️ context-length=65536 是硬上限：prompt + 输出 必须 ≤ 65536。64k 档 prompt 已接近上限，MAX_NEW 留小
-#      （默认 1000：~63k + 1000 < 65536）。64k 单 chunk prefill 的 activation 峰值大、未验证，可能 OOM；
-#      OOM 就降 MEM_FRACTION 或去掉 64k 档。
-#   拉起（chunk 要覆盖 64k；65408 = 最大的 ≤ max-prefill-tokens(65535) 的 128 倍数）：
-#     export KT_MXFP4_CKPT=/workspace/models/DeepSeekV4/DeepSeek-V4-Flash
-#     export KT_MXFP4_OP_DIR=/workspace/code/ktransformers-AK/tools/ascendc_mxfp4   # 主干自己的目录（首跑自动 bisheng 编译，见总纲 §4.6）
-#     KT_PREFILL_STREAM=1 KT_MXFP4_DEPOOL=1 KT_MXFP4_NZ_CHUNK=32 KT_DYNAMIC_RESIDENT=1 \
-#     MEM_FRACTION=0.72 NPU_DEVICE_ID=<空卡> PORT=8200 CHUNKED_PREFILL_SIZE=65408 \
-#       bash tools/p27_launch_ds4flash_npu.sh 2>&1 | tee /tmp/serve.log
+# 前提：服务已起，且 CHUNKED_PREFILL_SIZE >= 最长一档的实际 prompt_tokens（单 chunk，避 compressor 跨 chunk bug 坑⑯）。
+#   ⚠️ context-length=65536 是硬上限：prompt + 输出 必须 ≤ 65536。
+#   ⚠️ 64k 单 chunk prefill 的 activation 峰值 ~20GB 可能 OOM；OOM 就降 KT_NUM_GPU_EXPERTS/MEM_FRACTION 或去掉 64k 档。
 #
 # 用法：
-#   PORT=8200 bash tools/p27_longseq_test.sh                    # 默认跑 32k + 64k 两档
-#   TARGET_TOKENS_LIST="32000" PORT=8200 bash tools/p27_longseq_test.sh   # 只跑 32k
+#   PORT=8020 bash tools/p27_longseq_test.sh                                  # 默认 1k/8k/16k/32k，各暖机1次+循环3次
+#   TARGET_TOKENS_LIST="32000" PORT=8020 REPEAT=5 WARMUP=2 bash tools/p27_longseq_test.sh
 # env：
-#   TARGET_TOKENS_LIST  默认 "32000 64000"（空格分隔多档）
+#   TARGET_TOKENS_LIST  默认 "1000 8000 16000 32000"（空格分隔多档；均 ≤32768 单 chunk）
 #   MAX_NEW             默认 1000（ignore_eos 跑满）
-#   CHARS_PER_TOK       默认 4.6（英文实测 ~4.69 char/token；偏小→实际 token 略小于 target，留 context 余量）
-#   SKIP_PREFILL_PROBE=1  跳过每档 n=1 prefill 探针（省一次该长度的 prefill，但拿不到 prefill/decode 拆分）
-#   PORT(8200) / HOST(127.0.0.1)
+#   REPEAT              默认 3   —— 暖机后测量迭代次数（每次 = 一发完整 max_new 生成）
+#   WARMUP              默认 1   —— 正式测量前先跑几发丢弃，把 dynamic 热专家暖起来
+#   CHARS_PER_TOK       默认 4.6
+#   PORT(8020) / HOST(127.0.0.1) / PY(python)
 set -euo pipefail
 
-PORT="${PORT:-8200}"
+PORT="${PORT:-8020}"
 HOST="${HOST:-127.0.0.1}"
 MAX_NEW="${MAX_NEW:-1000}"
+REPEAT="${REPEAT:-3}"
+WARMUP="${WARMUP:-1}"
 CHARS_PER_TOK="${CHARS_PER_TOK:-4.6}"
-TARGET_TOKENS_LIST="${TARGET_TOKENS_LIST:-32000 64000}"
-SKIP_PREFILL_PROBE="${SKIP_PREFILL_PROBE:-0}"
-PY="${PYTHON_BIN:-/usr/local/python3.11.14/bin/python3.11}"
+TARGET_TOKENS_LIST="${TARGET_TOKENS_LIST:-130 1000 8000 16000 32000}"
+PY="${PY:-python}"
+
 CONTEXT_LIMIT=65536
+GEN_URL="http://${HOST}:${PORT}/generate"
 
 if ! curl -sf -m5 "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
-  echo "[longseq][ERROR] 服务没起或不健康：http://${HOST}:${PORT}/health（先按脚本头部命令起服务）" >&2
+  echo "[longseq][ERROR] 服务没起或不健康：http://${HOST}:${PORT}/health（先起服务）" >&2
   exit 1
 fi
 
-SUMMARY_ARGS=()
+# 取 meta_info 的一个字段
+metaf() { $PY -c "import json,sys;print(json.load(open(sys.argv[1])).get('meta_info',{}).get(sys.argv[2],'') or '')" "$1" "$2"; }
+
+echo "[longseq] REPEAT=${REPEAT} WARMUP=${WARMUP} MAX_NEW=${MAX_NEW}  URL=${GEN_URL}"
+SUMMARY=()   # 每行: "TGT pt e1 warmed_dec_msmean warmed_dec_tpsmean"
+
 for TGT in ${TARGET_TOKENS_LIST}; do
   if (( TGT + MAX_NEW > CONTEXT_LIMIT )); then
-    echo "[longseq][WARN] 档 ${TGT}: prompt + 输出(${MAX_NEW}) 可能 > context-length ${CONTEXT_LIMIT}；输出会被截或报错。建议 target ≤ $((CONTEXT_LIMIT - MAX_NEW))。"
+    echo "[longseq][WARN] 档 ${TGT}: prompt+输出(${MAX_NEW}) 可能 > ${CONTEXT_LIMIT}，会被截/报错。"
   fi
-  PF="/tmp/longseq_prompt_${TGT}.txt"; MA="/tmp/longseq_mA_${TGT}.json"; MC="/tmp/longseq_mC_${TGT}.json"
-  RQ1="/tmp/longseq_req1_${TGT}.json"; RQ2="/tmp/longseq_req2_${TGT}.json"
+  PF="/tmp/longseq_prompt_${TGT}.txt"; RQ1="/tmp/longseq_req1_${TGT}.json"; RQ2="/tmp/longseq_req2_${TGT}.json"
 
-  # ---- 构 prompt + 两个请求体 JSON 直接写文件（curl -d @file，避开 Argument list too long）----
+  # ---- 构 prompt + 探针(max_new=1) + 全量(max_new=MAX_NEW) 请求体 ----
   "$PY" - "$TGT" "$PF" "$CHARS_PER_TOK" "$MAX_NEW" "$RQ1" "$RQ2" <<'PYEOF'
 import sys, json
-target = int(sys.argv[1]); out = sys.argv[2]; cpt = float(sys.argv[3])
-maxn = int(sys.argv[4]); rq1 = sys.argv[5]; rq2 = sys.argv[6]
-facts = [
-    "The Roman aqueducts carried water across vast distances using only gravity",
-    "Beethoven composed his ninth symphony while almost completely deaf",
-    "The mitochondria is often called the powerhouse of the cell",
-    "Mount Everest grows a few millimeters taller each year due to plate tectonics",
-    "The printing press was invented by Johannes Gutenberg around the year 1440",
-    "Honeybees communicate the location of flowers through an intricate waggle dance",
-    "The Great Barrier Reef is the largest living structure on the entire Earth",
-    "Light from the sun takes about eight minutes and twenty seconds to reach our planet",
-    "The Rosetta Stone was the key that helped scholars decipher Egyptian hieroglyphs",
-    "Antarctica is simultaneously the driest, the windiest, and the coldest continent",
-    "Octopuses have three hearts and blue copper-based blood instead of red iron-based blood",
-    "The Eiffel Tower can grow more than fifteen centimeters taller during a hot summer",
-    "A single bolt of lightning is roughly five times hotter than the surface of the sun",
-    "The human brain contains approximately eighty-six billion individual neurons",
-    "Venus rotates so slowly that one of its days is longer than one of its years",
+target=int(sys.argv[1]); out=sys.argv[2]; cpt=float(sys.argv[3]); maxn=int(sys.argv[4]); rq1=sys.argv[5]; rq2=sys.argv[6]
+facts=[
+ "The Roman aqueducts carried water across vast distances using only gravity",
+ "Beethoven composed his ninth symphony while almost completely deaf",
+ "The mitochondria is often called the powerhouse of the cell",
+ "Mount Everest grows a few millimeters taller each year due to plate tectonics",
+ "The printing press was invented by Johannes Gutenberg around the year 1440",
+ "Honeybees communicate the location of flowers through an intricate waggle dance",
+ "The Great Barrier Reef is the largest living structure on the entire Earth",
+ "Light from the sun takes about eight minutes and twenty seconds to reach our planet",
+ "The Rosetta Stone was the key that helped scholars decipher Egyptian hieroglyphs",
+ "Antarctica is simultaneously the driest, the windiest, and the coldest continent",
+ "Octopuses have three hearts and blue copper-based blood instead of red iron-based blood",
+ "The Eiffel Tower can grow more than fifteen centimeters taller during a hot summer",
+ "A single bolt of lightning is roughly five times hotter than the surface of the sun",
+ "The human brain contains approximately eighty-six billion individual neurons",
+ "Venus rotates so slowly that one of its days is longer than one of its years",
 ]
-chars_needed = int(target * cpt)
-buf, n, clen = [], 0, 0
-while clen < chars_needed:
-    s = f"{facts[n % len(facts)]} (fact {n})."
-    buf.append(s); clen += len(s) + 1; n += 1
-body = " ".join(buf)
-prompt = (
-    body
-    + "\n\nQuestion: The passage above is very long and contains many numbered facts. "
-      "Cite three distinct facts by their fact numbers, then write a detailed multi-paragraph "
-      "summary of the different topics covered.\nAnswer:"
+# 短档(130/1k)用真正的自然问题；长档(8k+)仍用合成填充(自然长文难造，长档看性能足够)
+NAT_SHORT = (
+    "A logistics company ships orders from three warehouses. Warehouse A handles forty percent "
+    "of all orders, warehouse B handles thirty-five percent, and warehouse C handles the remaining "
+    "twenty-five percent. Historically two percent of A's shipments arrive late, three percent of "
+    "B's, and five percent of C's. A customer has just reported that their shipment arrived late. "
+    "Walk through the reasoning step by step to compute the probability that the late shipment "
+    "originated from warehouse C, state the final numerical probability, and then suggest the single "
+    "operational change that would most reduce the company's overall late-delivery rate. Explain why."
 )
-open(out, "w").write(prompt)
-json.dump({"text": prompt, "sampling_params": {"max_new_tokens": 1, "temperature": 0}}, open(rq1, "w"))
-json.dump({"text": prompt, "sampling_params": {"max_new_tokens": maxn, "temperature": 0, "ignore_eos": True}}, open(rq2, "w"))
-print(f"[longseq] 档 {target}: built ~{clen} chars, {n} sentences", file=sys.stderr)
+_nat1k = [
+ "Over the past decade, electricity grids around the world have begun a difficult transition away from "
+ "fossil-fuel generation toward variable renewable sources such as wind and solar. This shift creates a "
+ "fundamental engineering problem: supply and demand must be balanced on the grid at every instant, but "
+ "the sun does not always shine and the wind does not always blow, while electricity demand follows its "
+ "own daily and seasonal rhythms that rarely align with renewable output. Traditional grids balanced "
+ "supply by ramping controllable thermal plants up and down, but a grid dominated by renewables needs a "
+ "different toolkit, and energy storage sits at the center of that toolkit.",
+ "The most mature grid-scale storage technology today is the lithium-ion battery. Large installations, "
+ "sometimes exceeding several hundred megawatt-hours, can absorb excess solar energy in the middle of the "
+ "day and release it during the evening demand peak, a pattern operators call energy time-shifting. "
+ "Batteries also respond within milliseconds, which makes them valuable for frequency regulation, the fast "
+ "second-by-second balancing that keeps grid frequency near its target. However, lithium-ion systems "
+ "typically provide only a few hours of storage before they are exhausted, and their cost, while falling "
+ "rapidly, still makes multi-day storage impractical at scale.",
+ "For longer durations, engineers look to other approaches. Pumped hydroelectric storage, the oldest and "
+ "still the largest form of grid storage, pumps water uphill into a reservoir when energy is abundant and "
+ "lets it flow back down through turbines when energy is scarce. It offers enormous capacity and long life, "
+ "but it depends on suitable geography and large upfront construction. Emerging alternatives include flow "
+ "batteries, which store energy in liquid electrolytes and can be scaled independently in power and "
+ "capacity; compressed-air and liquid-air systems; gravity-based designs that lift and drop heavy masses; "
+ "and green hydrogen, produced by electrolysis when surplus renewable power is available and later burned "
+ "or run through fuel cells. Each technology occupies a different point on the trade-off surface between "
+ "cost, round-trip efficiency, response time, and storage duration.",
+ "The hardest problem is not any single technology but the mismatch of timescales. A grid needs storage "
+ "that spans milliseconds for frequency response, hours for daily solar shifting, and, critically, days or "
+ "even weeks to ride through long stretches of cloudy, windless weather. No single technology is cheapest "
+ "across all of these durations, so future grids will likely combine several, dispatching each where it is "
+ "most economical. Planners must also remember that storage is not free energy: every round trip loses some "
+ "power to inefficiency, and building storage consumes materials and capital that could otherwise fund "
+ "additional generation or transmission.",
+ "Economics complicate these choices further. Storage earns revenue in several distinct ways: arbitrage "
+ "between cheap and expensive hours, payments for fast frequency services, and capacity payments for being "
+ "available during peak demand. A battery optimized purely for daily arbitrage may sit idle during the rare "
+ "multi-day shortfalls that actually threaten reliability, while a technology sized for those long shortfalls "
+ "may be too expensive to justify on arbitrage alone. Regulators therefore increasingly value storage not by "
+ "a single number but by the specific services it can guarantee. Meanwhile, batteries degrade with every "
+ "cycle, losing a fraction of their capacity each year, so an operator must decide whether to oversize a "
+ "system at the start or plan to augment it later. These financial and lifecycle questions often matter more "
+ "to the final decision than the raw physics of any one storage medium.",
+ "A regional grid operator is now planning the next fifteen years of investment. The region has abundant "
+ "midday solar, growing evening demand, occasional multi-day winter periods of low wind and sun, limited "
+ "mountainous terrain, and a policy goal of reaching ninety percent renewable electricity.",
+ "Question: Recommend a portfolio of storage technologies for this operator. For each technology you "
+ "include, explain which balancing timescale it addresses and why it is well suited to that role, identify "
+ "the single biggest risk or limitation of your overall plan, and describe one concrete measurement the "
+ "operator should track over the next five years to know whether the plan is working. Be specific and "
+ "justify your reasoning.",
+]
+NAT_1K = "\n\n".join(_nat1k)
+if target <= 300:
+    prompt = NAT_SHORT
+elif target <= 2000:
+    prompt = NAT_1K
+else:
+    chars_needed=int(target*cpt); buf,n,clen=[],0,0
+    while clen<chars_needed:
+        s=f"{facts[n%len(facts)]} (fact {n})."; buf.append(s); clen+=len(s)+1; n+=1
+    prompt=" ".join(buf)+("\n\nQuestion: The passage above is very long and contains many numbered facts. "
+        "Cite three distinct facts by their fact numbers, then write a detailed multi-paragraph summary of the different topics covered.\nAnswer:")
+open(out,"w").write(prompt)
+json.dump({"text":prompt,"sampling_params":{"max_new_tokens":1,"temperature":0}},open(rq1,"w"))
+json.dump({"text":prompt,"sampling_params":{"max_new_tokens":maxn,"temperature":0,"ignore_eos":True}},open(rq2,"w"))
+print(f"[longseq] 档 {target}: built {len(prompt)} chars", file=sys.stderr)
 PYEOF
 
-  if [[ "${SKIP_PREFILL_PROBE}" != "1" ]]; then
-    echo "[longseq] 档 ${TGT}: prefill 探针 (max_new_tokens=1) ..."
-    curl -s -m 3600 -X POST "http://${HOST}:${PORT}/generate" -H 'Content-Type: application/json' \
-      -d @"${RQ1}" -o "${MA}" -w "  http %{http_code}  wall %{time_total}s\n"
-  fi
-  echo "[longseq] 档 ${TGT}: 全量生成 (max_new_tokens=${MAX_NEW}, ignore_eos) ..."
-  curl -s -m 3600 -X POST "http://${HOST}:${PORT}/generate" -H 'Content-Type: application/json' \
-    -d @"${RQ2}" -o "${MC}" -w "  http %{http_code}  wall %{time_total}s\n"
+  echo "----- 档 ${TGT} -----"
 
-  SUMMARY_ARGS+=("${TGT}" "${MA}" "${MC}")
+  # ---- 暖机：跑 WARMUP 发全量丢弃，暖 dynamic 热专家 ----
+  for w in $(seq 1 "${WARMUP}"); do
+    MW="/tmp/longseq_warm_${TGT}_${w}.json"
+    curl -s -m 3600 -X POST "$GEN_URL" -H 'Content-Type: application/json' -d @"${RQ2}" -o "${MW}" \
+      -w "  [warmup ${w}/${WARMUP}] http %{http_code} wall %{time_total}s\n"
+  done
+
+  # ---- 正式测量：循环 REPEAT 发【流式】全量，直接量 inter-token(TTFT=prefill / 间隔=decode，
+  #      免疫 prefill 波动，不再用 e2e-探针 减法)----
+  ANS="/tmp/longseq_ans_${TGT}.txt"
+  PF_LIST=(); DEC_TPS=(); PT=""
+  for r in $(seq 1 "${REPEAT}"); do
+    line="$($PY - "$GEN_URL" "$RQ2" "$ANS" <<'PYEOF'
+import sys, json, time, os, urllib.request
+os.environ["no_proxy"] = "127.0.0.1,localhost"; os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+url, reqf, ansf = sys.argv[1], sys.argv[2], sys.argv[3]
+body = json.load(open(reqf)); body["stream"] = True
+req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                             headers={"Content-Type": "application/json"})
+t0 = time.time(); tf = None; tl = None; pt = None; nc = 0; text = ""
+try:
+    with urllib.request.urlopen(req, timeout=3600) as rsp:
+        for raw in rsp:
+            s = raw.decode("utf-8", "ignore").strip()
+            if not s:
+                continue
+            if s.startswith("data:"):
+                s = s[5:].strip()
+            if s == "[DONE]":
+                break
+            try:
+                o = json.loads(s)
+            except Exception:
+                continue
+            m = o.get("meta_info", {}) or {}
+            if m.get("prompt_tokens"):
+                pt = m["prompt_tokens"]
+            if m.get("completion_tokens"):
+                nc = m["completion_tokens"]
+            t = o.get("text")
+            if t is not None and len(t) > len(text):
+                now = time.time()
+                if tf is None:
+                    tf = now
+                tl = now; text = t
+    open(ansf, "w").write(text)
+except Exception:
+    print("- - - 0 ?"); sys.exit()
+pf = (tf - t0) if tf else 0.0
+dec = (tl - tf) if (tf and tl and tl > tf) else 0.0
+if dec > 0 and nc > 1:
+    print(f"{pf:.1f} {dec / (nc - 1) * 1000:.1f} {(nc - 1) / dec:.2f} {nc} {pt}")
+else:
+    print(f"{pf:.1f} - - {nc} {pt}")
+PYEOF
+)"
+    read -r pf decms dectps nc pt <<<"$line"
+    printf "    iter %s: prefill %ss | decode %s ms/tok  %s tok/s  (compl %s)\n" "$r" "$pf" "$decms" "$dectps" "$nc"
+    [ "$dectps" != "-" ] && DEC_TPS+=("$dectps")
+    [ "$pf" != "-" ] && PF_LIST+=("$pf")
+    PT="$pt"
+  done
+
+  # ---- 打印该档模型回答(temp=0，取最后一发)----
+  echo "  ---- 档 ${TGT} 模型回答 ----"
+  sed 's/^/  | /' "$ANS" 2>/dev/null
+  echo "  ---- (回答结束) ----"
+
+  # ---- 暖机后统计(decode 中位免疫 prefill 波动;prefill 单独取均值)----
+  PFMEAN="$($PY -c "import sys;xs=[float(x) for x in sys.argv[1:] if x not in ('','-')];print(('%.1f'%(sum(xs)/len(xs))) if xs else '-')" "${PF_LIST[@]:-}")"
+  DSTATS="$($PY -c "import sys;xs=sorted(float(x) for x in sys.argv[1:] if x not in ('','-'));print(('%.2f %.2f %.2f %.2f'%(sum(xs)/len(xs),xs[len(xs)//2],xs[0],xs[-1])) if xs else '- - - -')" "${DEC_TPS[@]:-}")"
+  read -r smean smed smin smax <<<"$DSTATS"
+  echo "  >> 档 ${TGT} 暖后 decode: mean ${smean} / median ${smed} tok/s (min ${smin}/max ${smax}), prompt=${PT}, prefill-mean=${PFMEAN}s"
+  SUMMARY+=("${TGT} ${PT} ${PFMEAN} ${smean} ${smed} ${smin} ${smax}")
+  echo
 done
 
-echo
-SKIP_PREFILL_PROBE="${SKIP_PREFILL_PROBE}" "$PY" - "${SUMMARY_ARGS[@]}" <<'PYEOF'
-import sys, os, json
-args = sys.argv[1:]
-skip = os.environ.get("SKIP_PREFILL_PROBE") == "1"
-print("=" * 92)
-print(f"{'目标':>7} {'prompt_tok':>10} {'compl':>6} {'prefill(s)':>10} {'pf tok/s':>9} "
-      f"{'decode ms/tok':>13} {'dec tok/s':>9} {'e2e(s)':>8}")
-print("-" * 92)
-last_mc = None
-for i in range(0, len(args), 3):
-    tgt, ma, mc = args[i], args[i + 1], args[i + 2]
-    c = json.load(open(mc)); m = c.get("meta_info", {}); last_mc = c
-    pt = m.get("prompt_tokens"); nc = m.get("completion_tokens"); e3 = m.get("e2e_latency")
-    pf = pftps = decms = dectps = None
-    if not skip and os.path.exists(ma):
-        am = json.load(open(ma)).get("meta_info", {}); e1 = am.get("e2e_latency")
-        if e1 and pt and nc:
-            pf = e1; pftps = pt / e1
-            dec = (e3 - e1) / max(nc - 1, 1); decms = dec * 1000; dectps = 1 / dec
-    g = lambda x, fmt: (fmt % x) if x is not None else "-"
-    print(f"{tgt:>7} {pt:>10} {nc:>6} {g(pf,'%.1f'):>10} {g(pftps,'%.0f'):>9} "
-          f"{g(decms,'%.0f'):>13} {g(dectps,'%.2f'):>9} {g(e3,'%.1f'):>8}")
-print("=" * 92)
-print("decode = 长上下文每 token 时间（短上下文基线 ~62ms/16tps；KV 越长 attention 增量越大）")
-if last_mc is not None:
-    print("末档 answer head:", repr(last_mc.get("text", "")[:220]))
-PYEOF
+echo "=================================== 汇总（暖机后 decode）==================================="
+printf "%8s %10s %12s %11s %11s %9s %9s\n" 目标 prompt_tok warm-pf\(s\) dec-mean dec-med dec-min dec-max
+printf -- "-------------------------------------------------------------------------------------------\n"
+for row in "${SUMMARY[@]}"; do
+  read -r tgt pt e1 mean med mn mx <<<"$row"
+  printf "%8s %10s %12s %11s %11s %9s %9s\n" "$tgt" "$pt" "$e1" "$mean" "$med" "$mn" "$mx"
+done
+echo "==========================================================================================="
+echo "说明：decode tok/s = (compl-1)/(e2e - 暖后prefill)；暖机 ${WARMUP} 发后循环 ${REPEAT} 发取均值/中位。"

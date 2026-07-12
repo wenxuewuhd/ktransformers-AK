@@ -415,6 +415,69 @@ G 线 `mxfp4-dequant-kernel`（与 dev 在 `4755d7f` 分叉）真三方 merge �
 
 ---
 
+### 6.10 🏁 开源前收口（2026-07-08 ~ 07-12）：clean-code + 精度定案 + hot-tail + 冷 prefill 根因
+
+#### A. KT MoE clean-code（子模块 `e638dc5` / 外层 `4a9e78e`）
+- **净 −556 行**：`kt_ep_wrapper` 906→694、`kt_stream_prefill` 1417→1086。删的是 **0-caller 死代码**（被
+  `_build_pool_parread`/ping-pong 取代的旧串行 pool builder 等）+ **生产环境 env-gated OFF 的调试脚手架**；
+  有用的 probe 移到可选的 **`kt_moe_debug.py`**（`KT_PREFILL_EXPERT_HIST` / `KT_HITRATE_PROBE` 仍可用）。
+- **bit-exact 验证**：temp=0 固定 prompt（**1800 token，>512 触发流式 prefill**，覆盖清理最猛的那条路）
+  output_ids + top-20 logprobs 与清理前**逐位一致**，且跨 boot 可复现。
+- 复验工具：**[`tools/bitcompare/`](../../../tools/bitcompare/)**（harness + 金标 json）。
+
+#### B. NSA compressor `seqused` only-in-prefill（`016864e`）
+`compressor` 的 `seqused` 只在 prefill 传，decode 传 `None`（更贴 golden：golden 也只在 prefill 传）。
+`cu_seqlens` 不能同样处理（公开算子在 decode/TND 下要求它，置 None 会崩）。accuracy-neutral。
+
+#### C. ★ `KT_HOT_TAIL_TOKENS` —— decode 热池尾采样（子模块 `929c1bf8e` / 外层 `2606f04`）
+**decode 常驻热池从「prompt 末 N 个 token 的路由」选，而不是整段 prefill。** 动机：decode 紧跟 prompt 末尾，
+末段的专家分布比整段更能预测 decode 路由。实现 = `_hist_ids()`（`topk_ids[-N:]`），两处 bincount 复用它。
+
+实测（自然长文 + 合成 prompt；**命中率用 eager `KT_HITRATE_PROBE`**、**tps 用 graph-on 流式量 inter-token**）：
+
+| 窗口 N | 30k decode 命中率 | 30k decode tps |
+|---|---|---|
+| 1024 | 26.8% | 19.81 |
+| **0（整段=旧行为）** | 31.2% | 19.97 |
+| 256 | 34.8% | — |
+| 128 | 38.2% | 21.04 |
+| **64（最优）** | **43.1%** | **21.49** |
+
+- **越小越好，64 最优**；**tps 与命中率同序同向**（命中↑→tps↑；1024 命中跌破基线→tps 也跌破）。
+- **长上下文（8k–32k）：命中率 +10–13pp、decode tps +3~8%**（tps 增益比命中率“打折”，因为 CPU-MoE 被
+  NPU side-stream 部分掩盖，只对曝露部分提速）。
+- **但短 prompt（<~2k）小亏 −2~4%**（整段本就“近”，64 子窗口只加噪声）→ **默认 `0`（关闭），
+  长上下文部署 opt-in `KT_HOT_TAIL_TOKENS=64`**。
+- **纯性能开关**：只改哪些专家在 NPU/CPU 算，**输出 bit-exact**，零精度风险。
+
+#### D. 精度定案：**无回归**
+- 单卡 GPQA-diamond（off / temp=1）真实中心 **~68–69%**：10× 重复 mean **68.99%**、SD 1.3pp；
+  clean-code 后再 10× = **67.5%**、SD 2.3pp —— 两者统计一致（差 1.5pp ≈ 1.8 SE）。
+- 早期追的“vs 8 卡 72% 差 ~5pp”是 **temp=1 单跑采样噪声**（单跑 SE ±3.3pp），**不是回归**。
+  且 clean-code 是 bit-exact 的 → 机制上就不可能改精度。详见 [`accuracy_report.md`](accuracy_report.md)。
+- 附带根因：**NPU sampler 丢弃 per-request seed**（`sampler.py` 的昇腾路径用全局 RNG 的 `torch.multinomial`），
+  所以复现需 `--random-seed` + `--eval-batch-size 1` 串行 + 重启服务。
+
+#### E. 冷 prefill 慢的根因（32k：冷 63s → 暖 21s）
+临时插桩三相位计时（已回退）**石锤**：慢的**全在 `H2D+convert` 相位**（把 MXFP4 专家权重从 GGUF mmap
+搬进 HBM + 转换）——冷 23.1s → 暖 16.5s；而 `fused_experts`（1.6s）/ `inline_resident`（0.2s）**恒定**。
+
+- **机制**：`KT_MXFP4_GGUF_DEDUP=1` 时流式 prefill **直接读 GGUF mmap**（不是常驻 pinned 池），
+  **mmap 页会被 OS 页缓存淘汰** → 缓存冷时 H2D 命中磁盘 → 慢；读热后 ~16.5s 稳定。
+- **为什么 startup warmup 盖不住**：内置 warmup 是 **128-token 的 hybrid**（`< KT_PREFILL_STREAM_THRESHOLD`），
+  **根本不走流式、不读 mxfp4 GGUF**。
+- **缓解**（择一）：(a) startup 加一发 `>threshold` 的**流式** warmup；(b) `mlock`/预读把 GGUF 焐进页缓存；
+  (c) `KT_MXFP4_GGUF_DEDUP=0` 走常驻 pinned 池（代价：多占 ~137GB pinned DDR）。
+
+#### F. 测试工具（本轮新增/修好）
+- **[`tools/p27_longseq_test.sh`](../../../tools/p27_longseq_test.sh)**：5 档（130 / 1k / 8k / 16k / 32k），
+  **130 与 1k 用真正的自然问题**（贝叶斯推理 / 电网储能长文），8k+ 用合成填充；
+  **decode 改为流式量 inter-token 中位** —— 旧的 `e2e − prefill探针` 减法在 32k 上会因 prefill 波动
+  **算出假的 ~11 tok/s**（真值 ~20）。另打印模型回答 + 暖机后 decode 中位/分位。
+- **[`tools/bitcompare/`](../../../tools/bitcompare/)**：bit 级回归 harness（temp=0 output_ids + top-20 logprobs）。
+
+---
+
 ## 7. 性能数据（参考）
 
 | 项 | 值 |

@@ -181,8 +181,14 @@ launcher 需要**两份权重**,都不在仓库里,必须自备:
 
 | 权重 | 用途 | 从哪来 |
 |---|---|---|
-| **W8A8 safetensors**(`MODEL_PATH`) | NPU 侧(attention/常驻专家/embed) | 官方 DeepSeek-V4-Flash checkpoint 经 **modelslim W8A8 量化**得到;量化坑见 [`modelslim_quarot_basis_gguf_pitfall.md`](modelslim_quarot_basis_gguf_pitfall.md) |
-| **43 层 MXFP4 GGUF**(`KT_GGUF_TEMPLATE`) | CPU offload MoE(kt-kernel)+ depool 流式 prefill | 由**官方原生 MXFP4 专家权重**无损 bit-repack 而来 |
+| **W8A8 safetensors**(`MODEL_PATH`) | NPU 侧(attention / 常驻专家 / embed / lm_head) | 官方 DeepSeek-V4-Flash checkpoint 经 **modelslim W8A8 量化** |
+| **43 层 MXFP4 GGUF**(`KT_GGUF_TEMPLATE`) | CPU offload MoE(kt-kernel)+ depool 流式 prefill | 由**官方原生 MXFP4 专家权重**无损 bit-repack |
+
+> ### ⚠️ 硬约束:两份权重的「量化基底」必须一致(坑⑰)
+> CPU 侧 GGUF 与 NPU 侧 W8A8 **必须来自同一个量化基底**(quarot 旋转)。若你**自己**用 modelslim 量化 W8A8、
+> 而 GGUF 来自官方原生 MXFP4(未旋转),两边基底不一致 → **输出乱码**(且不报错,极难查)。
+> 详见 [`modelslim_quarot_basis_gguf_pitfall.md`](modelslim_quarot_basis_gguf_pitfall.md)。
+> **最稳妥:两份权重同源**(要么都用官方发布的,要么自量化时保证 GGUF 也走同一基底)。
 
 **MXFP4 GGUF 转换 → 见 [`mxfp4_gguf_conversion.md`](mxfp4_gguf_conversion.md)**(独立完整指南:转换 + 三级校验 + kernel 数值对账)。要点:
 

@@ -97,6 +97,11 @@ export KT_MXFP4_GGUF_DEDUP="${KT_MXFP4_GGUF_DEDUP:-1}"   # 依赖 depool；默�
 export KT_DYNAMIC_RESIDENT="${KT_DYNAMIC_RESIDENT:-1}"
 export KT_PREFILL_STREAM="${KT_PREFILL_STREAM:-1}"
 export KT_SIDE_STREAM="${KT_SIDE_STREAM:-1}"
+# 流式 prefill 的最小 chunk 长度门槛(kt_stream_prefill.py:_T)。prefill chunk 的 token 数 >= 此值
+# 才走流式 prefill;而 **dynamic hot expert(KT_DYNAMIC_RESIDENT)的常驻热专家槽正是在流式 prefill
+# 路径里刷新的** —— 所以低于门槛的短 prefill 走 hybrid、那一发不更新热专家。想让更短的 prompt 也
+# 享受流式+动态热专家,把它调小(如 128);调大则只有更长 prefill 才流式。默认 512(=代码默认,零回归)。
+export KT_PREFILL_STREAM_THRESHOLD="${KT_PREFILL_STREAM_THRESHOLD:-512}"
 
 # 勿用 KT_GGUF_TEMPLATE="${KT:-...dsv4_layer{layer_idx}.gguf}"：bash 会把 {layer_idx} 的第一个 ``}`` 当成 ``${...:-}`` 的结束符，路径会变成 ``...{layer_idx.gguf}``。
 # 默认 Q8_0（批量 convert 输出 dsv4_layer{L}.gguf）。须先 cp 新 kt_kernel_ext.so 到 kt-kernel/python/（手册 §2.4）。

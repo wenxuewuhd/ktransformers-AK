@@ -1,5 +1,17 @@
 # DeepSeek-V4-Flash 单卡 NPU — graph 模式 decode profiling 报告
 
+> ## ⚠️ 历史档案 —— **数字已过时,勿对外引用**
+> 本文写于 **2026-06-09,aclgraph 驱动 bug 修复之前**(当时 graph 实际没生效)。
+> 文中的 **3.6 / 6.12 tok/s、280ms/token、cpu_moe 215→115ms** 等,**均已被推翻**。
+>
+> **当前实测(2026-07,910C/A3,graph 真正生效后)**:
+> - decode **~20-21 tok/s**(TPOT ~47-50ms),不是 3.6/6.12;
+> - **cpu_moe_wall ~16ms**(长 prompt、热专家暖后),不是 55/215ms;
+> - **decode 是 NPU-bound,不是 CPU-bound** —— cpu_moe 只占 TPOT 的一小部分且被 side-stream 部分掩盖。
+>
+> **现行数字见总纲 §6.10 / §7.1.1。** 本文只保留方法论价值(PATH_A vs PATH_B 的测量陷阱、
+> "CPU MoE 是内存带宽瓶颈"这一定性结论仍成立)。
+
 > **日期**:2026-06-09 ｜ **分支**:graph_acc(== dsv4_one_card_dev @ afa4666)
 > **目标**:graph 模式 decode 还有没有加速空间,用扎实(且**带正确性校验**的)profiling 定位。
 > **结论**:有。瓶颈是 **CPU MoE 受内存带宽限,且只用了 192 核里的 24 核**。

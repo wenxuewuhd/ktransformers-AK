@@ -1,5 +1,15 @@
 # Findings — CPU MoE 带宽利用率(graph decode 子问题)
 
+> ## ⚠️ 历史档案 —— **端到端数字已过时,勿对外引用**
+> 本文写于 **2026-06-09,aclgraph 驱动 bug 修复之前**。文中的端到端 **6.84 / 8.52 tok/s**、
+> **cpu_moe_wall 55-67ms** 反映的是 graph 未真正生效时的状态。
+>
+> **当前实测(2026-07,910C/A3)**:decode **~20-21 tok/s**、**cpu_moe_wall ~16ms**(长 prompt 热专家暖后)。
+> **现行数字见总纲 §6.10 / §7.1.1。**
+>
+> **仍然成立的**:CPU MoE 是**内存带宽 bound**(decode 是 batch-1 GEMV,算术强度 ~3.8 OP/byte,
+> 远低于 roofline 拐点)、线程/NUMA 扫描的方法论、TP 对 decode 近乎最优。这些定性结论未被推翻。
+
 > **状态**:阶段性收口｜**日期**:2026-06-09｜**分支**:`cpu-compute-opt`(worktree `/workspace/code/kt-A-cpuopt`)
 > **承接**:[graph_decode_bandwidth_handoff.md](graph_decode_bandwidth_handoff.md)(本文证伪了它的核心假设)
 > **复现工具**:`tools/p27_cpu_moe_bw_bench.py`(隔离微基准,PATH_B,真实 layer3 权重,输出签名校验)

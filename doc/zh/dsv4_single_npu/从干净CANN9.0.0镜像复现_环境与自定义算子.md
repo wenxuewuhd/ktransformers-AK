@@ -197,8 +197,25 @@ launcher 需要**两份权重**,都不在仓库里,必须自备:
 
 **MXFP4 GGUF 转换 → 见 [`mxfp4_gguf_conversion.md`](mxfp4_gguf_conversion.md)**(独立完整指南:转换 + 三级校验 + kernel 数值对账)。要点:
 
+**① 先给 llama.cpp 打两个 patch(转换的硬依赖;`setup_dsv4_env_from_clean_cann.sh` 不做这一步)**
+
+本仓的 llama.cpp 子模块**故意停在干净的公开上游 tag `b3173`**(`a94e6ff87`)——**不 fork**;
+MXFP4 支持以 patch 形式随仓发布(红线 R7:vendored ggml 改动不入子模块,否则合上游时污染 gitlink)。
+所以 clone 完子模块是**干净的**,必须手动打 patch,否则转换会挂在 `GGML_TYPE_MXFP4` 未知类型上:
+
 ```bash
-# 依赖:llama.cpp 子模块(公开 tag b3173) + patch 0001(NumPy2) / 0002(MXFP4 类型)——见总纲 §4.2
+cd third_party/llama.cpp                      # 干净 b3173 (a94e6ff)
+git apply -p1 ../../tools/kt_dsv4_npu_patches/llama_cpp/0001-fix-gguf-NumPy-2-GGUFReader.patch
+git apply -p1 ../../tools/kt_dsv4_npu_patches/llama_cpp/0002-add-ggml-type-mxfp4.patch
+cd -
+# 自检:两个 patch 应能干净反向应用(= 已打上)
+git -C third_party/llama.cpp apply --check -R -p1 tools/kt_dsv4_npu_patches/llama_cpp/*.patch && echo "patch OK"
+```
+> 打完子模块会显示 dirty(7 文件 +150 行)——**这是设计如此,别 commit 进子模块**。
+
+**② 转换 + 校验**
+
+```bash
 python3 tools/batch_convert_mxfp4_layers_mp.py --out-dir /path/to/cache ...   # 全量 43 层,多进程
 python3 tools/verify_mxfp4_gguf_set.py --dir /path/to/cache ...               # L1 齐全+尺寸 / L2 sha256 / L3 bit-exact
 ```

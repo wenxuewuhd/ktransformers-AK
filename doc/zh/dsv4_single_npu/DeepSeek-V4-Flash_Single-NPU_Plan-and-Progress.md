@@ -1,9 +1,26 @@
 # DeepSeek-V4-Flash 单卡 910B + K920 CPU MoE —— 总体方案与当前进展（整合版）
 
-> **文档定位**：本文是 DeepSeek-V4-Flash「单卡 Ascend 910B + Kunpeng-920 CPU MoE offload」方案的**唯一现行总纲**。
+> **文档定位**：本文是 DeepSeek-V4-Flash「单卡 Ascend NPU + Kunpeng-920 CPU MoE offload」方案的**唯一现行总纲**。
 > 当各来源冲突时**以本文为准**。维护分支：`dsv4_one_card_dev`。
-> **最后更新：2026-06-11**（CPU MoE 换原生 **MXFP4**，搬运字节减半，decode ~8.5→~13–16 tok/s，
-> DRAM 275→137 GiB；Session D 已合入主干 commit `91b9c92`）。
+>
+> ## ★ 现行硬件与性能（2026-07，**910C/A3**，graph-on）——引用请用这一组
+>
+> | 项 | 当前实测（910C/A3） | 旧值（910B，已过时） |
+> |---|---|---|
+> | **decode 吞吐** | **~19–22.5 tok/s（中位，随上下文略降）**；快端 token 到 **23–25** | ~13–16 tok/s |
+> | ├ 短/中 prompt（≤2k） | **~21.5–22.5 tok/s** | — |
+> | ├ 8k / 16k / 32k | **~19.8 / 19.3 / 19.2 tok/s** | — |
+> | └ 开 `KT_HOT_TAIL_TOKENS=64`（opt-in，§6.10-C） | 长上下文 **+3~8%** → 8k/16k/32k **~20.4 / 20.8 / 20.5** | — |
+> | **CPU-MoE wall/token** | **~16 ms**（长 prompt、热专家暖后；短 prompt ~22.6 ms） | 55–215 ms |
+> | **prefill（暖后）** | 130/1k/8k/16k/32k = **15.4 / 15.6 / 16.5 / 17.6 / 20.3 s**（流式的**固定开销 ~15s** 主导，几乎不随长度涨） | — |
+> | 精度（GPQA-off，10× 重复） | **~68–69%**（mean 68.99% / SD 1.3pp，见 accuracy_report §0） | — |
+>
+> **关键定性结论也变了：decode 现在是 NPU-bound，不再是 CPU-bound**（cpu_moe ~16ms ≪ TPOT ~47ms，
+> 且被 side-stream 部分掩盖）。910B 时代"CPU MoE 占 decode 70%"的判断已被推翻。
+> 下文 §1 演进账 / §7 里的 13–16 tok/s 等是 **910B 历史值**，保留作演进记录。
+>
+> **最后更新：2026-07-12**（开源前收口：clean-code + KT_HOT_TAIL_TOKENS + 精度定案 + 冷 prefill 根因，见 **§6.10**）。
+> 上一版：2026-06-11（CPU MoE 换原生 MXFP4，DRAM 275→137 GiB，commit `91b9c92`）。
 >
 > | 来源 | 时间 | 角色 | 现状 |
 > |---|---|---|---|
@@ -30,9 +47,14 @@ CPU 吃由**官方原生 MXFP4 checkpoint** 无损 repack 出来的 GGUF。
 | 里程碑 | decode | CPU MoE/token | 备注 |
 |---|---|---|---|
 | eager 基线 | ~1.6 tok/s | — | 功能对照 |
-| graph + `kt-cpuinfer 24` | ~3.6 | ~215 ms | 06-08 graph 闭合 |
-| graph + `kt-cpuinfer 96→128` | ~6.1→8.5 | ~115→55 ms | 06-09 带宽瓶颈定位 |
-| **graph + CPU MXFP4 + 行内预取 kernel** | **~13–16 tok/s** | **~17–27 ms** | **06-11 现行**（清净窗口 ~16，中等争抢 ~13–14，独占实测） |
+| graph + `kt-cpuinfer 24` | ~3.6 | ~215 ms | 06-08 graph 闭合（**910B**） |
+| graph + `kt-cpuinfer 96→128` | ~6.1→8.5 | ~115→55 ms | 06-09 带宽瓶颈定位（**910B**） |
+| graph + CPU MXFP4 + 行内预取 kernel | ~13–16 tok/s | ~17–27 ms | 06-11（**910B**，清净窗口 ~16） |
+| **★ 910C/A3 + aclgraph 驱动修复后（现行）** | **~19–22.5 tok/s**（快端 23–25） | **~16 ms** | **2026-07 实测**。短/中 prompt ~21.5–22.5；8k/16k/32k ~19.8/19.3/19.2 |
+| └ 叠加 `KT_HOT_TAIL_TOKENS=64`（opt-in） | 长上下文 **+3~8%** → ~20.4–21.5 | ↓（命中率 +10–13pp） | §6.10-C |
+
+> ⚠️ **前 4 行是 910B 历史值**（且 06-08/06-09 那两行还写于 aclgraph 驱动 bug 修复之前，实际 graph 未生效）。
+> **引用请用最后两行（910C/A3 现行）。**
 
 > 瓶颈定性（不变）：CPU MoE 深度 **memory-bound**（`AI=0.94 MAC/byte ≪ 平衡点 21`），decode 时间
 > 主要花在把专家权重从 DDR 搬一遍。MXFP4 把搬运字节**精确减半**（Q8_0 1.0625 → MXFP4 0.53125 B/元素），
@@ -480,16 +502,51 @@ G 线 `mxfp4-dequant-kernel`（与 dev 在 `4755d7f` 分叉）真三方 merge �
 
 ## 7. 性能数据（参考）
 
+### 7.0 ★ 当前实测（**910C/A3**，2026-07，graph-on）——**引用请用这一节**
+
+配置：`MEM_FRACTION=0.82` · `KT_NUM_GPU_EXPERTS=32` · `KT_CPUINFER=32` · `KT_THREADPOOL_COUNT=1` ·
+`CHUNKED_PREFILL_SIZE=32768` · depool + 流式 prefill + dynamic-resident 全开。
+
+**decode（流式量 inter-token 中位，免疫 prefill 波动；工具 [`tools/p27_decode_timing.py`](../../../tools/p27_decode_timing.py)）**
+
+| prompt | decode tok/s（默认） | 开 `KT_HOT_TAIL_TOKENS=64`（opt-in） |
+|---|---|---|
+| 118 tok | 21.6 | 20.7 |
+| 801 tok（~1k） | **22.6** | 22.2 |
+| 7.8k | 19.8 | **20.4**（+2.9%） |
+| 15.6k | 19.3 | **20.8**（+7.7%） |
+| 31.5k | 19.2 | **20.5**（+6.8%） |
+
+- **区间：~19–22.5 tok/s（中位）**；单 token 快端到 **23–25**（p10 ≈ 23.3，min ≈ 25–28）。
+- 随上下文变长小幅下降（KV 变长）。**hot-tail=64 专治长上下文**（短 prompt 反而小亏 −2~4%，故默认关）。
+
+**其它**
+
 | 项 | 值 |
 |---|---|
-| Decode 吞吐 — **MXFP4** graph `kt-cpuinfer 128`（06-11） | **~13–16 tok/s**（清净窗口 ~16，中等争抢 ~13–14；min cpu_moe_wall 17ms） |
-| Decode 吞吐 — Q8_0 graph `kt-cpuinfer 128`（06-09） | ~8.5 tok/s |
-| Decode 吞吐 — eager | ~1.6 tok/s |
+| **CPU-MoE wall/token**（`KT_DECODE_TIMING=1`） | **~16 ms**（长 prompt、热专家暖后；12–20 ms 区间）；短 prompt ~22.6 ms |
+| **prefill（暖后）** | 130/1k/8k/16k/32k = **15.4 / 15.6 / 16.5 / 17.6 / 20.3 s** —— **流式的固定开销 ~15s 主导**（每发都要把全套专家权重 DDR→HBM 搬一遍），几乎不随 prompt 长度涨 |
+| **prefill（冷）** | 32k 可达 **~63s**（GGUF mmap 页缓存冷，H2D 命中磁盘；暖后 ~21s。根因见 §6.10-E） |
+| HBM（静态，N=32） | **48.32 GB 权重 + 3.66 KV + 0.27 graph**；余量 **~8.8 GB**（正推分解见 **§7.1.1**） |
+| DRAM | ~137 GiB（MXFP4）/ 275（Q8_0）/ 555（BF16） |
+| 精度（GPQA-off，10×） | **~68–69%**（accuracy_report §0） |
+
+> **★ decode 现在是 NPU-bound，不是 CPU-bound**：cpu_moe ~16ms ≪ TPOT ~47ms，且跑在 side-stream 上
+> 与 NPU 部分重叠。910B 时代"CPU MoE 占 decode 70%"的结论已被推翻 —— 想再提速要看 NPU 侧。
+
+---
+
+### 7.0.1 历史值（**910B**，2026-06，保留作演进记录，**勿对外引用**）
+
+| 项 | 值 |
+|---|---|
+| Decode — MXFP4 graph `kt-cpuinfer 128`（06-11） | ~13–16 tok/s（清净 ~16，中等争抢 ~13–14） |
+| Decode — Q8_0 graph（06-09） | ~8.5 tok/s |
+| Decode — eager | ~1.6 tok/s |
 | Graph capture | ~6.8s（bs=1，真实权重） |
-| 模型加载（MXFP4 138 GiB） | **~2–3.5 min**（热 cache，page cache 全驻;冷盘首启另加磁盘读） |
-| 开机第一发（20-tok）— `SKIP_WARMUP=1` 基线 / `=0` 预热 | req1 **2.1–2.5s → 1.8s**（清净窗口 load~21，§6.8;预热消掉冷启 ramp） |
-| HBM 占用（静态，N=32，见 §7.1） | **~44.7 GB**（模型 42.32 + KV pool 1.34 + graph 1.08）;拉起后剩 **~15.8 GB** |
-| DRAM 占用 | **~137 GiB（MXFP4）** / 275（Q8_0）/ 555（BF16） |
+| 模型加载（MXFP4 138 GiB） | ~2–3.5 min（热 cache） |
+| 开机第一发（20-tok）`SKIP_WARMUP=1`→`=0` | 2.1–2.5s → 1.8s（§6.8） |
+| HBM（静态，N=32，MEM_FRACTION=0.72） | ~44.7 GB；剩 ~15.8 GB（见 §7.1） |
 
 > 共享机 load 长期 ~400 时所有绝对带宽是被邻居挤占后的下限;清净独占聚合 ~442 GB/s。decode 的
 > median−min 抖动主体是邻居噪声（G1，max-of-8-NUMA 放大）。

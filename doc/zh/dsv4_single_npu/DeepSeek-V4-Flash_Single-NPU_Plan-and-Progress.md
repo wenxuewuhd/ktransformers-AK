@@ -1,4 +1,7 @@
-# DeepSeek-V4-Flash 单卡 910B + K920 CPU MoE —— 总体方案与当前进展（整合版）
+# DeepSeek-V4-Flash 单卡 Ascend NPU（现行 **910C/A3**）+ K920 CPU MoE —— 总体方案与当前进展（整合版）
+
+> 硬件演进：项目起于 **910B**（2026-06 及之前的数据/结论均为 910B），现行验证平台是 **910C(A3) + CANN 9.0.0**。
+> 文中凡标 **910B** 的数字/结论均为**历史值**，当前值见头部「★ 现行硬件与性能」与 **§7.0**。
 
 > **文档定位**：本文是 DeepSeek-V4-Flash「单卡 Ascend NPU + Kunpeng-920 CPU MoE offload」方案的**唯一现行总纲**。
 > 当各来源冲突时**以本文为准**。维护分支：`dsv4_one_card_dev`。
@@ -33,8 +36,9 @@
 
 ## 0. 一句话现状
 
-单卡 910B + K920 的 DeepSeek-V4-Flash 推理**已端到端拉起、输出连贯、NPU graph 性能路径闭合**。
-**当前生产配置（2026-06-11）**：
+单卡 Ascend NPU + K920 的 DeepSeek-V4-Flash 推理**已端到端拉起、输出连贯、NPU graph 性能路径闭合**
+（**910B** 上首次跑通，现行验证平台为 **910C/A3 + CANN 9.0.0**，decode **~19–22.5 tok/s**、GPQA-off **~68–69%**）。
+**当前生产配置（2026-06-11 定型，2026-07 于 910C/A3 复核）**：
 
 > **NPU 侧 W8A8**（attention MLA+NSA+Indexer / shared expert / router / 前 32 个常驻 routed expert）
 > **＋ CPU offload 侧原生 MXFP4 GGUF**（其余 224 专家/层，~137 GiB）**＋ graph-on**。
@@ -72,8 +76,8 @@ CPU 吃由**官方原生 MXFP4 checkpoint** 无损 repack 出来的 GGUF。
 | **CPU** | Kunpeng-920 5250,4 socket × 48 core = **192 物理核**,8 NUMA(每 NUMA 24 核 ~192 GB),**1.5 TB DRAM** |
 | **CPU ISA** | ARMv8.2-A + `asimddp`(NEON SDOT)+ `asimdhp`/`fphp`(FP16);**无 SVE / 无 BF16 / 无 I8MM / 无 SME** |
 | **DDR** | 每 NUMA 实插 **3/4 通道**（24 DIMM/32 槽）DDR4-**3200** → 真 spec **614 GB/s**；清净独占聚合 ~442 GB/s |
-| **NPU** | 8 × Atlas 910B（每张 64 GB HBM）;**项目只用 1 张** |
-| **CANN** | 8.5.0,`/usr/local/Ascend/ascend-toolkit/latest` |
+| **NPU** | **现行:Ascend 910C(A3)**,64 GB HBM/die(实际可见 ~61 GB);**项目只用 1 张**。历史:8 × Atlas 910B(每张 64 GB HBM) |
+| **CANN** | **现行:9.0.0**(`$HOME/Ascend/cann-9.0.0`;NSA 走**公开 single-state compressor**,须 `KT_NSA_COMPRESSOR_MODE=single`)。历史:8.5.0(私有 split 算子) |
 
 > **ISA 红线(R1)**：任何 SVE / BF16 / I8MM 指令（`+sve` march、SVE 汇编、`__bf16`、`smmla`/`usdot`/`ptrue`）
 > 在 K920 上 **SIGILL**。march 固定 `-march=armv8.2-a+fp16+dotprod`。MXFP4/Q8_0 kernel 只用 NEON
@@ -117,7 +121,7 @@ CPU 吃由**官方原生 MXFP4 checkpoint** 无损 repack 出来的 GGUF。
 ## 2. 系统架构与数据流
 
 ```
-单卡：Atlas 910B (64 GB HBM) + K920 (1.5 TB DRAM, 192 核, 8 NUMA)
+单卡：Ascend 910C(A3) 64 GB HBM（现行；历史 Atlas 910B）+ K920 (1.5 TB DRAM, 192 核, 8 NUMA)
 
 input → [NPU: embedding / RoPE / MLA+NSA+Indexer attention]
       → [NPU: MoE router gate → topk_ids, topk_weights(k=6)]

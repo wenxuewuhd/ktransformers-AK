@@ -290,8 +290,13 @@ echo "[p27] SKIP_WARMUP=${SKIP_WARMUP} (warmup_flag='${WARMUP_FLAG}') KT_STREAM_
 #   KT_NUM_GPU_EXPERTS  每层放 NPU 的 expert 数，默认 32。每多 1 个 ≈ +1.0GB HBM。
 #       实测上限（context 65536）：40 可起（KV max_total=135k，仍≥2×context），42 崩
 #       （SWA 多池 c128 盘口算负）。想更多须降 --context-length 或改 KV 分配算法。
-#   MEM_FRACTION  默认 0.85。⚠️ 实测在本 NPU 路径下不影响 avail mem（0.85/0.92 同样 60.5GB），
-#       故不能靠它腾 HBM；保留仅为兼容。
+#   MEM_FRACTION  默认 0.85。它是 (权重 + KV 池) 的上限；权重是固定的 48.3GB，所以它实际
+#       只在「KV 池 ↔ 激活余量」之间挪。910C/A3 实测（ctx 65536）：
+#         0.85 → KV 3.66GB（max_total_num_tokens 577,536），激活余量 ~8.8GB
+#         0.82 → KV ~1.9GB（max_total_num_tokens 258,048），激活余量 ~10.6GB
+#       ★ 调高没用（KV 池有上限，0.85/0.92 avail 相同）；★ 调低有用（能给激活腾地）。
+#       ⚠️ 长上下文必看：32k 单块 prefill 的激活峰值 ~10GB，默认 0.85 只剩 ~8.8GB → 会 OOM。
+#       跑 32k 请用 MEM_FRACTION=0.82（本仓 32k 实测即用此值）。详见总纲 §7.1.1。
 # shellcheck disable=SC2086
 exec "${PYTHON_BIN}" -m sglang.launch_server \
   --model-path "$MODEL_PATH" \

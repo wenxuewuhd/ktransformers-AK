@@ -511,6 +511,11 @@ G 线 `mxfp4-dequant-kernel`（与 dev 在 `4755d7f` 分叉）真三方 merge �
 配置：`MEM_FRACTION=0.82` · `KT_NUM_GPU_EXPERTS=32` · `KT_CPUINFER=32` · `KT_THREADPOOL_COUNT=1` ·
 `CHUNKED_PREFILL_SIZE=32768` · depool + 流式 prefill + dynamic-resident 全开。
 
+> **为什么是 0.82 而不是默认的 0.85**：32k 单块 prefill 的激活峰值 ~10 GB，默认 0.85 只剩
+> ~8.8 GB 激活余量 → **会 OOM**。降到 0.82 把 KV 池压小、腾出 ~10.6 GB 才跑得动 32k。
+> **MEM_FRACTION 不影响 decode/prefill 的吞吐**（它只在 KV 池 ↔ 激活余量之间挪），所以下面的
+> tok/s 在默认 0.85 下同样成立（只要 prompt 不长到把激活撑爆）。详见 **§7.1.1**。
+
 **decode（流式量 inter-token 中位，免疫 prefill 波动；工具 [`tools/p27_decode_timing.py`](../../../tools/p27_decode_timing.py)）**
 
 | prompt | decode tok/s（默认） | 开 `KT_HOT_TAIL_TOKENS=64`（opt-in） |
@@ -592,14 +597,28 @@ HBM 总可用 **60.50 GB**（64GB − 驱动 ~3.5GB）。拉起日志实测：
 
 > 与 §7.1（旧 910B / 0.72 / MXFP4-NZ 常驻，数字多为反推/估算）不同：本节权重分项**逐张量正推**自 safetensors 头（dtype+shape），激活模型用一次 24K 单块 prefill 的实测峰值标定。当前配置常驻专家是 **W8A8 INT8（非 MXFP4-NZ）**，故权重更大。
 
-**A. 初始化实测（启动日志）**：HBM 可见 **61.03 GB**。
+**A. 初始化实测（启动日志，`MEM_FRACTION=0.85` = launcher 默认）**：HBM 可见 **61.03 GB**。
 
-| 块 | 大小 | 来源 |
+| 块 | 大小 | 容量 / 来源 |
 |---|---|---|
 | 模型权重（NPU 驻留） | **48.32 GB** | `Load weight end … mem usage=48.32, avail=12.71` |
-| KV pool（预分配，NSA 压缩） | **~3.66 GB** | avail 12.71→9.05；`max_total_num_tokens=577536` |
+| **KV pool**（预分配，**NSA 压缩**） | **~3.66 GB** | **可容 `max_total_num_tokens` = 577,536 token**（单请求上限另由 `--context-length 65536` 卡）<br>→ 平均 **~6.6 KB/token**：NSA(c4/c128 压缩态 + SWA 窗口)把 KV 压得极狠，**3.66 GB 就足够撑满 64K 上下文**，不要被"才 3.7 GB"误导 |
 | NPU graph buffer | **0.27 GB** | `Capture npu graph … mem usage=0.27` |
 | **初始化后剩余（激活全从这出）** | **~8.8 GB** | `avail mem=8.79` |
+
+> ### MEM_FRACTION 到底在调什么（★ 长上下文必看）
+> `--mem-fraction-static` 是 **(权重 + KV 池)** 的上限；**权重 48.32 GB 是固定的**，所以它实际
+> **只在「KV 池 ↔ 激活余量」之间挪**。910C/A3 实测（ctx 65536）：
+>
+> | MEM_FRACTION | KV pool | max_total_num_tokens | 激活余量 |
+> |---|---|---|---|
+> | **0.85**（默认） | 3.66 GB | **577,536** | **~8.8 GB** |
+> | **0.82** | ~1.9 GB | 258,048 | **~10.6 GB** |
+>
+> - **调高没用**（KV 池自身有上限，0.85/0.92 的 avail 相同）；**调低有用**（把 KV 压小，给激活腾地）。
+> - ⚠️ **32k 单块 prefill 的激活峰值 ~10 GB**（§7.1.1-C），**默认 0.85 只剩 ~8.8 GB → 会 OOM**。
+>   **跑 32k 请用 `MEM_FRACTION=0.82`**（本仓 §7.0 的 32k 性能数据即在 0.82 下实测）。
+> - KV 从 577K→258K token 仍**远大于单请求上限 65,536**，所以降到 0.82 不影响单请求能开多长的上下文。
 
 **B. 48.32 GB 权重正推分解**（单专家 W8A8 = `3×hidden(4096)×moe_inter(2048)` = 25.17M 参数 = **25.2 MB**）：
 

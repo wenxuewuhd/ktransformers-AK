@@ -5,7 +5,7 @@
 > **cpu_moe_wall 55-67ms** 反映的是 graph 未真正生效时的状态。
 >
 > **当前实测(2026-07,910C/A3)**:decode **~20-21 tok/s**、**cpu_moe_wall ~16ms**(长 prompt 热专家暖后)。
-> **现行数字见总纲 §6.10 / §7.1.1。**
+> **现行数字见总纲 §6.10 / §7.1.1，以及 [graph_decode_roofline_overlap.md](graph_decode_roofline_overlap.md)（2026-07 roofline 自洽 + side-stream 重叠分解，当前权威）。**
 >
 > **仍然成立的**:CPU MoE 是**内存带宽 bound**(decode 是 batch-1 GEMV,算术强度 ~3.8 OP/byte,
 > 远低于 roofline 拐点)、线程/NUMA 扫描的方法论、TP 对 decode 近乎最优。这些定性结论未被推翻。

@@ -655,6 +655,16 @@ HBM 总可用 **60.50 GB**（64GB − 驱动 ~3.5GB）。拉起日志实测：
 
 ---
 
+### 7.2 Decode roofline 自洽 + side-stream 重叠分解(2026-07-19)
+
+详见 **[graph_decode_roofline_overlap.md](graph_decode_roofline_overlap.md)**（当前权威）。一句话:
+- **自洽①**:CPU-MoE 墙钟 18.3ms ↔ 命中率 26.2% + 反推带宽 **142 GB/s**(∈[100,155])对得上;
+- **自洽②**:`NPU + 露出CPU = TPOT`(hidden 9.43 / exposed 8.87,均正且 ∈[0,18.3]);
+- **side-stream 净收益 9.43ms/token = NPU 盖住 ~4.8ms(resident GroupedMatmul 窗口)+ 避开 SIDE=0 host 串行惩罚 ~4.6ms**;attention/NSA 在 fork 之前、盖不进是数据依赖硬约束;
+- **天花板**:CPU-MoE 在 H≈80% 时被 NPU 完全掩盖,TPOT 触底 ≈ NPU 临界路径 ~36ms → **~27 tok/s**;之后 decode 转为纯 NPU-bound。
+
+---
+
 ## 8. 关键约束 / 红线
 
 | # | 红线 | 后果 |

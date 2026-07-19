@@ -9,7 +9,7 @@
 > - **cpu_moe_wall ~16ms**(长 prompt、热专家暖后),不是 55/215ms;
 > - **decode 是 NPU-bound,不是 CPU-bound** —— cpu_moe 只占 TPOT 的一小部分且被 side-stream 部分掩盖。
 >
-> **现行数字见总纲 §6.10 / §7.1.1。** 本文只保留方法论价值(PATH_A vs PATH_B 的测量陷阱、
+> **现行数字见总纲 §6.10 / §7.1.1，以及 [graph_decode_roofline_overlap.md](graph_decode_roofline_overlap.md)（2026-07 roofline 自洽 + side-stream 重叠分解，当前权威）。** 本文只保留方法论价值(PATH_A vs PATH_B 的测量陷阱、
 > "CPU MoE 是内存带宽瓶颈"这一定性结论仍成立)。
 
 > **日期**:2026-06-09 ｜ **分支**:graph_acc(== dsv4_one_card_dev @ afa4666)

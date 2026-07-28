@@ -561,6 +561,26 @@ class BaseMoEWrapper(_MoEBase, ABC):
 
         return immediate_ids, deferred_ids
 
+    def _check_qlen_fits_cpp_buffers(self, hidden_states: torch.Tensor) -> None:
+        """Fail loudly when qlen would overrun the C++ MoE output buffer.
+
+        ``moe-tp.hpp`` sizes ``local_output_numa[i]`` by ``max_possible_qlen()`` =
+        ``max(max_len, group_max_len)``, and both are set to ``chunked_prefill_size``
+        (``utils/llamafile.py``). ``TP::forward`` then hands the *full* qlen to
+        ``MOE::forward``, whose recursion only splits the internal scratch — the
+        caller-supplied output pointer still advances across ``qlen * hidden_size``.
+        So ``qlen > chunked_prefill_size`` writes past the allocation and corrupts the
+        heap, surfacing later as an unrelated ``malloc(): unaligned tcache chunk``
+        abort. Raise here instead, mirroring the SFT path (``sft/base.py``).
+        """
+        qlen = hidden_states.numel() // hidden_states.shape[-1]
+        if qlen > self.chunked_prefill_size:
+            raise ValueError(
+                f"qlen ({qlen}) exceeds chunked_prefill_size ({self.chunked_prefill_size}); "
+                "the C++ MoE output buffer is sized by chunked_prefill_size and would be "
+                "overrun. Raise --chunked-prefill-size or reduce the prefill chunk."
+            )
+
     def _prepare_forward_cpu_buffers(
         self,
         hidden_states: torch.Tensor,
@@ -568,6 +588,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         topk_weights: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], tuple, int, int]:
         """D2H copy into pinned CPU buffers; return deferred ids and buffer handles."""
+        self._check_qlen_fits_cpp_buffers(hidden_states)
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         (
@@ -626,6 +647,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         cuda_stream,
     ) -> None:
         """Run CPU MoE on buffers already filled (sync or stream callback)."""
+        self._check_qlen_fits_cpp_buffers(hidden_states)
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         (
             input_tensor_cpu,
@@ -702,6 +724,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         nested stream callbacks.
         """
         del cuda_stream  # unused — sync path only
+        self._check_qlen_fits_cpp_buffers(hidden_states)
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         (
             input_tensor_cpu,

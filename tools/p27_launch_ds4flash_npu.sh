@@ -18,11 +18,18 @@
 #   PORT              默认 8000
 #   ASCEND_TOOLKIT_HOME  默认 /usr/local/Ascend/ascend-toolkit/latest
 #   NPU_DEVICE_ID     可选，物理 NPU 序号（如 2）。设置后会 export ASCEND_RT_VISIBLE_DEVICES=$NPU_DEVICE_ID。
-#   CHUNKED_PREFILL_SIZE  默认 2048（必须是 page-size=128 的倍数，且 >= page-size）。
-#                         注意：不能传 -1。KT(LLAMAFILE) C++ MoE 内部 fp32 输出
-#                         buffer 按 max_possible_qlen()=max(max_len, group_max_len)
-#                         分配；-1 会被算成 1，prefill qlen>1 时立刻越界写堆
-#                         → glibc tcache abort。详见 Handoff 附录 Z.7。
+#   CHUNKED_PREFILL_SIZE  默认 8192（必须是 page-size=128 的倍数，且 >= page-size）。
+#                         ★ 不变量：prefill 的 qlen 必须 <= 本值。KT(LLAMAFILE) C++ MoE 的
+#                         输出 buffer local_output_numa[] 按 max_possible_qlen()=
+#                         max(max_len, group_max_len) 分配，而这两者都被设成本值
+#                         (kt-kernel/python/utils/llamafile.py)；TP::forward 却把完整 qlen
+#                         传给 MOE::forward，其递归只切内部 scratch、不切调用方的输出指针
+#                         → qlen 超出即越界写堆，事后在无关处 glibc tcache abort。
+#                         现已在 kt-kernel/python/experts_base.py 的三个 forward 入口
+#                         加了显式报错（_check_qlen_fits_cpp_buffers），不再静默破坏堆。
+#                         注意：不能传 -1。llamafile.py 对 <=0 会兜底成 2048，那只是把崩溃
+#                         从「第 2 个 token」推到「第 2049 个 token」，并未根治；而 -1 在
+#                         sglang 侧等于关闭分块，一次喂进整条 prompt。详见 Handoff 附录 Z.9。
 #   QUANTIZATION      默认 compressed-tensors（与基线一致）。
 
 set -euo pipefail
@@ -313,6 +320,12 @@ if [[ "${SKIP_WARMUP}" == "0" ]]; then
   WARMUP_FLAG=""
 fi
 echo "[p27] SKIP_WARMUP=${SKIP_WARMUP} (warmup_flag='${WARMUP_FLAG}') KT_STREAM_WARMUP=${KT_STREAM_WARMUP:-0}"
+# ★ 环境快照：绝大多数 KT_* 既不进 sglang 的 ServerArgs、也不被上面的 [p27] 逐条回显，
+# 事后无法从日志判断当时 shell 里到底 export 了什么（2026-07 排查两次 GPQA 跑分差异时，
+# 有一半时间花在猜这个上）。这里把与本服务相关的环境变量全量落盘，纯 echo、不改行为。
+echo "[p27][env] ---- 相关环境变量快照 ----"
+env | grep -E "^((KT_|SGLANG_)[A-Za-z0-9_]*|CHUNKED_PREFILL_SIZE|MEM_FRACTION|QUANTIZATION|SKIP_WARMUP|EXTRA_FLAGS|MODEL_PATH|NPU_DEVICE_ID|PORT|PYTHON_BIN|ASCEND_RT_VISIBLE_DEVICES)=" | sort | sed 's/^/[p27][env] /' || true
+echo "[p27][env] ---- 快照结束（无输出=该类变量全部未设，走脚本默认）----"
 # 可调 env（2026-06-11 加）：
 #   KT_NUM_GPU_EXPERTS  每层放 NPU 的 expert 数，默认 32。每多 1 个 ≈ +1.0GB HBM。
 #       实测上限（context 65536）：40 可起（KV max_total=135k，仍≥2×context），42 崩

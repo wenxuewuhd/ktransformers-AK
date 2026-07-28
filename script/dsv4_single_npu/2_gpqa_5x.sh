@@ -60,13 +60,35 @@ LOGDIR="${LOGDIR:-$REPO/logs/dsv4_single_npu}"
 mkdir -p "$LOGDIR"
 CONSOLE="${LOGDIR}/gpqa_5x_${STAMP}.log"
 
-# ★ evalscope 必须 >=1.9.0:1.8.1 的 GPQA 适配器会洗坏 15/198 题选项、系统性低 ~1.9pp
-# (根因见 REPORT_910b_vs_910c_accuracy.md)。预装了旧版也强制升级,避免静默复现。
+# ★ evalscope 版本必须锁死 —— 这不是洁癖，是踩过的坑（2026-07-28）：
+#   本行原为 `command -v evalscope || pip install -q evalscope`（不锁版本）。GPQA 的
+#   198 题里有 15 题选项含方括号（IUPAC 命名如 spiro[4.5]decan、benzo[1,2-c:...]，
+#   以及量子态记号）。evalscope **1.8.1** 的 benchmarks/gpqa/gpqa_adapter.py 在
+#   _process_input() 的 preprocess() 里做 `re.sub(r'\[.*?\]', '', text)`，把这些方括号
+#   内容整段删掉 —— spiro[4.5]decan-6-ol 变成 spirodecan-6-ol、[1,1'-biphenyl]-4-ol
+#   变成 -4-ol，选项与题干对不上。1.9.x 已移除该清洗。
+#   实测（910B，同一模型同一服务）：1.8.1 六轮 67.85%±1.83 vs 1.9.1 九轮 70.88%±0.87，
+#   差 3.03pp，置换检验 p=0.0006；差异全部来自那 15 题（41.3% vs 61.1%），
+#   其余 183 题只差 1.6pp（噪声）。910C 独立排查得到同一结论（同样 15 题、同样 idx24）。
+#   ⇒ 不锁版本会让「跑分」随 PyPI 上的最新版漂移，把 harness 差异误读成模型/硬件回归。
+EVALSCOPE_VERSION="${EVALSCOPE_VERSION:-1.9.1}"
+# 预装了 <1.9.0 的旧版也强制升级到锁定版，避免 1.8.x 静默复现
+# （根因另见 REPORT_910b_vs_910c_accuracy.md）。
 _ev="$("$PY" -m pip show evalscope 2>/dev/null | awk '/^Version:/{print $2}')"
 if [ -z "$_ev" ] || [ "$(printf '1.9.0\n%s\n' "$_ev" | sort -V | head -1)" != "1.9.0" ]; then
-  echo "evalscope=${_ev:-未装} < 1.9.0,升级到 >=1.9.0(1.8.1 会污染 GPQA 精度)..."
-  "$PY" -m pip install -q -U 'evalscope>=1.9.0'
+  echo "   [evalscope] ${_ev:-未装} < 1.9.0，安装 evalscope==${EVALSCOPE_VERSION}（1.8.1 会污染 GPQA 精度）"
+  "$PY" -m pip install -q "evalscope==${EVALSCOPE_VERSION}"
 fi
+# 无论用的是哪一份（PATH 上的 / venv 里的 / 调用方用 EVALSCOPE= 指定的），都必须落盘，
+# 否则事后无法判断这一跑到底用了哪个 harness（这正是本次排查最耗时的一环）。
+_ES_BIN="${EVALSCOPE:-$(command -v evalscope)}"
+_ES_VER="$("$_ES_BIN" --version 2>/dev/null | tr -d '\n' || echo unknown)"
+echo "==== [evalscope] bin=${_ES_BIN}"
+echo "==== [evalscope] version=${_ES_VER}  (期望 ${EVALSCOPE_VERSION}；>=1.9 才修好 GPQA 方括号清洗)"
+case "$_ES_VER" in
+  *1.8.*) echo "!! [evalscope] 警告：1.8.x 会破坏 15/198 道 GPQA 题的选项，跑分系统性低约 3pp。" >&2
+          echo "!! 除非你明确要复现历史口径，否则请升级：$PY -m pip install 'evalscope==${EVALSCOPE_VERSION}'" >&2 ;;
+esac
 
 # 服务健康检查
 if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' "http://${HOST}:${PORT}/health" 2>/dev/null)" != "200" ]; then

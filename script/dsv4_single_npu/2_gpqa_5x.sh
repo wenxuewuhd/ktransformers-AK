@@ -60,7 +60,13 @@ LOGDIR="${LOGDIR:-$REPO/logs/dsv4_single_npu}"
 mkdir -p "$LOGDIR"
 CONSOLE="${LOGDIR}/gpqa_5x_${STAMP}.log"
 
-command -v evalscope >/dev/null 2>&1 || "$PY" -m pip install -q evalscope
+# ★ evalscope 必须 >=1.9.0:1.8.1 的 GPQA 适配器会洗坏 15/198 题选项、系统性低 ~1.9pp
+# (根因见 REPORT_910b_vs_910c_accuracy.md)。预装了旧版也强制升级,避免静默复现。
+_ev="$("$PY" -m pip show evalscope 2>/dev/null | awk '/^Version:/{print $2}')"
+if [ -z "$_ev" ] || [ "$(printf '1.9.0\n%s\n' "$_ev" | sort -V | head -1)" != "1.9.0" ]; then
+  echo "evalscope=${_ev:-未装} < 1.9.0,升级到 >=1.9.0(1.8.1 会污染 GPQA 精度)..."
+  "$PY" -m pip install -q -U 'evalscope>=1.9.0'
+fi
 
 # 服务健康检查
 if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' "http://${HOST}:${PORT}/health" 2>/dev/null)" != "200" ]; then

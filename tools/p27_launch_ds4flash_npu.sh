@@ -73,7 +73,14 @@ if [[ -n "${1:-}" && "$1" =~ ^[0-9]+$ && -z "${NPU_DEVICE_ID:-}" ]]; then
   shift
 fi
 
-MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8}"
+# MODEL_PATH 默认:自动探测(本盒 /mnt/workspace、旧镜像 /workspace),显式 env 仍优先。
+if [[ -z "${MODEL_PATH:-}" ]]; then
+  for _c in /mnt/workspace/models/DeepSeek-V4-Flash-W8A8 \
+            /workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8; do
+    [[ -d "$_c" ]] && { MODEL_PATH="$_c"; break; }
+  done
+  MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8}"
+fi
 
 # Streaming-prefill checkpoints (only read when KT_PREFILL_STREAM=1). kt_stream_prefill.py
 # reads config.json / model.safetensors.index.json from these; its own defaults are the old
@@ -97,6 +104,15 @@ export KT_MXFP4_GGUF_DEDUP="${KT_MXFP4_GGUF_DEDUP:-1}"   # 依赖 depool；默�
 export KT_DYNAMIC_RESIDENT="${KT_DYNAMIC_RESIDENT:-1}"
 export KT_PREFILL_STREAM="${KT_PREFILL_STREAM:-1}"
 export KT_SIDE_STREAM="${KT_SIDE_STREAM:-1}"
+# NSA compressor 算子 ABI 选择器(非调优项,绑 CANN 版本):single=CANN 9.0.0+ 公开 18 参数/单交织
+# buffer;split=CANN 8.5.0 私有 19 参数/双分离 buffer。两者不兼容、无运行时回退(见 nsa_compressor_mode.py)。
+# 按 CANN 主版本自动探测(从 ASCEND_TOOLKIT_HOME/HOME_PATH 路径里的 cann-X):>=9 → single,否则 split。
+# 这样 910C(cann-9.0.0)与 910B(cann-8.5.0)裸启动都对;显式 KT_NSA_COMPRESSOR_MODE 仍优先。
+if [[ -z "${KT_NSA_COMPRESSOR_MODE:-}" ]]; then
+  _cann_major="$(echo "${ASCEND_TOOLKIT_HOME:-${ASCEND_HOME_PATH:-}}" | grep -oE 'cann-[0-9]+' | grep -oE '[0-9]+' | head -1)"
+  if [ "${_cann_major:-0}" -ge 9 ]; then KT_NSA_COMPRESSOR_MODE=single; else KT_NSA_COMPRESSOR_MODE=split; fi
+fi
+export KT_NSA_COMPRESSOR_MODE
 # 流式 prefill 的最小 chunk 长度门槛(kt_stream_prefill.py:_T)。prefill chunk 的 token 数 >= 此值
 # 才走流式 prefill;而 **dynamic hot expert(KT_DYNAMIC_RESIDENT)的常驻热专家槽正是在流式 prefill
 # 路径里刷新的** —— 所以低于门槛的短 prefill 走 hybrid、那一发不更新热专家。想让更短的 prompt 也
@@ -106,14 +122,21 @@ export KT_PREFILL_STREAM_THRESHOLD="${KT_PREFILL_STREAM_THRESHOLD:-512}"
 # 勿用 KT_GGUF_TEMPLATE="${KT:-...dsv4_layer{layer_idx}.gguf}"：bash 会把 {layer_idx} 的第一个 ``}`` 当成 ``${...:-}`` 的结束符，路径会变成 ``...{layer_idx.gguf}``。
 # 默认 Q8_0（批量 convert 输出 dsv4_layer{L}.gguf）。须先 cp 新 kt_kernel_ext.so 到 kt-kernel/python/（手册 §2.4）。
 # BF16 回退：export KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_bf16.gguf'
+# GGUF 权重缓存目录:自动探测(本盒 /mnt/workspace、旧镜像 /workspace),可用 KT_GGUF_CACHE_DIR 覆盖。
+if [[ -z "${KT_GGUF_CACHE_DIR:-}" ]]; then
+  for _c in /mnt/workspace/models/cache /workspace/models/cache; do
+    [[ -d "$_c" ]] && { KT_GGUF_CACHE_DIR="$_c"; break; }
+  done
+  KT_GGUF_CACHE_DIR="${KT_GGUF_CACHE_DIR:-/workspace/models/cache}"
+fi
 if [[ -z "${KT_GGUF_TEMPLATE:-}" ]]; then
   if [[ "${KT_MXFP4_DEPOOL:-}" == "1" ]]; then
     # depool：NPU 侧本就 MXFP4，CPU 专家也走 MXFP4 GGUF（3.4GB/层 vs Q8_0 6.8GB/层）。CPU MoE 是
     # 内存带宽 bound，Q8_0 默认会让 depool decode off_cpu ~2×(22 vs 14ms,13 vs 16tps);MXFP4 ≈ plain。
     # 见 memory depool-decode-needs-mxfp4-gguf。显式 export KT_GGUF_TEMPLATE 仍优先(不被本默认覆盖)。
-    KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}_mxfp4.gguf'
+    KT_GGUF_TEMPLATE="$KT_GGUF_CACHE_DIR/dsv4_layer{layer_idx}_mxfp4.gguf"
   else
-    KT_GGUF_TEMPLATE='/workspace/models/cache/dsv4_layer{layer_idx}.gguf'
+    KT_GGUF_TEMPLATE="$KT_GGUF_CACHE_DIR/dsv4_layer{layer_idx}.gguf"
   fi
 fi
 # ★必须 export：除了 --kt-weight-path（CPU MoE）外，GGUF dedup（KT_MXFP4_GGUF_DEDUP=1）从
@@ -133,14 +156,18 @@ QUANTIZATION="${QUANTIZATION:-compressed-tensors}"
 # wins on safety: 8 cores/NUMA headroom vs 160's 4. The old "<=96, >=128 thrashes" note was a
 # live-server-contention artifact, not intrinsic. Override with KT_CPUINFER (160 fine too).
 # (profiling: doc/zh/dsv4_single_npu/graph_decode_bandwidth_handoff.md, 2026-06-09)
-KT_CPUINFER="${KT_CPUINFER:-128}"
-# kt-kernel builds one NUMA subpool per threadpool_count and binds subpool i to NUMA
-# node i (numa_nodes defaults to 0,1,...,count-1). MUST equal the box's NUMA node count,
-# else you get "NUMA node N not found" + set_mempolicy failures for the missing nodes.
-# Reference image = 8 NUMA nodes (default 8). Single-NUMA boxes (e.g. 40-core/1-node 910C
-# A3 host): set KT_THREADPOOL_COUNT=1 and KT_CPUINFER<=cores (~32). threads/subpool =
-# KT_CPUINFER / KT_THREADPOOL_COUNT.
-KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-8}"
+#
+# 默认改为「按机器自动探测」(显式 env 仍优先):
+#   * KT_THREADPOOL_COUNT = 实际 NUMA 节点数(kt-kernel 每节点一个子池并绑核;必须 == 机器 NUMA 数,
+#     否则 "NUMA node N not found" + set_mempolicy 失败)。参考镜像=8;本盒 910C(A3)=1。
+#   * KT_CPUINFER = 总核数 − 8×NUMA(每 NUMA 留 8 核给 NumaJobDistributor 自旋线程 + NPU host 回调 +
+#     python/OS,避免占满核 thrash)。参考镜像 192−64=128(=旧默认);本盒 40−8=32。threads/subpool =
+#     KT_CPUINFER / KT_THREADPOOL_COUNT。占满全核会崩(无余量给 NPU host 线程)。
+_NUMA_N="$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)"; [ "${_NUMA_N:-0}" -lt 1 ] && _NUMA_N=1
+_NCORE="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
+_INFER=$(( _NCORE - 8 * _NUMA_N )); [ "$_INFER" -lt 1 ] && _INFER="$_NCORE"
+KT_CPUINFER="${KT_CPUINFER:-$_INFER}"
+KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-$_NUMA_N}"
 PORT="${PORT:-8000}"
 # ASCEND_TOOLKIT_HOME is the SINGLE anchor — ATB(nnal), opp vendors, custom-op paths all derive
 # from it. Take it from the environment (CANN's set_env.sh exports both ASCEND_TOOLKIT_HOME and

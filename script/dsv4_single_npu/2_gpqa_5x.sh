@@ -17,15 +17,44 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
 cd "$REPO"
 
-export PY="${PY:-/usr/local/python3.11.14/bin/python3.11}"
+# 解析 python3.11:PY / PYTHON_BIN 覆盖 > PATH > 常见安装位置
+_resolve_py() {
+  for v in "${PY:-}" "${PYTHON_BIN:-}"; do
+    [ -n "$v" ] && [ -x "$v" ] && { echo "$v"; return; }
+  done
+  local p
+  for c in python3.11 /opt/buildtools/Python-3.11.4/bin/python3.11 \
+           /usr/local/python3.11.14/bin/python3.11 /usr/bin/python3.11; do
+    p="$(command -v "$c" 2>/dev/null || true)"
+    [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return; }
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+}
+export PY="$(_resolve_py)"
+[ -z "$PY" ] && { echo "找不到 python3.11，请设 PYTHON_BIN=/path/to/python3.11"; exit 1; }
 export PATH="$(dirname "$PY"):$PATH"
 PORT="${PORT:-8020}"
 HOST="${HOST:-127.0.0.1}"
 REPEATS="${REPEATS:-5}"
-MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8}"
+# MODEL_PATH 默认:自动探测(本盒 /mnt/workspace、旧镜像 /workspace),显式 env 仍优先。
+if [[ -z "${MODEL_PATH:-}" ]]; then
+  for _c in /mnt/workspace/models/DeepSeek-V4-Flash-W8A8 \
+            /workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8; do
+    [[ -d "$_c" ]] && { MODEL_PATH="$_c"; break; }
+  done
+  MODEL_PATH="${MODEL_PATH:-/workspace/models/DeepSeekV4/DeepSeek-V4-Flash-W8A8}"
+fi
 STAMP="$("$PY" -c 'import time;print(time.strftime("%Y%m%d_%H%M%S"))')"
 OUT_PREFIX="${OUT_PREFIX:-eval_gpqa_R}"
-ARCH="${ARCH:-/workspace/models/eval_archive/gpqa_off_5x_${STAMP}}"
+# 归档输出目录:选一个可写的 base(本盒 /mnt/workspace、旧镜像 /workspace,都不可写则落仓库 logs/)。
+if [[ -z "${ARCH:-}" ]]; then
+  for _b in /mnt/workspace/models/eval_archive /workspace/models/eval_archive \
+            "$REPO/logs/dsv4_single_npu/eval_archive"; do
+    _d="$(dirname "$_b")"
+    [[ -d "$_d" && -w "$_d" ]] && { ARCH="$_b/gpqa_off_5x_${STAMP}"; break; }
+  done
+  ARCH="${ARCH:-$REPO/logs/dsv4_single_npu/eval_archive/gpqa_off_5x_${STAMP}}"
+fi
 # 日志同时落到仓库内持久目录（可被 review/分析）；控制台也实时上屏（前台）。
 LOGDIR="${LOGDIR:-$REPO/logs/dsv4_single_npu}"
 mkdir -p "$LOGDIR"

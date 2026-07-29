@@ -15,7 +15,19 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
 cd "$REPO"
 
-PY="${PYTHON_BIN:-/usr/local/python3.11.14/bin/python3.11}"
+# 解析 python3.11:PYTHON_BIN 覆盖 > PATH > 常见安装位置
+_resolve_py() {
+  if [ -n "${PYTHON_BIN:-}" ] && [ -x "${PYTHON_BIN:-}" ]; then echo "$PYTHON_BIN"; return; fi
+  local p
+  for c in python3.11 /opt/buildtools/Python-3.11.4/bin/python3.11 \
+           /usr/local/python3.11.14/bin/python3.11 /usr/bin/python3.11; do
+    p="$(command -v "$c" 2>/dev/null || true)"
+    [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return; }
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+}
+PY="$(_resolve_py)"
+[ -z "$PY" ] && { echo "找不到 python3.11，请设 PYTHON_BIN=/path/to/python3.11"; exit 1; }
 NPU_DEVICE_ID="${NPU_DEVICE_ID:-2}"
 PORT="${PORT:-8020}"
 LOGDIR="${LOGDIR:-$REPO/logs/dsv4_single_npu}"

@@ -1,0 +1,8 @@
+# 实验产物(逐 token logprob 转储可达 10MB+):脚本可重新生成,统计结论见 REPORT。
+data/
+__pycache__/
+
+# 顶层 .gitignore 的 `build*` 会吞掉本目录的 build_*.py 样本构造脚本。
+!build_samples.py
+!build_letter_samples.py
+!build_long_samples.py

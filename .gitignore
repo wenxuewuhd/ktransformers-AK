@@ -55,3 +55,6 @@ eval_gpqa_*/
 eval_gpqa_*.log
 rep10_clean.log
 evalscope/
+
+# dsv4 upstream 交接补丁(全局 *.patch 忽略的例外)
+!doc/zh/dsv4_single_npu/patches/*.patch

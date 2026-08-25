@@ -113,8 +113,11 @@ fi
 
 if [ "${DSV4_PREFILL_STREAM:-0}" = "1" ]; then
   sec "5. Streaming prefill actually engaged"
-  _inline="$(grep -c 'inline resident' "${LOG}" 2>/dev/null || echo 0)"
-  _fallback="$(grep -cE 'streaming failed|hybrid fallback' "${LOG}" 2>/dev/null || echo 0)"
+  # grep -c prints "0" AND exits 1 when there are no matches, so `|| echo 0`
+  # appends a SECOND zero and the value becomes the two-line string "0\n0",
+  # which makes the -eq test below abort with "integer expression expected".
+  _inline="$(grep -c 'inline resident' "${LOG}" 2>/dev/null)" || _inline=0
+  _fallback="$(grep -cE 'streaming failed|hybrid fallback' "${LOG}" 2>/dev/null)" || _fallback=0
   if [ "${_inline}" -gt 0 ] && [ "${_fallback}" -eq 0 ]; then
     ok "inline resident=${_inline}, hybrid fallback=${_fallback}"
   else

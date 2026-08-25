@@ -80,7 +80,16 @@ elseif(USE_CONDA_TOOLCHAIN)
     set(CMAKE_CXX_COMPILER ${CONDA_CXX} CACHE FILEPATH "C++ compiler" FORCE)
 else()
     # Prefer system compilers explicitly to avoid accidentally picking conda wrappers from PATH
-    if(EXISTS "/usr/bin/gcc" AND EXISTS "/usr/bin/g++")
+    # Honor an explicit CC/CXX before falling back to /usr/bin/gcc. Without this the
+    # CACHE ... FORCE below wins over CC/CXX, a PATH-prepended gcc, and even
+    # -DCMAKE_CXX_COMPILER, so a host whose /usr/bin/g++ is gcc-9 cannot build at all:
+    # cpu_backend/worker_pool.h needs C++20 <barrier>, which libstdc++ ships from GCC 11.
+    # (Equivalent to pr2157-a3-adapt commit 45ee748.)
+    if(DEFINED ENV{CC} AND DEFINED ENV{CXX})
+        set(CMAKE_C_COMPILER   "$ENV{CC}"  CACHE FILEPATH "C compiler" FORCE)
+        set(CMAKE_CXX_COMPILER "$ENV{CXX}" CACHE FILEPATH "C++ compiler" FORCE)
+        message(STATUS "Honoring explicit CC=$ENV{CC} CXX=$ENV{CXX}")
+    elseif(EXISTS "/usr/bin/gcc" AND EXISTS "/usr/bin/g++")
         set(CMAKE_C_COMPILER   "/usr/bin/gcc" CACHE FILEPATH "C compiler" FORCE)
         set(CMAKE_CXX_COMPILER "/usr/bin/g++" CACHE FILEPATH "C++ compiler" FORCE)
     endif()

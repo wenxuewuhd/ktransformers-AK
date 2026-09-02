@@ -24,17 +24,12 @@ import json
 
 import numpy as np
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_GGUF_PY = Path(os.environ.get("KT_GGUF_PY", _REPO_ROOT / "third_party" / "llama.cpp" / "gguf-py"))
-if not _GGUF_PY.is_dir():
-    raise SystemExit(
-        f"gguf-py not found at {_GGUF_PY}.\n"
-        "Initialize the submodule first:\n"
-        f"  git -C {_REPO_ROOT} submodule update --init --progress third_party/llama.cpp\n"
-        "or point KT_GGUF_PY at a gguf-py that knows GGML_TYPE_MXFP4 (id 39)."
-    )
-sys.path.insert(0, str(_GGUF_PY))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# One resolver for both scripts: whichever gguf actually knows GGML_TYPE_MXFP4 wins, so
+# this runs before the llama.cpp submodule is populated.  Importing it here also fixes
+# sys.path for the bare `import gguf` inside layer_test().
+from convert_mxfp4_gguf import gguf  # noqa: E402,F401
 
 FP4_TABLE = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                       0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=np.float32)
@@ -95,24 +90,29 @@ def unit_test(seed: int = 0) -> None:
     print(f"[unit] PASS: repack lossless, {a.size} elements bit-exact (N={N},K={K})")
 
 def layer_test(gguf_path: Path, model_dir: Path, layer_idx: int, n_experts_check: int) -> None:
-    import gguf
     from safetensors import safe_open
     import torch
-    from convert_mxfp4_gguf import _load_weight_map, _detect_experts_prefix, _open_shard, _as_u8
+    from convert_mxfp4_gguf import (
+        _as_u8,
+        _detect_expert_naming,
+        _load_weight_map,
+        _open_shard,
+        _text_config,
+    )
 
     reader = gguf.GGUFReader(str(gguf_path))
     tmap = {t.name: t for t in reader.tensors}
     weight_map = _load_weight_map(model_dir)
-    prefix = _detect_experts_prefix(weight_map, layer_idx)
+    naming = _detect_expert_naming(weight_map, layer_idx)
     cache: dict = {}
 
     # (gguf tensor name, native proj, K)
-    cfg = json.loads((model_dir / "config.json").read_text())
+    cfg = _text_config(json.loads((model_dir / "config.json").read_text()))
     hidden = int(cfg["hidden_size"])
     inter = int(cfg["moe_intermediate_size"])
-    projs = [(f"blk.{layer_idx}.ffn_gate_exps.weight", "w1", hidden),
-             (f"blk.{layer_idx}.ffn_up_exps.weight", "w3", hidden),
-             (f"blk.{layer_idx}.ffn_down_exps.weight", "w2", inter)]
+    projs = [(f"blk.{layer_idx}.ffn_gate_exps.weight", naming.gate, hidden),
+             (f"blk.{layer_idx}.ffn_up_exps.weight", naming.up, hidden),
+             (f"blk.{layer_idx}.ffn_down_exps.weight", naming.down, inter)]
 
     for gname, proj, K in projs:
         t = tmap[gname]
@@ -122,8 +122,8 @@ def layer_test(gguf_path: Path, model_dir: Path, layer_idx: int, n_experts_check
         packed = np.asarray(t.data).reshape(E, N, nb * 17)
         ok = True
         for e in range(min(n_experts_check, E)):
-            wk = f"{prefix}.{e}.{proj}.weight"
-            sk = f"{prefix}.{e}.{proj}.scale"
+            wk = naming.weight_key(e, proj)
+            sk = naming.scale_key(e, proj)
             h = _open_shard(model_dir, weight_map, cache, wk)
             w_u8 = _as_u8(h.get_tensor(wk))
             s_u8 = _as_u8(h.get_tensor(sk))
@@ -151,6 +151,11 @@ def _set_main(argv) -> int:
     ap.add_argument("--name-tpl", type=str, default="dsv4_layer{L}_mxfp4.gguf")
     ap.add_argument("--expect-layers", type=int, default=None,
                     help="Layer count. Default: num_hidden_layers from --model-dir, else the file count found")
+    ap.add_argument("--layer-start", type=int, default=None,
+                    help="First layer index. Default: first_k_dense_replace from --model-dir, else 0. "
+                          "GLM-5.3's expert-bearing layers start at 3; DeepSeek-V4's at 0.")
+    ap.add_argument("--layer-end", type=int, default=None,
+                    help="Last layer index, inclusive. Default: layer-start + expect-layers - 1")
     ap.add_argument("--expected-size", type=int, default=None,
                     help="Exact bytes per file. Default: the most common size in the directory")
     ap.add_argument("--sha256-manifest", type=Path, default=None,
@@ -168,16 +173,31 @@ def _set_main(argv) -> int:
     fail = False
 
     # ---- how many layers do we expect? ----
+    # The converted set is a CONTIGUOUS RANGE of model layer indices, not 0..N-1: a
+    # model with leading dense layers starts higher, and the files are named by the
+    # model's own absolute layer index because that is what --kt-weight-path formats.
+    cfg_d = {}
+    if args.model_dir is not None:
+        cfg_p = args.model_dir.expanduser().resolve() / "config.json"
+        if cfg_p.is_file():
+            raw = json.loads(cfg_p.read_text())
+            cfg_d = raw.get("text_config", raw)
     n_layers = args.expect_layers
-    if n_layers is None and args.model_dir is not None:
-        cfg = args.model_dir.expanduser().resolve() / "config.json"
-        if cfg.is_file():
-            n_layers = int(json.loads(cfg.read_text())["num_hidden_layers"])
+    layer_start = args.layer_start
+    if layer_start is None:
+        layer_start = int(cfg_d.get("first_k_dense_replace", 0) or 0)
     present = sorted(d.glob(args.name_tpl.replace("{L}", "*")))
-    if n_layers is None:
-        n_layers = len(present)
-        print(f"[L1] no layer count given; assuming the {n_layers} files present are the full set")
-    layers = list(range(n_layers))
+    if args.layer_end is not None:
+        layers = list(range(layer_start, args.layer_end + 1))
+        n_layers = len(layers)
+    else:
+        if n_layers is None and cfg_d:
+            n_layers = int(cfg_d["num_hidden_layers"]) - layer_start
+        if n_layers is None:
+            n_layers = len(present)
+            print(f"[L1] no layer count given; assuming the {n_layers} files present are the full set")
+        layers = list(range(layer_start, layer_start + n_layers))
+    print(f"[L1] expecting layers {layers[0]}..{layers[-1]} ({n_layers} files)")
 
     # ---- what size should each file be? ----
     expected_size = args.expected_size

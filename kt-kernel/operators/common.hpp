@@ -252,9 +252,31 @@ struct GeneralMOEConfig {
     }
   }
 
+  // When true, the CPU backend allocates and loads BufferB only for experts
+  // whose gpu_experts_mask entry is false. The mask then also describes CPU
+  // *residency*, not just routing: touching the weights of a masked expert is
+  // a null dereference. Opt-in because only the MXFP4 backend implements the
+  // matching skips in its load path (see operators/amx/fp4-moe.hpp).
+  // Origin: dsv4-a5 single-card offload (stage 0.6).
+  bool skip_gpu_expert_weights = false;
+
+  // Pure residency test: true iff `expert_id` lives on the accelerator and has
+  // no CPU-side weights. No bounds handling, so it is safe to drive allocation
+  // loops (0 <= expert_id < expert_num by construction there).
+  inline bool is_gpu_expert(int64_t expert_id) const {
+    return gpu_experts_mask != nullptr && gpu_experts_mask[expert_id];
+  }
+
+  // True iff the CPU has no weights for `expert_id` because it was never
+  // allocated. Identical to is_gpu_expert() unless the subset mode is off, in
+  // which case every expert is resident on the CPU as well.
+  inline bool lacks_cpu_weights(int64_t expert_id) const {
+    return skip_gpu_expert_weights && is_gpu_expert(expert_id);
+  }
+
   // Check if expert should be skipped (invalid, out of range, or on GPU)
   inline bool should_skip_expert(int64_t expert_id) const {
-    return expert_id < 0 || expert_id >= expert_num || (gpu_experts_mask && gpu_experts_mask[expert_id]);
+    return expert_id < 0 || expert_id >= expert_num || is_gpu_expert(expert_id);
   }
 
   void* gate_proj = nullptr;

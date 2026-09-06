@@ -14,6 +14,7 @@ import torch
 from enum import IntEnum
 from safetensors import safe_open
 from gguf.gguf_reader import GGUFReader
+from typing import Optional, Sequence
 
 
 class GGMLQuantizationType(IntEnum):
@@ -1212,6 +1213,9 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
 
     EXPERTS_PATH_TPL = "{base}.ffn.experts"
     PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
+    # load_experts() honours an explicit `expert_ids` subset. Probed by
+    # NativeMoEWrapper.load_weights so other loaders keep their old signature.
+    SUPPORTS_EXPERT_SUBSET = True
 
     def _experts_prefix_candidates(self, base_key: str) -> list[str]:
         candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
@@ -1230,7 +1234,20 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         # because torch CPU has no lshift kernel for uint16.
         return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
 
-    def load_experts(self, base_key: str, device: str = "cpu"):
+    def load_experts(self, base_key: str, device: str = "cpu", expert_ids: Optional[Sequence[int]] = None):
+        """Materialise expert weights for one layer.
+
+        Args:
+            expert_ids: when given, only these logical expert ids are read from
+                the checkpoint; every other slot of the returned lists stays
+                ``None``. The lists keep their full ``expert_count`` length so
+                callers can go on indexing them by logical expert id (the C++
+                side does exactly that, via ``config.gate_projs[0][expert_id]``).
+                This is what makes partial CPU residency affordable: a full
+                DeepSeek-V4-Flash layer is 3.19 GiB of routed experts, and the
+                offloaded subset is typically 96/256 of it.
+                Origin: dsv4-a5 single-card offload (stage 0.6).
+        """
         gate_name, up_name, down_name = self.PROJ_NAMES
         prefix = None
         expert_count = 0
@@ -1246,6 +1263,16 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 f"No MXFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
             )
 
+        if expert_ids is None:
+            wanted = range(expert_count)
+        else:
+            wanted = sorted({int(e) for e in expert_ids})
+            if wanted and (wanted[0] < 0 or wanted[-1] >= expert_count):
+                raise ValueError(
+                    f"expert_ids out of range for {prefix}: got [{wanted[0]}, {wanted[-1]}], "
+                    f"checkpoint has {expert_count} experts"
+                )
+
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
         down_weights = [None] * expert_count
@@ -1253,7 +1280,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         up_scales = [None] * expert_count
         down_scales = [None] * expert_count
 
-        for exp_id in range(expert_count):
+        for exp_id in wanted:
             for proj, dst in (
                 (gate_name, gate_weights),
                 (up_name, up_weights),
@@ -1272,7 +1299,8 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
                 dst[exp_id] = self._ue8m0_to_bf16(s)
 
-        print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        loaded = expert_count if expert_ids is None else len(wanted)
+        print(f"[MXFP4SafeTensorLoader] Loaded {loaded}/{expert_count} experts from {prefix}")
         return {
             "gate": gate_weights,
             "up": up_weights,

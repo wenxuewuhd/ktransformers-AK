@@ -864,6 +864,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       // false. MXFP4 only; see GeneralMOEConfig::skip_gpu_expert_weights.
       // Origin: dsv4-a5 single-card offload (stage 0.6).
       .def_readwrite("skip_gpu_expert_weights", &GeneralMOEConfig::skip_gpu_expert_weights)
+      // MXFP4 only: store E8M0 scales as one byte per k-group instead of one
+      // FP32. Default false; see GeneralMOEConfig::compact_mxfp4_scales.
+      .def_readwrite("compact_mxfp4_scales", &GeneralMOEConfig::compact_mxfp4_scales)
       .DEF_PTR_PROPERTY(GeneralMOEConfig, physical_to_logical_map)
 
       .DEF_PTR_PROPERTY(GeneralMOEConfig, gate_proj)

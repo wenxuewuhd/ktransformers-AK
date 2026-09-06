@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <type_traits>
@@ -46,6 +47,20 @@
   })
 
 #define expert_map(m, x) (m != nullptr ? m[(x)] : (x))
+
+// Runtime switch for the per-phase decode timing in
+// operators/amx/moe_base.hpp::forward_decode. Off by default; the check is one
+// predictable load of a function-local static, and it only guards work that is
+// already outside the per-task inner loops.
+//   KT_MOE_PHASE_TIMING=1 ./your_run   ->  one line per layer per NUMA node
+// Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
+inline bool kt_moe_phase_timing() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("KT_MOE_PHASE_TIMING");
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
@@ -259,6 +274,15 @@ struct GeneralMOEConfig {
   // matching skips in its load path (see operators/amx/fp4-moe.hpp).
   // Origin: dsv4-a5 single-card offload (stage 0.6).
   bool skip_gpu_expert_weights = false;
+
+  // When true, the MXFP4 BufferB stores one E8M0 exponent byte per k-group
+  // instead of one FP32, shrinking a resident expert from 0.625 to 0.53125
+  // bytes per weight element (15.014 -> 12.76 MiB per expert per layer, i.e.
+  // 15.0% less host RAM). Native MXFP4 checkpoints are E8M0 by construction;
+  // a scale that is not a positive power of two now throws at load time
+  // instead of silently taking the FP32 fallback, so this stays opt-in.
+  // Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
+  bool compact_mxfp4_scales = false;
 
   // Pure residency test: true iff `expert_id` lives on the accelerator and has
   // no CPU-side weights. No bounds handling, so it is safe to drive allocation

@@ -230,14 +230,63 @@ struct GemmKernel224MXFP4SmallKGroup {
 
     uint8_t* scale_e8;
     bool scale_e8_valid = false;
+    // True when the buffer was sized for one exponent byte per k-group instead
+    // of one FP32. Native MXFP4 scales are E8M0 by construction, so the FP32
+    // slot is dead weight: 4 -> 1 byte per 32 weights is 15.0% of the resident
+    // MXFP4 expert (2.25 of 15.014 MiB per expert per layer). In this mode `d`
+    // is null and every FP32 scale path is unreachable; loading a scale that is
+    // not a positive power of two throws instead of silently degrading.
+    // Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
+    bool compact = false;
 
     static size_t required_size(int n, int k, int k_group_size) { return Base::required_size(n, k, k_group_size); }
 
-    BufferB(int n_, int k_, int k_group_size_, void* ptr) : Base(n_, k_, k_group_size_, ptr) {
+    static size_t required_size(int n, int k, int k_group_size, bool compact) {
+      if (!compact) return Base::required_size(n, k, k_group_size);
+      return sizeof(int8_t) * static_cast<size_t>(n) * k / 2 +
+             sizeof(uint8_t) * static_cast<size_t>(n) * (k / k_group_size);
+    }
+
+    BufferB(int n_, int k_, int k_group_size_, void* ptr) : BufferB(n_, k_, k_group_size_, ptr, false) {}
+
+    BufferB(int n_, int k_, int k_group_size_, void* ptr, bool compact_)
+        : Base(n_, k_, k_group_size_, ptr), compact(compact_) {
       // The compact bytes replace the FP32 contents in-place after validation.
       // Forward compression is overlap-safe: byte i is always written below
       // the first byte of every not-yet-read float j > i.
       scale_e8 = reinterpret_cast<uint8_t*>(d);
+      if (compact) {
+        // Nothing was allocated past the exponent bytes; make every FP32 read
+        // a null dereference rather than an out-of-bounds one.
+        d = nullptr;
+        scale_e8_valid = true;
+      }
+    }
+
+    // Fill the scale region from the loader's BF16 source. In compact mode the
+    // exponent byte is taken straight from the BF16 bit pattern (a positive
+    // power of two is exponent<<7 with a zero mantissa), so no FP32 ever
+    // materialises. In the legacy mode this is exactly the previous sequence
+    // (convert to FP32, then compact in place).
+    void load_scales_bf16(const ggml_bf16_t* source, size_t count) {
+      if (!compact) {
+        convert_or_copy(d, source, count);
+        finalize_scale_e8();
+        return;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        const uint16_t bits = source[i].bits;
+        const uint16_t exponent = static_cast<uint16_t>((bits >> 7) & 0xFFu);
+        const bool is_positive_power_of_two =
+            (bits & 0x8000u) == 0 && (bits & 0x007Fu) == 0 && exponent != 0 && exponent != 0xFFu;
+        if (!is_positive_power_of_two) {
+          throw std::runtime_error(
+              "MXFP4 compact scales: scale " + std::to_string(i) +
+              " is not a positive power of two (bf16 bits 0x" + std::to_string(bits) +
+              "). Set KT_MXFP4_COMPACT_SCALES=0 to fall back to the FP32 scale slot.");
+        }
+        scale_e8[i] = static_cast<uint8_t>(exponent);
+      }
     }
 
     void finalize_scale_e8() {
@@ -269,7 +318,10 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
 
     float* get_scale(int n_, int n_begin, int k_, int k_begin) {
-      if (!scale_e8_valid) return Base::get_scale(n_, n_begin, k_, k_begin);
+      if (!scale_e8_valid) {
+        assert(!compact);
+        return Base::get_scale(n_, n_begin, k_, k_begin);
+      }
       constexpr int max_group_count = K_BLOCK / 32;
       const int group_count = k_ / k_group_size;
       assert(group_count <= max_group_count);
@@ -711,7 +763,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   // BufferA: raw BF16, no group_size needed
   size_t buffer_a_required_size_impl(size_t m, size_t k) const { return T::BufferA::required_size(m, k); }
   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
-    return T::BufferB::required_size(n, k, config_.quant_config.group_size);
+    return T::BufferB::required_size(n, k, config_.quant_config.group_size, config_.compact_mxfp4_scales);
   }
   size_t buffer_c_required_size_impl(size_t m, size_t n) const { return T::BufferC::required_size(m, n); }
 
@@ -719,7 +771,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     return std::make_shared<typename T::BufferA>(m, k, data);
   }
   std::shared_ptr<typename T::BufferB> make_buffer_b_impl(size_t n, size_t k, void* data) const {
-    return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data);
+    return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data,
+                                                 config_.compact_mxfp4_scales);
   }
   std::shared_ptr<typename T::BufferC> make_buffer_c_impl(size_t m, size_t n, void* data) const {
     return std::make_shared<typename T::BufferC>(m, n, data);
@@ -848,15 +901,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
-          convert_or_copy(gate_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          convert_or_copy(up_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          convert_or_copy(down_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          gate_bb_[expert_idx]->finalize_scale_e8();
-          up_bb_[expert_idx]->finalize_scale_e8();
-          down_bb_[expert_idx]->finalize_scale_e8();
+          gate_bb_[expert_idx]->load_scales_bf16(
+              (const ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+          up_bb_[expert_idx]->load_scales_bf16(
+              (const ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+          down_bb_[expert_idx]->load_scales_bf16(
+              (const ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
         },
         nullptr);
   }

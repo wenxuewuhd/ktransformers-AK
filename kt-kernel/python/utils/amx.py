@@ -926,6 +926,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # skips are implemented in the MXFP4 load path alone.
         # Origin: dsv4-a5 single-card offload (stage 0.6).
         moe_config.skip_gpu_expert_weights = bool(load_kwargs)
+        # Store the E8M0 scale as one byte per k-group instead of one FP32.
+        # Native MXFP4 checkpoints (DeepSeek-V4-Flash) carry F8_E8M0 scales, so
+        # the FP32 slot never holds anything but a power of two -- 15.0% of the
+        # resident expert (2.25 of 15.014 MiB per expert per layer) is dead.
+        # Opt out with KT_MXFP4_COMPACT_SCALES=0 if a checkpoint ever ships a
+        # scale that is not a positive power of two (the loader throws then).
+        # Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
+        moe_config.compact_mxfp4_scales = self.method == "MXFP4" and os.environ.get(
+            "KT_MXFP4_COMPACT_SCALES", "1"
+        ) not in ("0", "false", "False")
 
         # Use gate_projs instead of gate_proj for per-expert pointers
         moe_config.gate_projs = gate_ptrs

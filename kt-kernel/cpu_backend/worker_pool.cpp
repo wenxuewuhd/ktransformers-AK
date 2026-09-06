@@ -18,11 +18,130 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <vector>
 
 #include "hwloc.h"
 
 thread_local int WorkerPool::thread_local_id = -1;
+
+// ---------------------------------------------------------------------------
+// Core selection for worker binding.
+//
+// The historical order is hwloc's "logical index inside the NUMA cpuset",
+// which is dense: worker i lands on core i, so the first 8 workers of a node
+// all land on the first L3 domain.  On Zen5 (EPYC 9575F) an L3 domain is one
+// CCD of 8 cores and a single CCD saturates at ~76 GB/s while the socket
+// sustains ~246 GB/s, so a dense order caps a low-thread MoE forward at a
+// third of the achievable read bandwidth.  MXFP4 decode is a pure streaming
+// read, and it dispatches only nth*experts*2 tasks (8 tasks for one activated
+// expert), so it lives exactly in that low-thread regime.
+//
+// Default order therefore round-robins over L3 domains: worker i goes to
+// domain (i % ndomains), slot (i / ndomains).  Set KT_CPU_BIND=pack to get the
+// old dense order back (A/B without a rebuild).
+// Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
+// ---------------------------------------------------------------------------
+static bool kt_cpu_bind_striped() {
+  static const bool striped = [] {
+    const char* v = std::getenv("KT_CPU_BIND");
+    if (v == nullptr) return true;
+    if (std::strcmp(v, "pack") == 0 || std::strcmp(v, "dense") == 0 || std::strcmp(v, "0") == 0) return false;
+    return true;
+  }();
+  return striped;
+}
+
+// Cores of `numa_obj`, ordered so that consecutive indices land on different
+// L3 domains.  Falls back to the dense order when the topology exposes no
+// usable L3 grouping.  The cache holds duplicated bitmaps, not hwloc objects,
+// because each caller here loads its own topology and the two lifetimes are
+// unrelated.
+static const std::vector<hwloc_bitmap_t>& kt_striped_cores(hwloc_topology_t topology, hwloc_obj_t numa_obj,
+                                                           int numa_id) {
+  static std::mutex cache_mutex;
+  static std::map<int, std::vector<hwloc_bitmap_t>> cache;
+  std::lock_guard<std::mutex> guard(cache_mutex);
+  auto it = cache.find(numa_id);
+  if (it != cache.end()) return it->second;
+
+  std::vector<std::vector<hwloc_obj_t>> domains;
+  int l3_count = hwloc_get_nbobjs_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_L3CACHE);
+  for (int d = 0; d < l3_count; d++) {
+    hwloc_obj_t l3 = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_L3CACHE, d);
+    if (l3 == nullptr) continue;
+    std::vector<hwloc_obj_t> cores;
+    int core_count = hwloc_get_nbobjs_inside_cpuset_by_type(topology, l3->cpuset, HWLOC_OBJ_CORE);
+    for (int c = 0; c < core_count; c++) {
+      hwloc_obj_t core = hwloc_get_obj_inside_cpuset_by_type(topology, l3->cpuset, HWLOC_OBJ_CORE, c);
+      if (core != nullptr) cores.push_back(core);
+    }
+    if (!cores.empty()) domains.push_back(std::move(cores));
+  }
+
+  std::vector<hwloc_obj_t> ordered_objs;
+  if (domains.size() <= 1) {
+    int core_count = hwloc_get_nbobjs_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE);
+    for (int c = 0; c < core_count; c++) {
+      hwloc_obj_t core = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, c);
+      if (core != nullptr) ordered_objs.push_back(core);
+    }
+  } else {
+    size_t deepest = 0;
+    for (auto& d : domains) deepest = std::max(deepest, d.size());
+    for (size_t slot = 0; slot < deepest; slot++) {
+      for (auto& d : domains) {
+        if (slot < d.size()) ordered_objs.push_back(d[slot]);
+      }
+    }
+  }
+  std::vector<hwloc_bitmap_t> order;
+  order.reserve(ordered_objs.size());
+  for (hwloc_obj_t core : ordered_objs) order.push_back(hwloc_bitmap_dup(core->cpuset));
+  printf("[kt] NUMA %d core order: %zu L3 domains, %zu cores, mode=%s\n", numa_id, domains.size(), order.size(),
+         kt_cpu_bind_striped() ? "stripe" : "pack");
+  return cache.emplace(numa_id, std::move(order)).first->second;
+}
+
+// Bind `handle` to the core that logical worker `index` of `numa_obj` owns.
+// Over-subscription (index >= core count) wraps onto SMT siblings instead of
+// leaving the thread unbound, but only in striped mode; pack mode keeps the
+// historical behaviour byte for byte.
+static bool kt_bind_worker(hwloc_topology_t topology, hwloc_obj_t numa_obj, int numa_id, int index,
+                           pthread_t handle) {
+  hwloc_const_cpuset_t core_cpuset = nullptr;
+  int pu_slot = 0;
+  if (kt_cpu_bind_striped()) {
+    const auto& order = kt_striped_cores(topology, numa_obj, numa_id);
+    if (order.empty()) return false;
+    core_cpuset = order[index % order.size()];
+    pu_slot = index / static_cast<int>(order.size());
+  } else {
+    hwloc_obj_t core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, index);
+    if (core_obj == nullptr) return false;
+    core_cpuset = core_obj->cpuset;
+  }
+  if (core_cpuset == nullptr) return false;
+
+  hwloc_bitmap_t cpuset = hwloc_bitmap_alloc();
+  hwloc_bitmap_copy(cpuset, core_cpuset);
+  if (pu_slot > 0) {
+    // Over-subscribed: fall onto this core's SMT siblings in order.
+    int pu_count = hwloc_get_nbobjs_inside_cpuset_by_type(topology, core_cpuset, HWLOC_OBJ_PU);
+    hwloc_obj_t pu = pu_count > 0
+                         ? hwloc_get_obj_inside_cpuset_by_type(topology, core_cpuset, HWLOC_OBJ_PU, pu_slot % pu_count)
+                         : nullptr;
+    if (pu != nullptr) hwloc_bitmap_copy(cpuset, pu->cpuset);
+  }
+  hwloc_bitmap_singlify(cpuset);
+  int res = hwloc_set_thread_cpubind(topology, handle, cpuset, HWLOC_CPUBIND_STRICT);
+  hwloc_bitmap_free(cpuset);
+  return res == 0;
+}
 
 InNumaPool::InNumaPool(int max_thread_num) {
   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
@@ -41,8 +160,7 @@ InNumaPool::InNumaPool(int max_thread_num) {
 InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
   printf("===========In NumaPool============\n");
   hwloc_topology_t topology;
-  hwloc_obj_t numa_obj, core_obj;
-  hwloc_bitmap_t cpuset;
+  hwloc_obj_t numa_obj;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
@@ -77,18 +195,8 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
       // throw std::runtime_error("NUMA node not found");
       continue;
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
-    if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
-      // throw std::runtime_error("Core not found inside NUMA node");
-      continue;
-    }
-    cpuset = hwloc_bitmap_alloc();
-    hwloc_bitmap_copy(cpuset, core_obj->cpuset);
-    hwloc_bitmap_singlify(cpuset);
-    auto res = hwloc_set_thread_cpubind(topology, native_handle, cpuset, HWLOC_CPUBIND_STRICT);
-    if (res != 0) {
-      fprintf(stderr, "Failed to set thread CPU binding: %s\n", strerror(errno));
+    if (!kt_bind_worker(topology, numa_obj, numa_id, i + threads_id_start, native_handle)) {
+      fprintf(stderr, "Failed to bind worker %d inside NUMA node %d\n", i + threads_id_start, numa_id);
     }
   }
 }
@@ -299,23 +407,8 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
       // throw std::runtime_error("NUMA node not found");
       continue;
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, start_id);
-    if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", 0, this_numa);
-      // throw std::runtime_error("Core not found inside NUMA node");
-      continue;
-    }
-    // 精简 cpuset
-    auto cpuset_simple = hwloc_bitmap_alloc();
-    hwloc_bitmap_copy(cpuset_simple, core_obj->cpuset);
-    hwloc_bitmap_singlify(cpuset_simple);
-    // 打印绑定的具体的 CPU 物理索引
-    unsigned long i_in;
-    // hwloc_bitmap_foreach_begin(i_in, cpuset_simple) { printf("Thread %d bound to CPU %ld\n", start_id, i_in); }
-    // hwloc_bitmap_foreach_end();
-    auto res = hwloc_set_thread_cpubind(topology, native_handle, cpuset_simple, HWLOC_CPUBIND_STRICT);
-    if (res != 0) {
-      fprintf(stderr, "Failed to set thread CPU binding: %s\n", strerror(errno));
+    if (!kt_bind_worker(topology, numa_obj, this_numa, start_id, native_handle)) {
+      fprintf(stderr, "Failed to bind distributor worker %d inside NUMA node %d\n", start_id, this_numa);
     }
     // 检查线程是否绑定到指定的 核上了
     hwloc_cpuset_t cpuset = hwloc_bitmap_alloc();

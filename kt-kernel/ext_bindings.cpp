@@ -860,6 +860,10 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
           "gpu_experts_mask",
           [](const GeneralMOEConfig& self) { return reinterpret_cast<uintptr_t>(self.gpu_experts_mask); },
           [](GeneralMOEConfig& self, uintptr_t val) { self.gpu_experts_mask = reinterpret_cast<uint8_t*>(val); })
+      // Allocate/load CPU BufferB only for experts with gpu_experts_mask ==
+      // false. MXFP4 only; see GeneralMOEConfig::skip_gpu_expert_weights.
+      // Origin: dsv4-a5 single-card offload (stage 0.6).
+      .def_readwrite("skip_gpu_expert_weights", &GeneralMOEConfig::skip_gpu_expert_weights)
       .DEF_PTR_PROPERTY(GeneralMOEConfig, physical_to_logical_map)
 
       .DEF_PTR_PROPERTY(GeneralMOEConfig, gate_proj)

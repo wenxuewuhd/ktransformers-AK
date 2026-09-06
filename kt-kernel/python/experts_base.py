@@ -460,6 +460,17 @@ class BaseMoEWrapper(_MoEBase, ABC):
         # Backend-specific initialization happens in subclasses
         self.moe = None
 
+    def cpu_expert_ids(self) -> List[int]:
+        """Logical ids of the experts this layer keeps on the CPU.
+
+        The complement of ``gpu_experts_mask``. The order is ascending logical
+        id; the list is *not* a compaction map -- the CPU backend keeps
+        indexing every per-expert structure by logical id, so an arbitrary
+        (non-prefix) residency mask works with no renumbering on either side.
+        Origin: dsv4-a5 single-card offload (stage 0.6).
+        """
+        return torch.nonzero(~self.gpu_experts_mask, as_tuple=False).flatten().tolist()
+
     @abstractmethod
     def load_weights_from_tensors(
         self,

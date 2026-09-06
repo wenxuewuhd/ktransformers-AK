@@ -131,6 +131,23 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
+      // Experts resident on the accelerator have no CPU weights when the
+      // caller opted into subset residency: skip the three BufferB
+      // allocations, which are the only per-expert allocations that scale
+      // with the weight size (0.625 B/element for MXFP4). The BufferA/BufferC
+      // handles above own no memory -- they are re-pointed into the shared
+      // pools on every forward -- so they stay in place and keep every vector
+      // indexable by the routed (logical) expert id. forward_prefill /
+      // forward_decode never reach a masked expert because
+      // should_skip_expert() filters it out of the routing first.
+      // Origin: dsv4-a5 single-card offload (stage 0.6).
+      if (config_.lacks_cpu_weights(static_cast<int64_t>(i))) {
+        gate_bb_.push_back(nullptr);
+        up_bb_.push_back(nullptr);
+        down_bb_.push_back(nullptr);
+        continue;
+      }
+
       void* gate_bb_ptr =
           std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));

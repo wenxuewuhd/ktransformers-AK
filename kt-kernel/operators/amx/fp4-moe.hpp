@@ -812,6 +812,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         nth * config_.expert_num, nullptr,
         [this, nth, physical_to_logical_map](int task_id) {
           uint64_t expert_idx = task_id / nth;
+          // No CPU BufferB was allocated for accelerator-resident experts.
+          if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
           gate_bb_[expert_idx]->from_raw_mat(
@@ -829,6 +831,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         nth * config_.expert_num, nullptr,
         [this, nth, physical_to_logical_map](int task_id) {
           uint64_t expert_idx = task_id / nth;
+          if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
           down_bb_[expert_idx]->from_raw_mat(
@@ -842,6 +845,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         config_.expert_num, nullptr,
         [this, physical_to_logical_map](int task_id) {
           uint64_t expert_idx = task_id;
+          if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
           convert_or_copy(gate_bb_[expert_idx]->d,
@@ -1074,6 +1078,11 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
         pool->get_subpool(i)->do_work_stealing_job(
             tpc.expert_num, nullptr,
             [&, i](int expert_id_) {
+              // Accelerator-resident experts have no CPU BufferB and the
+              // Python loader left their pointer entries null; leaving the
+              // staging pages untouched is also what keeps the staging
+              // allocation from ever becoming resident for them.
+              if (config.lacks_cpu_weights(expert_id_)) return;
               size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
 
               uint8_t* src_gate = (uint8_t*)config.gate_projs[0][expert_id];
@@ -1109,6 +1118,7 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
           pool->get_subpool(i)->do_work_stealing_job(
               tpc.expert_num, nullptr,
               [&, i](int expert_id_) {
+                if (config.lacks_cpu_weights(expert_id_)) return;
                 size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
 
                 memcpy((uint8_t*)tpc.gate_proj + ((expert_id * weight_elem_count) >> 1),
@@ -1174,6 +1184,14 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     if (w13_weight_ptrs.size() != gpu_tp_count || w13_scale_ptrs.size() != gpu_tp_count ||
         w2_weight_ptrs.size() != gpu_tp_count || w2_scale_ptrs.size() != gpu_tp_count)
       throw std::runtime_error("Pointer arrays size must match gpu_tp_count");
+    // Under partial CPU residency there is nothing to hand back for an expert
+    // that was never loaded on the CPU. Fail loudly rather than dereferencing
+    // a null BufferB. Origin: dsv4-a5 single-card offload (stage 0.6).
+    if (this->config.lacks_cpu_weights(expert_id))
+      throw std::runtime_error(
+          "write_weight_scale_to_buffer: expert " + std::to_string(expert_id) +
+          " has no CPU weights (skip_gpu_expert_weights is on and gpu_experts_mask[" +
+          std::to_string(expert_id) + "] is true)");
 
     this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,

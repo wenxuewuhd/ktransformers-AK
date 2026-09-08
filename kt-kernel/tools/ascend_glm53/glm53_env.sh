@@ -177,6 +177,12 @@ _glm53_undrive() {   # $1 = var name, $2 = name of the stamp holding our last va
   [ -n "${stamp}" ] && [ "${cur}" = "${stamp}" ] && unset "$1"
   return 0
 }
+# Streaming prefill is the default on this line: it is why the resident set is 28
+# rather than 32 and the static fraction 0.95 rather than 0.85, and the budget below
+# is derived on that basis. Set GLM53_PREFILL_STREAM=0 to fall back to the hybrid
+# resident+CPU-offload MoE path, which re-derives all three values.
+export GLM53_PREFILL_STREAM="${GLM53_PREFILL_STREAM:-1}"
+
 if [ -n "${GLM53_DERIVED_FOR_STREAM:-}" ] \
    && [ "${GLM53_DERIVED_FOR_STREAM}" != "${GLM53_PREFILL_STREAM:-0}" ]; then
   _glm53_undrive GLM53_MEM_FRACTION     _GLM53_DRV_MEMFRAC

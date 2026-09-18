@@ -277,6 +277,16 @@ class KTMoEWrapper:
         BaseMoEWrapper.set_capture_batch_sizes(capture_bs)
 
     @staticmethod
+    def set_capture_probe(probe):
+        """Install the host framework's graph-capture probe (None = sglang default).
+
+        See ``experts_base.set_capture_probe``.
+        """
+        from .experts_base import set_capture_probe
+
+        set_capture_probe(probe)
+
+    @staticmethod
     def get_capture_batch_sizes() -> List[int]:
         """
         Get currently configured capture batch sizes.

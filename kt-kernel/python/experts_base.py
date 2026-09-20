@@ -860,6 +860,46 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
+    def has_pending_deferred(self, layer_idx: Optional[int] = None) -> bool:
+        """True iff this layer left a deferred CPU task queued for the next layer.
+
+        Public read of the bookkeeping ``submit_forward`` / ``run_pinned_forward_sync``
+        keep; callers that need the drain allowance must use this instead of the
+        private ``_layer_has_pending_deferred`` dict, whose name and shape are
+        not part of the API. Origin: dsv4-a5 single-card offload (M3 side stream).
+        """
+        idx = self.layer_idx if layer_idx is None else layer_idx
+        return bool(BaseMoEWrapper._layer_has_pending_deferred.get(idx, False))
+
+    def sync_cpu_only(self) -> None:
+        """Block until the CPU MoE queue has drained. No device sync, no H2D copy.
+
+        ``sync_forward`` waits for the whole accelerator (``torch.npu.synchronize``)
+        before draining, which also waits for the device-resident experts and so
+        erases any CPU/device overlap. This is the drain on its own: it blocks on
+        kt's ``TaskQueue`` condition variable only (``cpu_backend/task_queue.cpp``),
+        touches no device API, and leaves the H2D of the result to the caller.
+
+        Note the queue is process-global (one ``CPUInfer`` singleton for every
+        layer), so this waits for whatever else is queued too; the allowance comes
+        from *this* layer's deferred flag, exactly as in ``sync_forward``.
+
+        Framework-managed overlap, all of it public API::
+
+            wrapper.copy_inputs_to_cpu_buffers(h, topk_ids, topk_weights)
+            # the D2H above is async on the current stream: the caller must make
+            # the host wait for *that copy* (e.g. event.record(); event.synchronize())
+            # before the CPU reads the pinned input -- a targeted wait, not a
+            # device-wide one.
+            wrapper.forward_on_pinned_buffers(h, stream)   # submit, no device wait
+            ...                                            # device-side work here
+            wrapper.sync_cpu_only()
+            out = wrapper.copy_forward_output_to_device(h)
+
+        Origin: dsv4-a5 single-card offload (M3 side stream).
+        """
+        self.cpu_infer.sync(1 if self.has_pending_deferred() else 0)
+
     def copy_forward_output_to_device(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Copy pinned CPU output to the device tensor (CPU work already finished)."""
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])

@@ -129,6 +129,12 @@ class NumaJobDistributor {
   void worker_thread(int);
 };
 
+// Milliseconds a worker spins after finishing a job before it sleeps on its
+// condvar, parsed from KT_WORKER_SPIN_MS. Default (unset, empty or invalid)
+// is the historical 50. Exposed so the parsing can be tested without starting
+// a pool (test/cpp/test_worker_spin_ms.cpp).
+long kt_parse_spin_ms(const char* value);
+
 struct WorkerPoolConfig {
   int subpool_count;
   std::vector<int> subpool_numa_map;

@@ -30,6 +30,38 @@
 thread_local int WorkerPool::thread_local_id = -1;
 
 // ---------------------------------------------------------------------------
+// How long a worker keeps spinning after it finishes a job before it sleeps on
+// its condvar. The historical value is 50 ms, and it stays the default: with
+// decode handing this pool new work every few hundred µs, every worker is a
+// runnable spinner hard-bound to one PU for the whole run, which is exactly
+// what makes the wake-up cheap. It is also what the ACL report thread of a
+// host-callback framework has to compete with (dsv4-a5 single-card offload,
+// §4.20: whole-net A+F 78.0 µs/layer against 56.8 µs with the same pool idle
+// and asleep). KT_WORKER_SPIN_MS makes that trade measurable without a second
+// build: unset or invalid = 50 = byte-for-byte the old behaviour, 0 = sleep
+// immediately. Read once.
+// ---------------------------------------------------------------------------
+long kt_parse_spin_ms(const char* v) {
+  if (v == nullptr || *v == '\0') return 50L;
+  char* end = nullptr;
+  long parsed = std::strtol(v, &end, 10);
+  if (end == v || *end != '\0' || parsed < 0) {
+    fprintf(stderr, "[kt] KT_WORKER_SPIN_MS=%s is not a non-negative integer; keeping the default 50 ms\n", v);
+    return 50L;
+  }
+  return parsed;
+}
+
+static long kt_worker_spin_ms() {
+  static const long spin_ms = [] {
+    long parsed = kt_parse_spin_ms(std::getenv("KT_WORKER_SPIN_MS"));
+    printf("[kt] worker spin before condvar sleep: %ld ms\n", parsed);
+    return parsed;
+  }();
+  return spin_ms;
+}
+
+// ---------------------------------------------------------------------------
 // Core selection for worker binding.
 //
 // The historical order is hwloc's "logical index inside the NUMA cpuset",
@@ -331,7 +363,7 @@ void InNumaPool::worker_thread(int thread_id, int numa_id) {
     } else if (status == ThreadStatus::WAITING) {
       auto now = std::chrono::high_resolution_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-      if (duration > 50) {
+      if (duration > kt_worker_spin_ms()) {
         std::unique_lock<std::mutex> lock(thread_state_[thread_id].mutex);
         thread_state_[thread_id].cv.wait(lock, [&] {
           return thread_state_[thread_id].status.load(std::memory_order_acquire) != ThreadStatus::WAITING;
@@ -492,7 +524,7 @@ void NumaJobDistributor::worker_thread(int numa_id) {
     } else if (stat == ThreadStatus::WAITING) {
       auto now = std::chrono::high_resolution_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-      if (duration > 50) {
+      if (duration > kt_worker_spin_ms()) {
         std::unique_lock<std::mutex> lock(*mutexes[numa_id]);
         cvs[numa_id]->wait(lock, [&] {
           return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING;

@@ -631,6 +631,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   m.def("is_ascend_callback_worker_running", &kt::ascend::callback_worker_running,
         "True iff the ACL callback worker is started and dispatching reports.");
 #endif
+  m.def("cpuinfer_inline_enabled", &kt_cpuinfer_inline_enabled,
+        "True iff KT_CPUINFER_INLINE=1: CPUInfer.run_inline runs the task on the calling thread.");
+
   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
       .def(py::init<>())
@@ -642,6 +645,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def(py::init<int>())
       .def(py::init<WorkerPoolConfig>())
       .def("submit", &CPUInfer::submit)
+      // Runs the task on the calling thread when KT_CPUINFER_INLINE=1 and the
+      // queue is empty; returns whether it did. Off or queue non-empty, it is
+      // submit(). No gil_scoped_release, for the same reason submit/sync have
+      // none: the caller holds the GIL across submit+sync today either way.
+      .def("run_inline", &CPUInfer::run_inline)
       .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0)
       .def_readwrite("backend_", &CPUInfer::backend_)
 #ifndef KTRANSFORMERS_CPU_ONLY

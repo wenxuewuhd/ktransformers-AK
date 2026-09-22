@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
 _ascend_worker_degraded: Optional[bool] = None
 
 
+_cpuinfer_inline: bool | None = None
+
+
 def _ascend_callback_worker_running() -> Optional[bool]:
     """Probe the C++ callback worker; None when the build predates the probe."""
     probe = getattr(kt_kernel_ext, "is_ascend_callback_worker_running", None)
@@ -84,6 +87,25 @@ def _should_bypass_stream_callback(device: torch.device) -> bool:
 
 def _uses_external_npu_report_subscriber() -> bool:
     return os.environ.get("KT_EXTERNAL_NPU_REPORT_SUBSCRIBER", "") == "1"
+
+
+def _cpuinfer_inline_enabled() -> bool:
+    """True iff this build was asked to run submitted tasks on the calling thread.
+
+    The switch itself lives in C++ (KT_CPUINFER_INLINE, cpu_backend/
+    task_queue.cpp): one reader, one printed line, and a build without the
+    feature simply has no probe and answers False -- the queue path then runs
+    byte for byte as before. Memoized: the env is read once over there too,
+    and this sits on the per-layer forward path.
+    """
+    global _cpuinfer_inline
+    if _cpuinfer_inline is None:
+        probe = getattr(kt_kernel_ext, "cpuinfer_inline_enabled", None)
+        try:
+            _cpuinfer_inline = bool(probe()) if probe is not None else False
+        except Exception:
+            _cpuinfer_inline = False
+    return _cpuinfer_inline
 
 
 def _ensure_ascend_callback_worker() -> None:
@@ -751,6 +773,23 @@ class BaseMoEWrapper(_MoEBase, ABC):
             output_cpu[current_slot].data_ptr(),
             incremental,
         )
+        if _cpuinfer_inline_enabled() and hasattr(self.cpu_infer, "run_inline"):
+            # Inline is only sound while this layer is the whole content of the
+            # queue, so both deferred state bits are *read*, not assumed:
+            # ``incremental`` says the previous layer left a task pending, and
+            # the deferred ids of this slot say this layer will leave one. Both
+            # are 0 on the NPU graph path (cross-layer deferral is refused
+            # there), but a wrapper that ever produced one must keep the queue.
+            has_deferred = (
+                self.max_deferred_experts_per_token > 0 and (deferred_experts_ids_cpu[current_slot] >= 0).any().item()
+            )
+            if not incremental and not has_deferred:
+                # run_inline falls back to submit() by itself if the queue is
+                # not empty after all; either way the sync below drains it.
+                self.cpu_infer.run_inline(immediate_task)
+                BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+                self.cpu_infer.sync(0)
+                return
         self.cpu_infer.submit(immediate_task)
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         has_deferred = (

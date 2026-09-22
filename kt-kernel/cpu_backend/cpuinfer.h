@@ -76,6 +76,13 @@ class CPUInfer {
 
   template <typename Func, typename Obj, typename... Args>
   void enqueue(Func f, Obj* obj, Args... args) {
+    if (inline_depth_ > 0) {
+      // We are inside run_inline() on this very thread: run the task here
+      // rather than posting it. Every op's binding funnels through enqueue(),
+      // so nothing else has to know about the inline path.
+      task_queue_->run_inline([=]() { std::invoke(f, *obj, args...); });
+      return;
+    }
     task_queue_->enqueue([=]() { std::invoke(f, *obj, args...); });
   }
 
@@ -84,6 +91,37 @@ class CPUInfer {
     void* args = (void*)params.second;
     *((CPUInfer**)args) = this;
     func(args);
+  }
+
+  // Same task, executed on the calling thread (DSV4.1 offload §4.22 P2).
+  //
+  // Returns true iff it really ran inline. It falls back to submit() -- the
+  // ordinary queue -- when the switch is off, and also when the queue still
+  // holds anything: a task that jumps ahead of a pending one would silently
+  // reorder two layers' work, and "the caller says there is no deferred task"
+  // is not something to take on trust when the queue can be asked.
+  //
+  // The GIL is not released here, exactly as for submit()/sync(): today the
+  // Python caller holds it across the whole submit+sync anyway, so inlining
+  // moves no GIL boundary. A task that throws is stored and rethrown by the
+  // next sync(), which is what the queued path does.
+  bool run_inline(std::pair<intptr_t, intptr_t> params) {
+    if (!kt_cpuinfer_inline_enabled() || task_queue_->pending_tasks() != 0) {
+      submit(params);
+      return false;
+    }
+    void (*func)(void*) = (void (*)(void*))params.first;
+    void* args = (void*)params.second;
+    *((CPUInfer**)args) = this;
+    inline_depth_ += 1;
+    try {
+      func(args);
+    } catch (...) {
+      inline_depth_ -= 1;
+      throw;
+    }
+    inline_depth_ -= 1;
+    return true;
   }
 #ifndef KTRANSFORMERS_CPU_ONLY
   void submit_with_cuda_stream(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
@@ -125,6 +163,11 @@ class CPUInfer {
  public:
   WorkerPool* backend_;
   TaskQueue* task_queue_;
+
+ private:
+  // Per thread: only the thread inside run_inline() takes the inline branch,
+  // so a submit from any other thread keeps using the queue.
+  static inline thread_local int inline_depth_ = 0;
 };
 
 #endif

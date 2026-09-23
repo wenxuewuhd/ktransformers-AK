@@ -64,6 +64,32 @@ _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
 
 
+def _fullset_load_requested() -> bool:
+    """KT_FULLSET_LOAD=1: load every expert's CPU weights even with a resident mask.
+
+    By default a NativeMoEWrapper whose loader supports expert subsets and whose
+    gpu_experts_mask marks some experts resident loads only the CPU experts and
+    sets ``skip_gpu_expert_weights`` so the C++ side allocates no BufferB for the
+    resident ones. That makes a resident expert impossible to demote at runtime:
+    after a demotion the CPU would read an unallocated BufferB. With this switch
+    on, all ``num_experts`` experts are loaded and ``skip_gpu_expert_weights``
+    stays False, while ``gpu_experts_mask`` keeps marking the resident experts
+    for routing (``should_skip_expert``). Cost: host RAM for the full set.
+
+    Unset / empty / "0" -> off (the old subset path, unchanged). "1" -> on.
+    Anything else raises: a typo must not silently fall back to the subset,
+    because the caller is about to rely on every expert having CPU weights.
+    Read on every call (per layer), like KT_MXFP4_COMPACT_SCALES.
+    Origin: dsv41 stream-prefill F2-3 (full-set load for runtime demotion).
+    """
+    value = os.environ.get("KT_FULLSET_LOAD", "")
+    if value in ("", "0"):
+        return False
+    if value == "1":
+        return True
+    raise ValueError(f"KT_FULLSET_LOAD={value!r} is not 0 or 1")
+
+
 def _trim_malloc_arena() -> None:
     """Hand the loader's freed temporaries back to the OS.
 
@@ -707,8 +733,46 @@ class NativeMoEWrapper(BaseMoEWrapper):
         (b) an actual accelerator-resident set to skip. Off by default, so
         every other backend keeps loading all `num_experts` experts.
         Origin: dsv4-a5 single-card offload (stage 0.6).
+
+        KT_FULLSET_LOAD=1 turns it off unconditionally (see
+        ``_fullset_load_requested``); the mask is left untouched, so routing
+        still skips the resident experts.
+        Origin: dsv41 stream-prefill F2-3 (full-set load for runtime demotion).
         """
+        if _fullset_load_requested():
+            return False
         return bool(getattr(self.loader, "SUPPORTS_EXPERT_SUBSET", False)) and self.num_gpu_experts > 0
+
+    def lacks_cpu_weights(self, expert_id: int) -> bool:
+        """True iff the C++ backend holds no CPU weights (no BufferB) for this slot.
+
+        Answers from what ``load_weights`` actually allocated: the slots it
+        loaded are snapshotted right after the C++ load, from the
+        ``skip_gpu_expert_weights`` value the backend was built with and the
+        mask at that moment. Unlike ``GeneralMOEConfig::lacks_cpu_weights``
+        (common.hpp), which reads the *live* mask, this does not change when a
+        caller later rewrites ``gpu_experts_mask`` (e.g. a resident swap):
+        BufferB is never allocated after load. With KT_FULLSET_LOAD=1 it is
+        False for every slot. Raises before ``load_weights``.
+        Origin: dsv41 stream-prefill F2-3 (full-set load for runtime demotion).
+        """
+        slots = getattr(self, "_cpu_weight_slots", None)
+        if slots is None:
+            raise RuntimeError(f"layer {self.layer_idx}: lacks_cpu_weights() before load_weights()")
+        e = int(expert_id)
+        if not 0 <= e < self.num_experts:
+            raise IndexError(f"layer {self.layer_idx}: expert {e} out of range [0, {self.num_experts})")
+        return e not in slots
+
+    def cpu_weight_expert_ids(self) -> List[int]:
+        """Slots the C++ backend loaded CPU weights for (ascending); see lacks_cpu_weights.
+
+        Origin: dsv41 stream-prefill F2-3 (full-set load for runtime demotion).
+        """
+        slots = getattr(self, "_cpu_weight_slots", None)
+        if slots is None:
+            raise RuntimeError(f"layer {self.layer_idx}: cpu_weight_expert_ids() before load_weights()")
+        return sorted(slots)
 
     def _cpu_logical_expert_ids(self, physical_to_logical_map_cpu) -> List[int]:
         """Checkpoint expert ids this layer must actually read.
@@ -806,6 +870,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # for DeepSeek-V4-Flash -- even though the masked ones are never used.
         # Loaders that do not implement the subset keep their old behaviour.
         # Origin: dsv4-a5 single-card offload (stage 0.6).
+        # KT_FULLSET_LOAD=1 disables the subset (all experts are read).
+        # Origin: dsv41 stream-prefill F2-3.
         load_kwargs = {}
         if self._cpu_expert_subset_enabled():
             load_kwargs["expert_ids"] = self._cpu_logical_expert_ids(physical_to_logical_map_cpu)
@@ -925,7 +991,19 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # Only set where the loader really produced a subset, because the C++
         # skips are implemented in the MXFP4 load path alone.
         # Origin: dsv4-a5 single-card offload (stage 0.6).
+        # Under KT_FULLSET_LOAD=1 load_kwargs is empty, so this is False and
+        # BufferB is allocated and loaded for every expert.
+        # Origin: dsv41 stream-prefill F2-3.
         moe_config.skip_gpu_expert_weights = bool(load_kwargs)
+        if _fullset_load_requested() and self.num_gpu_experts > 0 and self.method != "MXFP4":
+            # Other backends skip masked experts in their load paths by
+            # should_skip_expert(), ignoring skip_gpu_expert_weights: the
+            # BufferB would exist but never be filled. Refuse, don't pretend.
+            # Origin: dsv41 stream-prefill F2-3.
+            raise RuntimeError(
+                f"KT_FULLSET_LOAD=1 with method={self.method!r}: only the AMX MXFP4 backend loads "
+                "CPU weights for experts marked in gpu_experts_mask"
+            )
         # Store the E8M0 scale as one byte per k-group instead of one FP32.
         # Native MXFP4 checkpoints (DeepSeek-V4-Flash) carry F8_E8M0 scales, so
         # the FP32 slot never holds anything but a power of two -- 15.0% of the
@@ -975,6 +1053,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 raise RuntimeError(
                     "No MXFP4 backend available after runtime selection. "
                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
+                )
+            if _fullset_load_requested() and self.num_gpu_experts > 0 and backend_cls is not AMXFP4_KGroup_MOE:
+                # AVX2MXFP4_MOE's load path skips masked experts by
+                # should_skip_expert() (operators/avx2/mxfp4-moe.hpp), so their
+                # BufferB would stay unfilled. Origin: dsv41 stream-prefill F2-3.
+                raise RuntimeError(
+                    f"KT_FULLSET_LOAD=1 needs AMXFP4_KGroup_MOE, runtime selected {backend_cls.__name__}"
                 )
             self.moe = backend_cls(moe_config)
         elif self.method == "NVFP4":
@@ -1071,6 +1156,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
         self.cpu_infer.sync()
+        # Snapshot of the slots that got a BufferB, taken once the backend holds
+        # the weights and read back from the config C++ was built from. Backs
+        # lacks_cpu_weights() / cpu_weight_expert_ids().
+        # Origin: dsv41 stream-prefill F2-3.
+        if moe_config.skip_gpu_expert_weights:
+            self._cpu_weight_slots = frozenset(self.cpu_expert_ids())
+        else:
+            self._cpu_weight_slots = frozenset(range(self.num_experts))
         t5 = time.time()
 
         del self.gate_weights

@@ -15,6 +15,8 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include <stdexcept>  // std::runtime_error -- was only ever pulled in transitively
+
 #include "../zerocopy_weights.hpp"  // KT_ZEROCOPY_WEIGHTS switch + page placement/pinning
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
@@ -1361,9 +1363,18 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     // hidden / 2 bytes, 3.2 GiB per node for DeepSeek-V4.1-Flash) is not
     // allocated at all. The SCALE staging stays: scales are converted, never
     // aliased. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
-    const bool zero_copy = kt_zerocopy::enabled() && use_per_expert_ptrs;
+    // 🔴 Throw, do not fall back: the caller sized node0 for zero-copy
+    // (kt_offload_gate.py), and the copy path needs ~84.4 GiB more anonymous
+    // memory than it was granted. The old fallback was a printf lost in a
+    // 40-layer load.
     if (kt_zerocopy::enabled() && !use_per_expert_ptrs)
-      printf("[kt zero-copy] KT_ZEROCOPY_WEIGHTS=1 ignored: this layer has no per-expert source pointers\n");
+      throw std::runtime_error(
+          "kt-kernel: KT_ZEROCOPY_WEIGHTS=1 but this layer has no per-expert source pointers "
+          "(config.gate_projs is empty), so the weights cannot be consumed in place. Refusing to "
+          "fall back to the copy path: the caller's memory account was computed for zero-copy and "
+          "the copy path needs ~84.4 GiB more anonymous memory than it was granted. Either pass "
+          "per-expert pointers or unset KT_ZEROCOPY_WEIGHTS.");
+    const bool zero_copy = kt_zerocopy::enabled() && use_per_expert_ptrs;
     // KT_ZEROCOPY_SCOPE=w13: gate/up are consumed in place, down is NOT, so its
     // TP-sliced staging (1/3 of the weight staging) still has to be built here.
     const bool stage_down_weights = zero_copy && kt_zerocopy::scope_w13_only();

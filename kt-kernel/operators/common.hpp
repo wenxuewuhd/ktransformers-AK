@@ -69,34 +69,16 @@ inline bool kt_moe_phase_timing() {
   return enabled;
 }
 
-// ---------------------------------------------------------------------------
 // Checked host allocation.
 //
-// kt's worker pool pins every worker thread to one NUMA node with
-// hwloc_set_membind(BIND | STRICT | THREAD) (cpu_backend/worker_pool.h:49) and
-// never resets that bind -- by design. STRICT means the allocation is not
-// allowed to spill to another node, so once the bound node is full
-// std::aligned_alloc returns nullptr instead of succeeding elsewhere.
-//
-// An unchecked nullptr from there used to disappear completely: it was handed
-// straight to the BufferB constructors, whose only guard is
-// assert(ptr % 64 == 0) (operators/amx/la/amx_raw_buffers.hpp) -- 0 passes that
-// test, and a Release build defines NDEBUG, which removes the assert outright.
-// The first write then took SIGSEGV, and with kernel.print-fatal-signals=0 and
-// core_pattern piped to apport that signal leaves neither a dmesg line nor a
-// core file: the process simply vanishes. (Observed 2026-09-24 10:41:21 --
-// EngineCore gone with no output at all, machine-wide global_oom two minutes
-// later.)
-//
-// These helpers do not prevent the failure; they make it say what happened.
-// The byte count says how much was asked for, and the NUMA binding of the
-// calling thread is what identifies the hard bind as the reason a machine with
-// free memory elsewhere could still fail to allocate -- without it that is
-// guesswork.
-// Origin: dsv4.1 single-card line, 2026-09-24.
+// Worker threads are hard-bound with hwloc_set_membind(BIND|STRICT|THREAD)
+// (cpu_backend/worker_pool.h) and never unbound, so a full node makes
+// std::aligned_alloc return nullptr instead of spilling. nullptr then passes
+// BufferB's assert(ptr % 64 == 0) -- which NDEBUG removes anyway -- and the
+// first write is a SIGSEGV with no dmesg line and no core. These helpers do
+// not prevent that; they make it say what happened.
 
-// One line describing where the calling thread runs and what its memory policy
-// allows. Only ever called on a failure path, so the /sys reads are free.
+// Where the calling thread runs and what its mempolicy allows. Failure path only.
 inline std::string kt_thread_numa_binding(bool* hard_bound = nullptr) {
   if (hard_bound != nullptr) *hard_bound = false;
   std::ostringstream oss;
@@ -155,12 +137,8 @@ inline std::string kt_thread_numa_binding(bool* hard_bound = nullptr) {
   return oss.str();
 }
 
-// std::aligned_alloc that never returns nullptr: on failure it prints and
-// throws (via ASSERT_RELEASE, so NDEBUG cannot compile the check away) a
-// message carrying the requested size and the calling thread's NUMA binding.
-// `what` names the buffer, `index` is an optional expert id (-1 = none).
-// The thrown type is std::runtime_error, which pybind11 surfaces to Python as
-// RuntimeError with this message intact.
+// std::aligned_alloc that throws std::runtime_error (via ASSERT_RELEASE, which
+// NDEBUG cannot remove) instead of returning nullptr. `index` = expert id or -1.
 inline void* kt_checked_aligned_alloc(size_t alignment, size_t size, const char* what, long long index = -1) {
   void* ptr = std::aligned_alloc(alignment, size);
   if (ptr == nullptr) {

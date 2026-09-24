@@ -105,20 +105,12 @@ inline Scope scope() {
 inline bool scope_w13_only() { return scope() == Scope::kW13; }
 
 // KT_ZEROCOPY_MLOCK=0 turns off the pinning (placement + mlock) while keeping
-// the zero-copy pointers, so the two effects can be measured apart.
+// the zero-copy pointers.
 //
-// 🔴 THIS ONE DEFAULTS *ON*, unlike every other switch in this file, and that
-// is deliberate -- do not "make it consistent" with env_flag() by flipping the
-// default. Pinning is what the zero-copy path was built to do; unset has always
-// meant pinned, and a build that silently stopped pinning would change what the
-// measured arms mean. What IS shared with env_flag() is the parse: "" and unset
-// (= on, here), "0" off, "1" on, and anything else throws. A lax parse in this
-// particular switch is the dangerous direction, because every typo lands on the
-// ON side: KT_ZEROCOPY_MLOCK=false / =off / =no used to read as "pin", i.e. it
-// would mlock 84.4 GiB onto node0 -- the node with 4-8 GiB free -- while the
-// operator believed they had turned it off. vllm_ascend/kt_offload/layer.py
-// exports exactly "0" so today's runs are unaffected; this closes the shape,
-// not a live bug. (decode majflt = 0 measured: the pin is not needed there.)
+// 🔴 Defaults ON, unlike every other switch here, deliberately -- do not "make
+// it consistent". The parse is strict because every typo would otherwise land
+// on the ON side, mlocking 84.4 GiB onto the node with 4-8 GiB free while the
+// operator believes it is off.
 inline bool mlock_enabled() {
   const char* v = std::getenv("KT_ZEROCOPY_MLOCK");
   if (v == nullptr || v[0] == '\0') return true;  // unset/empty = pinned (see above)

@@ -1,6 +1,7 @@
 #ifndef AMX_BUFFERS_HPP
 #define AMX_BUFFERS_HPP
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -1085,6 +1086,21 @@ struct BufferBInt4KGroupImpl {
   float* d;  // scales only (no mins/zero-points), row majored
   int n, k, k_group_size, k_group_count;
 
+  // Byte distance between two consecutive rows of `b`. Equal to k/2 for an
+  // owned (packed) buffer; larger when `b` is a *strided view* into somebody
+  // else's rows -- which is what the zero-copy weight path needs for w2/down,
+  // where this TP part owns only a 576-byte column slice of each 1152-byte
+  // source row. Every read of `b` must go through get_submat(), never through
+  // `n_begin * k / 2` arithmetic of its own.
+  // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+  size_t b_row_stride_bytes = 0;
+  // True when `b` points at memory this BufferB does not own (the checkpoint
+  // mapping). from_raw_mat() is then a no-op: there is nothing to copy.
+  bool external_b = false;
+
+  // Tag for the scale-only constructor (weights live elsewhere).
+  struct ScaleOnly {};
+
   static constexpr int N_STEP = K::N_STEP;
   static constexpr int K_STEP = K::K_STEP;
   static constexpr bool SCALE = true;
@@ -1094,24 +1110,81 @@ struct BufferBInt4KGroupImpl {
     return sizeof(int8_t) * n * k / 2 + sizeof(float) * n * (k / k_group_size);
   }
 
-  BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* ptr) : n(n), k(k), k_group_size(k_group_size) {
-    assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
-    assert(n % N_STEP == 0);
-    assert(k % K_STEP == 0);
+  // Scale-only: the weights are served from an external mapping, so the owned
+  // allocation shrinks to the scale region alone.
+  static size_t required_size_scale_only(int n, int k, int k_group_size) {
+    return sizeof(float) * n * (k / k_group_size);
+  }
+
+  void check_shape() const {
     if (n % N_STEP || k % K_STEP || k % k_group_size) {
       printf("BufferBInt4KGroupImpl: n: %d, k: %d, N_STEP: %d, K_STEP: %d, k_group_size: %d\n", n, k, N_STEP, K_STEP,
              k_group_size);
       throw std::runtime_error("n or k is not aligned to N_STEP or K_STEP");
     }
+  }
+
+  BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* ptr) : n(n), k(k), k_group_size(k_group_size) {
+    assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
+    assert(n % N_STEP == 0);
+    assert(k % K_STEP == 0);
+    check_shape();
     k_group_count = k / k_group_size;
+    b_row_stride_bytes = static_cast<size_t>(k) / 2;
     b = reinterpret_cast<dt*>(ptr);
     d = reinterpret_cast<float*>(offset_pointer(b, n * k / 2));
+  }
+
+  // Scale-only construction. `scale_ptr` owns ONLY the scales; `b` stays null
+  // until set_external_weights() points it at the checkpoint mapping. `d` is
+  // therefore an independent pointer, not `b + n*k/2` -- in the checkpoint the
+  // weights and the scales are two separate tensors and are not adjacent.
+  BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* scale_ptr, ScaleOnly)
+      : n(n), k(k), k_group_size(k_group_size) {
+    assert(reinterpret_cast<intptr_t>(scale_ptr) % 64 == 0);
+    check_shape();
+    k_group_count = k / k_group_size;
+    b = nullptr;
+    external_b = true;
+    b_row_stride_bytes = static_cast<size_t>(k) / 2;
+    d = reinterpret_cast<float*>(scale_ptr);
+  }
+
+  // Point `b` at externally owned rows. `row_stride_bytes` is the byte
+  // distance between consecutive rows *in the source*, which is k/2 for a
+  // contiguous row block (w13) and the full source row for a column slice (w2).
+  //
+  // 🔴 Alignment: this used to be a *correctness* requirement. Plain `w[g]` on
+  // a `const __m128i*` is a 16-byte ALIGNED load (GCC emits `vmovdqa`; counted
+  // 17 of them in the generated assembly of fp4-moe.hpp), and DeepSeek-V4.1-
+  // Flash hands out tensors at `ptr % 64 == 56` -- safetensors only pads its
+  // header to 8 bytes -- so zero-copy would have #GP'd. The FP4 weight loads
+  // were changed to `_mm_loadu_si128` (GemmKernel224MXFP4SmallKGroup::ldw);
+  // the same assembly now has 0 such loads. What is left is a *performance*
+  // question only -- an 8-byte-aligned stream splits a cache line on 1 of
+  // every 4 16-byte loads -- so this warns once and continues.
+  void set_external_weights(void* weights, size_t row_stride_bytes) {
+    if (!external_b) throw std::runtime_error("set_external_weights on an owning BufferB");
+    if (weights == nullptr) throw std::runtime_error("set_external_weights: null weight pointer");
+    if (row_stride_bytes < static_cast<size_t>(k) / 2)
+      throw std::runtime_error("set_external_weights: row stride smaller than the row");
+    if (reinterpret_cast<uintptr_t>(weights) % 64 != 0 || row_stride_bytes % 64 != 0) {
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        printf("[kt zero-copy] ⚠ external weights are not 64-byte aligned: ptr%%64=%u stride%%64=%zu -- correct "
+               "(all weight loads are unaligned) but every 4th 16-byte load splits a cache line\n",
+               (unsigned)(reinterpret_cast<uintptr_t>(weights) % 64), row_stride_bytes % 64);
+      }
+    }
+    b = reinterpret_cast<dt*>(weights);
+    b_row_stride_bytes = row_stride_bytes;
   }
 
   // Load from packed signed int4 format
   // Input: proj is packed int4 weights (2 int4 values per byte)
   // Each int4 value is in range [-8, 7] (signed)
   void from_raw_mat(uint8_t* proj, int ith, int nth) {
+    if (external_b) return;  // zero-copy: `b` already points at the source bytes
     auto [n_start, n_end] = K::split_range_n(n, ith, nth);
     if (n_start >= n_end) {
       return;
@@ -1125,8 +1198,8 @@ struct BufferBInt4KGroupImpl {
 
   // Get pointer to submatrix for computation
   dt* get_submat(int n, int k, int n_begin, int k_begin) {
-    const size_t row_bytes = static_cast<size_t>(k) / 2;
-    const size_t row_offset = static_cast<size_t>(n_begin) * row_bytes;
+    (void)k;  // the row stride is a property of the buffer, not of this call
+    const size_t row_offset = static_cast<size_t>(n_begin) * b_row_stride_bytes;
     const size_t col_offset = static_cast<size_t>(k_begin) / 2;
     return reinterpret_cast<dt*>(reinterpret_cast<uint8_t*>(b) + row_offset + col_offset);
   }

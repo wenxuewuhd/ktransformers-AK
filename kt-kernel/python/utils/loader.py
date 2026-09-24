@@ -8,13 +8,89 @@ This module provides loaders for:
 
 from __future__ import annotations
 
+import json as _json
+import mmap as _mmap
 import os
+import struct as _struct
 import numpy as np
 import torch
 from enum import IntEnum
 from safetensors import safe_open
 from gguf.gguf_reader import GGUFReader
 from typing import Optional, Sequence
+
+
+def zero_copy_weights_enabled() -> bool:
+    """KT_ZEROCOPY_WEIGHTS: same three-state parse as the C++ side.
+
+    "" / "0" -> off, "1" -> on, anything else raises. A switch that is silently
+    ignored is worse than no switch: the run looks like it took the new path.
+    Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+    """
+    v = os.environ.get("KT_ZEROCOPY_WEIGHTS", "")
+    if v in ("", "0"):
+        return False
+    if v == "1":
+        return True
+    raise ValueError(f'KT_ZEROCOPY_WEIGHTS must be "", "0" or "1", got {v!r}')
+
+
+# Read-only SHARED mappings of the checkpoint shards, kept alive for the whole
+# process when zero-copy is on: the C++ BufferB points straight into them, so
+# unmapping is a use-after-free. Keyed by absolute path.
+#
+# 🔴 Why not reuse safetensors' own mapping: safe_open() maps the shard `rw-p`
+# (PRIVATE + WRITABLE). Measured on this machine, mlock() over 1 GiB of such a
+# mapping gives dRssAnon +1024 MiB / dRssFile -0.1 MiB -- every page is COW'd
+# into anonymous memory, i.e. two copies instead of zero, and auto NUMA
+# balancing is free to migrate them. Our own PROT_READ|MAP_SHARED mapping
+# measured dRssAnon 0 / dRssFile +1024 MiB on the same bytes.
+_RO_SHARED_MAPS: dict = {}
+_ST_HEADERS: dict = {}
+
+
+def _ro_shared_map(path: str):
+    """mmap(PROT_READ, MAP_SHARED) of `path`, cached and never unmapped."""
+    path = os.path.abspath(path)
+    mm = _RO_SHARED_MAPS.get(path)
+    if mm is None:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            mm = _mmap.mmap(fd, 0, flags=_mmap.MAP_SHARED, prot=_mmap.PROT_READ)
+        finally:
+            os.close(fd)
+        _RO_SHARED_MAPS[path] = mm
+    return mm
+
+
+def _st_header(path: str):
+    """(data_start, header_dict) of a safetensors file."""
+    path = os.path.abspath(path)
+    hdr = _ST_HEADERS.get(path)
+    if hdr is None:
+        with open(path, "rb") as f:
+            n = _struct.unpack("<Q", f.read(8))[0]
+            hdr = (8 + n, _json.loads(f.read(n)))
+        _ST_HEADERS[path] = hdr
+    return hdr
+
+
+def ro_shared_tensor_view(path: str, key: str) -> torch.Tensor:
+    """A uint8 torch view of `key`'s bytes inside our own read-only mapping.
+
+    No copy at any step: mmap -> memoryview slice -> np.frombuffer -> from_numpy.
+    torch.from_numpy (not torch.frombuffer) because torch_npu's
+    transfer_to_npu redirects the latter to the NPU.
+    """
+    data_start, hdr = _st_header(path)
+    info = hdr.get(key)
+    if info is None:
+        raise KeyError(f"{key} not in {path}")
+    begin, end = info["data_offsets"]
+    mm = _ro_shared_map(path)
+    off = data_start + begin
+    arr = np.frombuffer(mm, dtype=np.uint8, count=end - begin, offset=off)
+    return torch.from_numpy(arr)
 
 
 class GGMLQuantizationType(IntEnum):
@@ -158,6 +234,10 @@ class SafeTensorLoader:
             folder_path = os.path.dirname(file_path)
         else:
             folder_path = file_path
+        # Needed to rebuild the absolute shard path: tensor_file_map only keeps
+        # the basename. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+        self.safetensor_folder = folder_path
+        self.shard_path_map = {}  # basename -> absolute path
         self.file_handle_map = {}
         self.tensor_file_map = {}
         self.tensor_type_map = {}
@@ -170,6 +250,7 @@ class SafeTensorLoader:
                 if file.endswith(".safetensors"):
                     found_safetensor = True
                     file_path = os.path.join(root, file)
+                    self.shard_path_map[file] = file_path
                     if file not in self.file_handle_map:
                         try:
                             handle = safe_open(file_path, framework="pt")
@@ -1280,13 +1361,24 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         up_scales = [None] * expert_count
         down_scales = [None] * expert_count
 
+        # Zero-copy: hand out uint8 views of OUR read-only shared mapping so the
+        # C++ BufferB can point at them and mlock them without COW. The scales
+        # below are still materialised (ue8m0 -> bf16 is a conversion, and the
+        # kernel stores yet another encoding), so only the weights are aliased.
+        # Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+        zero_copy = zero_copy_weights_enabled()
         for exp_id in wanted:
             for proj, dst in (
                 (gate_name, gate_weights),
                 (up_name, up_weights),
                 (down_name, down_weights),
             ):
-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                key = f"{prefix}.{exp_id}.{proj}.weight"
+                if zero_copy:
+                    shard = self.shard_path_map[self.tensor_file_map[key]]
+                    dst[exp_id] = ro_shared_tensor_view(shard, key)
+                    continue
+                w = self.load_tensor(key, device).contiguous()
                 if w.dtype != torch.uint8:
                     w = w.view(torch.uint8)
                 dst[exp_id] = w

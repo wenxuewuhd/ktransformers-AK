@@ -64,6 +64,17 @@ _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
 
 
+def _zero_copy_weights_requested() -> bool:
+    """KT_ZEROCOPY_WEIGHTS, parsed exactly like KT_FULLSET_LOAD.
+
+    "" / "0" -> False, "1" -> True, anything else raises rather than being read
+    as off. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+    """
+    from .loader import zero_copy_weights_enabled
+
+    return zero_copy_weights_enabled()
+
+
 def _fullset_load_requested() -> bool:
     """KT_FULLSET_LOAD=1: load every expert's CPU weights even with a resident mask.
 
@@ -995,6 +1006,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # BufferB is allocated and loaded for every expert.
         # Origin: dsv41 stream-prefill F2-3.
         moe_config.skip_gpu_expert_weights = bool(load_kwargs)
+        # KT_ZEROCOPY_WEIGHTS is implemented only in the AMX MXFP4 load path
+        # (operators/amx/fp4-moe.hpp). Every other backend would ignore it and
+        # quietly keep memcpy'ing, i.e. the run would look like it took the new
+        # path. Refuse instead. Origin: dsv41 stream-prefill, CPU-MoE weight
+        # zero-copy.
+        if _zero_copy_weights_requested() and self.method != "MXFP4":
+            raise RuntimeError(
+                f"KT_ZEROCOPY_WEIGHTS=1 with method={self.method!r}: only the AMX MXFP4 backend "
+                "serves CPU weights directly from the checkpoint mapping"
+            )
         if _fullset_load_requested() and self.num_gpu_experts > 0 and self.method != "MXFP4":
             # Other backends skip masked experts in their load paths by
             # should_skip_expert(), ignoring skip_gpu_expert_weights: the

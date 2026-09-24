@@ -36,7 +36,7 @@ from kt_kernel import kt_kernel_ext  # noqa: E402
 # ----- V4-Flash MoE shape -----
 HIDDEN = 4096
 INTER = 2048
-EXPERT_NUM = 256
+EXPERT_NUM = int(__import__("os").environ.get("BENCH_EXPERTS", 256))
 TOP_K = 6
 K_GROUP_SIZE = 32
 

@@ -15,6 +15,7 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include "../zerocopy_weights.hpp"  // KT_ZEROCOPY_WEIGHTS switch + page placement/pinning
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
@@ -135,6 +136,19 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   };
 
+  // Load one 32-weight FP4 group. Plain `w[g]` on a `const __m128i*` is a
+  // 16-byte *aligned* load (GCC emits `vmovdqa`; verified in the generated
+  // assembly of this very file), so it faults when BufferB::b points straight
+  // at the checkpoint mapping: on DeepSeek-V4.1-Flash every expert tensor
+  // starts at `ptr % 64 == 56`, i.e. 8-byte aligned, because safetensors only
+  // pads its header to 8 bytes. `loadu` costs nothing extra when the address
+  // is in fact aligned, which is the case for every owned (aligned_alloc'd)
+  // BufferB, so the default path keeps its timings.
+  // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+  __attribute__((always_inline)) static inline __m128i ldw(const __m128i* w, int g) {
+    return _mm_loadu_si128(w + g);
+  }
+
   struct DequantizedWeight {
 #if defined(__AVX512BF16__)
     __m512bh d;
@@ -221,8 +235,11 @@ struct GemmKernel224MXFP4SmallKGroup {
   struct BufferB : public BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup> {
     using Base = BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;
     using Base::b;
+    using Base::b_row_stride_bytes;
     using Base::d;
+    using Base::external_b;
     using Base::get_submat;
+    using Base::set_external_weights;
     using Base::k;
     using Base::k_group_count;
     using Base::k_group_size;
@@ -247,7 +264,27 @@ struct GemmKernel224MXFP4SmallKGroup {
              sizeof(uint8_t) * static_cast<size_t>(n) * (k / k_group_size);
     }
 
+    // Zero-copy sizing: the weights are served from the checkpoint mapping, so
+    // only the scale region is allocated (1/16 of the expert in compact mode,
+    // 1/4 in FP32 mode). Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+    static size_t required_size_scale_only(int n, int k, int k_group_size, bool compact) {
+      if (!compact) return Base::required_size_scale_only(n, k, k_group_size);
+      return sizeof(uint8_t) * static_cast<size_t>(n) * (k / k_group_size);
+    }
+
     BufferB(int n_, int k_, int k_group_size_, void* ptr) : BufferB(n_, k_, k_group_size_, ptr, false) {}
+
+    // Scale-only: `scale_ptr` owns the scales, `b` is set later by
+    // set_external_weights(). `d`/`scale_e8` are independent of `b` here --
+    // the checkpoint stores the weight and the scale as two separate tensors.
+    BufferB(int n_, int k_, int k_group_size_, void* scale_ptr, bool compact_, typename Base::ScaleOnly tag)
+        : Base(n_, k_, k_group_size_, scale_ptr, tag), compact(compact_) {
+      scale_e8 = reinterpret_cast<uint8_t*>(d);
+      if (compact) {
+        d = nullptr;
+        scale_e8_valid = true;
+      }
+    }
 
     BufferB(int n_, int k_, int k_group_size_, void* ptr, bool compact_)
         : Base(n_, k_, k_group_size_, ptr), compact(compact_) {
@@ -395,10 +432,10 @@ struct GemmKernel224MXFP4SmallKGroup {
 
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
+          const DequantizedWeight d0(ldw(w0, g));
+          const DequantizedWeight d1(ldw(w1, g));
+          const DequantizedWeight d2(ldw(w2, g));
+          const DequantizedWeight d3(ldw(w3, g));
           acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), acc0);
           acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), acc1);
           acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), acc2);
@@ -413,7 +450,7 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d(w[g]);
+          const DequantizedWeight d(ldw(w, g));
           acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
         }
         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
@@ -494,10 +531,10 @@ struct GemmKernel224MXFP4SmallKGroup {
       __m512 acc3 = _mm512_setzero_ps();
       auto accumulate_group = [&](int g) __attribute__((always_inline)) {
         const __m512bh a = activation[g];
-        const __m512bh d0 = (__m512bh)mxfp4_to_bf16_32_natural(w0[g]);
-        const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32_natural(w1[g]);
-        const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32_natural(w2[g]);
-        const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32_natural(w3[g]);
+        const __m512bh d0 = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w0, g));
+        const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w1, g));
+        const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w2, g));
+        const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w3, g));
         acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d0), acc0);
         acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d1), acc1);
         acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d2), acc2);
@@ -541,7 +578,7 @@ struct GemmKernel224MXFP4SmallKGroup {
       }
       __m512 acc = _mm512_setzero_ps();
       auto accumulate_group = [&](int g) __attribute__((always_inline)) {
-        const __m512bh d = (__m512bh)mxfp4_to_bf16_32_natural(w[g]);
+        const __m512bh d = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w, g));
         acc = _mm512_fmadd_ps(_mm512_set1_ps(scales[g]), _mm512_dpbf16_ps(_mm512_setzero_ps(), activation[g], d), acc);
       };
       auto prefetch_group = [&](int g) __attribute__((always_inline)) {
@@ -614,10 +651,10 @@ struct GemmKernel224MXFP4SmallKGroup {
 
         for (int g = 0; g < kg_count; g++) {
           // 4 行权重解码一次, MB 个 token 共享
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
+          const DequantizedWeight d0(ldw(w0, g));
+          const DequantizedWeight d1(ldw(w1, g));
+          const DequantizedWeight d2(ldw(w2, g));
+          const DequantizedWeight d3(ldw(w3, g));
           const __m512 sv0 = _mm512_set1_ps(s0[g]);
           const __m512 sv1 = _mm512_set1_ps(s1[g]);
           const __m512 sv2 = _mm512_set1_ps(s2[g]);
@@ -651,7 +688,7 @@ struct GemmKernel224MXFP4SmallKGroup {
           __m512 acc = _mm512_setzero_ps();
           for (int g = 0; g < kg_count; g++) {
             const ActivationBF16 a(a_rows[i][g]);
-            const DequantizedWeight d(w[g]);
+            const DequantizedWeight d(ldw(w, g));
             acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
           }
           c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
@@ -675,10 +712,10 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
+          const DequantizedWeight d0(ldw(w0, g));
+          const DequantizedWeight d1(ldw(w1, g));
+          const DequantizedWeight d2(ldw(w2, g));
+          const DequantizedWeight d3(ldw(w3, g));
           a0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), a0);
           a1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), a1);
           a2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), a2);
@@ -692,7 +729,7 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d(w[g]);
+          const DequantizedWeight d(ldw(w, g));
           acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
         }
         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
@@ -760,9 +797,46 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
   ~AMX_FP4_MOE_TP() = default;
 
+  // Zero-copy is only possible with per-expert source pointers (gate_projs):
+  // the flat gate_proj buffer is already a kt-owned staging copy, so pointing
+  // at it would save nothing. Default off (KT_ZEROCOPY_WEIGHTS).
+  // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+  bool zero_copy_weights() const { return kt_zerocopy::enabled() && !config_.gate_projs.empty(); }
+
+  // KT_ZEROCOPY_SCOPE=w13 keeps w2/down on the copy path. See the long note at
+  // kt_zerocopy::scope(): w13 is a contiguous row block per TP part and places
+  // 100% local, w2 is a column slice of every row and can never exceed
+  // 1/tp_count local under any per-page placement.
+  bool zero_copy_down() const { return zero_copy_weights() && !kt_zerocopy::scope_w13_only(); }
+
+  // Which of the three BufferB's this (n, k) is. moe_base.hpp builds them as
+  //   gate/up : (n = intermediate_size, k = hidden_size)
+  //   down    : (n = hidden_size,       k = intermediate_size)
+  // and hands the derived class nothing else to go on, so the shape IS the
+  // discriminator. With hidden_size == intermediate_size (per TP part) the two
+  // are indistinguishable -- refuse rather than guess, because guessing wrong
+  // means down gets a scale-only allocation and its weights are never loaded.
+  bool is_down_buffer(size_t n, size_t k) const {
+    if ((size_t)config_.hidden_size == (size_t)config_.intermediate_size)
+      throw std::runtime_error(
+          "KT_ZEROCOPY_SCOPE=w13 cannot tell the gate/up BufferB from the down BufferB when hidden_size == "
+          "intermediate_size (per TP part); pass an explicit tensor kind before using this shape");
+    return n == (size_t)config_.hidden_size && k == (size_t)config_.intermediate_size;
+  }
+
+  // True when THIS BufferB is served from the mapping (scale region only).
+  bool zero_copy_buffer(size_t n, size_t k) const {
+    if (!zero_copy_weights()) return false;
+    if (!kt_zerocopy::scope_w13_only()) return true;
+    return !is_down_buffer(n, k);
+  }
+
   // BufferA: raw BF16, no group_size needed
   size_t buffer_a_required_size_impl(size_t m, size_t k) const { return T::BufferA::required_size(m, k); }
   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
+    if (zero_copy_buffer(n, k))
+      return T::BufferB::required_size_scale_only(n, k, config_.quant_config.group_size,
+                                                  config_.compact_mxfp4_scales);
     return T::BufferB::required_size(n, k, config_.quant_config.group_size, config_.compact_mxfp4_scales);
   }
   size_t buffer_c_required_size_impl(size_t m, size_t n) const { return T::BufferC::required_size(m, n); }
@@ -771,6 +845,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     return std::make_shared<typename T::BufferA>(m, k, data);
   }
   std::shared_ptr<typename T::BufferB> make_buffer_b_impl(size_t n, size_t k, void* data) const {
+    if (zero_copy_buffer(n, k))
+      return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data,
+                                                   config_.compact_mxfp4_scales,
+                                                   typename T::BufferB::Base::ScaleOnly{});
     return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data,
                                                  config_.compact_mxfp4_scales);
   }
@@ -860,6 +938,40 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       throw std::runtime_error("MXFP4 MoE only support KGroup FP4.");
     if (config_.gate_scale == nullptr) throw std::runtime_error("MXFP4 MoE only support load native weight.");
 
+    if (zero_copy_weights()) {
+      load_weights_zero_copy();
+      // KT_ZEROCOPY_SCOPE=w13: down stayed an OWNING BufferB, so it is filled
+      // the ordinary way, out of the down_proj staging the wrapper did allocate
+      // for exactly this case. This is the whole point of the partial scope:
+      // w2's bytes end up memcpy'd into memory first-touched by THIS sub-pool's
+      // threads, i.e. node-local, which is the locality the copy path gets for
+      // free and no per-page placement of the shared source can reproduce.
+      if (!zero_copy_down()) {
+        if (config_.down_proj == nullptr)
+          throw std::runtime_error("KT_ZEROCOPY_SCOPE=w13: down_proj staging was not allocated");
+        int nth_down = T::recommended_nth(config_.hidden_size);
+        pool->do_work_stealing_job(
+            nth_down * config_.expert_num, nullptr,
+            [this, nth_down, physical_to_logical_map](int task_id) {
+              uint64_t expert_idx = task_id / nth_down;
+              if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
+              uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+              int ith = task_id % nth_down;
+              down_bb_[expert_idx]->from_raw_mat(
+                  (uint8_t*)config_.down_proj +
+                      ((logical_expert_id * config_.hidden_size * config_.intermediate_size) >> 1),
+                  ith, nth_down);
+            },
+            nullptr);
+      }
+      // Scales still come from the (small) TP-sliced staging buffers below;
+      // they are NOT zero-copyable: the checkpoint ships ue8m0 bytes and this
+      // BufferB stores either FP32 or compacted E8M0 exponents, i.e. the scale
+      // region is always a converted copy (load_scales_bf16 / finalize_scale_e8).
+      load_scales_from_staging();
+      return;
+    }
+
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
         nth * config_.expert_num, nullptr,
@@ -894,6 +1006,17 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         },
         nullptr);
 
+    load_scales_from_staging();
+  }
+
+  // The scale region is always owned and always converted (bf16 ue8m0 in the
+  // checkpoint -> FP32 or compacted E8M0 byte here), so it is loaded the same
+  // way in both modes, from the TP-sliced staging buffers the outer wrapper
+  // built. Split out of load_weights() so the zero-copy path can reuse it
+  // verbatim. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+  void load_scales_from_staging() {
+    const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
+    auto pool = config_.pool->get_subpool(tp_part_idx);
     pool->do_work_stealing_job(
         config_.expert_num, nullptr,
         [this, physical_to_logical_map](int task_id) {
@@ -909,6 +1032,121 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               (const ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
         },
         nullptr);
+  }
+
+  // Zero-copy weights: BufferB::b is pointed at the checkpoint mapping and the
+  // pages are placed + pinned by this sub-pool's own threads.
+  //
+  // Layout, per logical expert, with tp_count parts and this part = tp_part_idx:
+  //   w1/w3 source [full_inter, hidden/2] row-major. This part owns rows
+  //     [tp*inter_tp, (tp+1)*inter_tp) -- a CONTIGUOUS block, so the view is
+  //     base + tp*inter_tp*hidden/2 with the source row stride hidden/2,
+  //     which is exactly this BufferB's own k/2. No stride needed.
+  //   w2   source [hidden, full_inter/2] row-major. This part owns a COLUMN
+  //     SLICE of every row: bytes [tp*inter_tp/2, (tp+1)*inter_tp/2). That is
+  //     a strided view: base + tp*inter_tp/2, row stride full_inter/2, row
+  //     length inter_tp/2 = this BufferB's k/2. Hence b_row_stride_bytes.
+  // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+  void load_weights_zero_copy() {
+    const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    const int tp_count = config_.pool->config.subpool_count;
+    const size_t inter_tp = (size_t)config_.intermediate_size;
+    const size_t hidden = (size_t)config_.hidden_size;
+    const size_t full_inter = inter_tp * (size_t)tp_count;
+
+    if (config_.gate_projs.empty() || config_.gate_projs[0].empty())
+      throw std::runtime_error("zero-copy weights: config.gate_projs is empty");
+
+    // 🔴 Placement is not a nice-to-have here. The copy path gets per-socket
+    // locality for free: each TP part memcpy's its own slice into its own
+    // node-local BufferB. Zero-copy has ONE physical copy, so unless the pages
+    // are deliberately placed, both sockets read from whichever node the page
+    // cache happened to use -- measured 2.45x slower at m=1, tp=2 with the
+    // pages unplaced. Hence "segment" (this part's pages -> this part's node)
+    // is the default.
+    //
+    // 🔴 Placement is done by MIGRATING the pages (move_pages MPOL_MF_MOVE_ALL),
+    // not by an allocation policy. set_mempolicy/mbind only steer pages the
+    // kernel allocates on the spot, and a checkpoint page that is already in
+    // the page cache is reused in place -- which is exactly the production case,
+    // since the point of zero-copy is to share the cache with streaming prefill.
+    // Measured falsification of the old mechanism, and of the migration that
+    // replaced it, in zerocopy_weights.hpp above policy_targets().
+    std::vector<int> nodes = config_.pool->config.subpool_numa_map;
+    if (nodes.empty()) nodes.push_back(0);
+    const int own_node = tp_part_idx < (int)nodes.size() ? nodes[tp_part_idx] : nodes[0];
+    // Parsed once per part: it throws on an unknown KT_ZEROCOPY_POLICY, and a
+    // throw out of a work-stealing task is a much worse place to find that out.
+    const std::vector<int> targets = kt_zerocopy::policy_targets(nodes, own_node);
+
+    const bool do_pin = kt_zerocopy::mlock_enabled();
+    // KT_ZEROCOPY_SCOPE=w13 -> false: down keeps its own owning BufferB and is
+    // filled by the copy pass in load_weights().
+    const bool down_zero_copy = zero_copy_down();
+    const size_t w13_bytes = inter_tp * hidden / 2;
+    const size_t w2_row_bytes = inter_tp / 2;
+    const size_t w2_src_stride = full_inter / 2;
+    // w2 row band this part pins (and therefore places on its own node). Every
+    // part READS every row -- it owns a column slice, not a row slice -- so the
+    // best any placement can do for w2 is 1/tp_count local. Splitting by rows
+    // makes that exactly 1/tp_count for everyone and covers all rows once.
+    const size_t w2_rows_per_part = hidden / (size_t)tp_count;
+
+    pool->do_work_stealing_job(
+        config_.expert_num, nullptr,
+        [&, this](int task_id) {
+          uint64_t expert_idx = (uint64_t)task_id;
+          if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
+          uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
+          if (lid >= config_.gate_projs[0].size() || lid >= config_.up_projs[0].size() ||
+              lid >= config_.down_projs[0].size())
+            throw std::runtime_error("zero-copy weights: logical expert id out of range");
+          uint8_t* src_gate = (uint8_t*)config_.gate_projs[0][lid];
+          uint8_t* src_up = (uint8_t*)config_.up_projs[0][lid];
+          uint8_t* src_down = (uint8_t*)config_.down_projs[0][lid];
+          if (src_gate == nullptr || src_up == nullptr || src_down == nullptr)
+            throw std::runtime_error("zero-copy weights: null source pointer for a CPU-resident expert");
+
+          kt_zerocopy::check_mapping_is_shared_readonly(src_gate);
+
+          uint8_t* gate_view = src_gate + (size_t)tp_part_idx * w13_bytes;
+          uint8_t* up_view = src_up + (size_t)tp_part_idx * w13_bytes;
+
+          gate_bb_[expert_idx]->set_external_weights(gate_view, hidden / 2);
+          up_bb_[expert_idx]->set_external_weights(up_view, hidden / 2);
+          if (down_zero_copy) {
+            uint8_t* down_view = src_down + (size_t)tp_part_idx * w2_row_bytes;
+            down_bb_[expert_idx]->set_external_weights(down_view, w2_src_stride);
+          }
+
+          if (!do_pin) return;
+          // w13: this part's rows are exactly this part's segment -> fully local.
+          kt_zerocopy::pin_range(gate_view, w13_bytes, targets);
+          kt_zerocopy::pin_range(up_view, w13_bytes, targets);
+          // w2: each part places (and pins) its own row band; together the parts
+          // cover the whole [hidden, full_inter/2] tensor exactly once.
+          //
+          // Under KT_ZEROCOPY_SCOPE=w13 nothing reads w2 from the mapping, so
+          // placing or pinning it there would be pure cost -- and worse, it
+          // would blur the arm: the H reading has to be "w13 placed", not
+          // "w13 placed plus a w2 migration pass nobody consumes".
+          if (!down_zero_copy) return;
+          const size_t band_begin = (size_t)tp_part_idx * w2_rows_per_part;
+          const size_t band_rows = (tp_part_idx == tp_count - 1) ? (hidden - band_begin) : w2_rows_per_part;
+          kt_zerocopy::pin_range(src_down + band_begin * w2_src_stride, band_rows * w2_src_stride, targets);
+        },
+        nullptr);
+
+    // 🔴 The stats are one global set, and this runs once per TP part, so with
+    // tp_count=2 you get TWO lines and the second is the grand total -- not
+    // "part 0" and "part 1". Say so in the tag: read the wrong way, the pair
+    // looks like a per-part breakdown and every percentage in it is misread.
+    if (do_pin) {
+      char tag[96];
+      snprintf(tag, sizeof(tag), "after load [cumulative over all TP parts; tp%d just finished]", tp_part_idx);
+      kt_zerocopy::print_stats(tag);
+    }
   }
 
   static inline void fast_memcpy(void* __restrict dst, const void* __restrict src, size_t bytes) {
@@ -993,9 +1231,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               size_t gpu_weight_slice_offset = local_idx * weight_per_col;
               size_t gpu_scale_slice_offset = local_idx * scale_per_col;
 
+              // Under zero-copy the down BufferB is a column slice of the
+              // source rows, so the distance between two of its rows is the
+              // SOURCE row, not weight_per_col. Reading `b + col*weight_per_col`
+              // there would silently return the wrong expert's bytes.
+              const size_t down_row_stride = down_bb_[expert_id]->b_row_stride_bytes;
               for (size_t col = col_start; col < col_end; col++) {
                 fast_memcpy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
-                            (uint8_t*)down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
+                            (uint8_t*)down_bb_[expert_id]->b + col * down_row_stride, weight_per_col);
                 down_bb_[expert_id]->copy_scale_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
                                                         col * scale_per_col, scale_per_col);
               }
@@ -1064,9 +1307,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               size_t weight_per_gpu_col = (config_.intermediate_size / gpu_tps_per_cpu_tp) >> 1;
               size_t scale_per_gpu_col = (config_.intermediate_size / gpu_tps_per_cpu_tp) / group_size;
 
+              const size_t down_row_stride = down_bb_[expert_id]->b_row_stride_bytes;
               for (size_t col = col_start; col < col_end; col++) {
-                size_t col_offset_weight = (col * config_.intermediate_size / 2) +
-                                           (local_gpu_idx * data_per_gpu_tp_weight / config_.hidden_size);
+                size_t col_offset_weight =
+                    (col * down_row_stride) + (local_gpu_idx * data_per_gpu_tp_weight / config_.hidden_size);
                 size_t col_offset_scale = (col * (config_.intermediate_size / group_size)) +
                                           (local_gpu_idx * data_per_gpu_tp_scale / config_.hidden_size);
 
@@ -1112,19 +1356,71 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
 
     int& group_size = config.quant_config.group_size;
 
+    // Zero-copy: the inner parts point BufferB straight at the checkpoint
+    // mapping, so the per-NUMA weight staging (3 x expert_num x inter_tp x
+    // hidden / 2 bytes, 3.2 GiB per node for DeepSeek-V4.1-Flash) is not
+    // allocated at all. The SCALE staging stays: scales are converted, never
+    // aliased. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+    const bool zero_copy = kt_zerocopy::enabled() && use_per_expert_ptrs;
+    if (kt_zerocopy::enabled() && !use_per_expert_ptrs)
+      printf("[kt zero-copy] KT_ZEROCOPY_WEIGHTS=1 ignored: this layer has no per-expert source pointers\n");
+    // KT_ZEROCOPY_SCOPE=w13: gate/up are consumed in place, down is NOT, so its
+    // TP-sliced staging (1/3 of the weight staging) still has to be built here.
+    const bool stage_down_weights = zero_copy && kt_zerocopy::scope_w13_only();
+    if (zero_copy)
+      printf("[kt zero-copy] scope=%s (w13 zero-copy, w2 %s)\n", stage_down_weights ? "w13" : "all",
+             stage_down_weights ? "copied into node-local BufferB" : "zero-copy");
+
     pool->dispense_backend()->do_numa_job([&, this](int i) {
       auto& tpc = tps[i]->config_;
       size_t weight_elem_count = tpc.intermediate_size * tpc.hidden_size;
       size_t scales_elem_count = (tpc.hidden_size / group_size) * tpc.intermediate_size;
 
-      tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
-      tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
-      tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+      if (!zero_copy) {
+        tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+        tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+        tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+      } else if (stage_down_weights) {
+        tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+      }
       tpc.gate_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
       tpc.up_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
       tpc.down_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
 
-      if (use_per_expert_ptrs) {
+      if (zero_copy) {
+        // Only the scales are staged here; the weights are consumed in place.
+        pool->get_subpool(i)->do_work_stealing_job(
+            tpc.expert_num, nullptr,
+            [&, i](int expert_id_) {
+              if (config.lacks_cpu_weights(expert_id_)) return;
+              size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
+              ggml_bf16_t* src_gate_scale = (ggml_bf16_t*)config.gate_scales[0][expert_id];
+              ggml_bf16_t* src_up_scale = (ggml_bf16_t*)config.up_scales[0][expert_id];
+              ggml_bf16_t* src_down_scale = (ggml_bf16_t*)config.down_scales[0][expert_id];
+              memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+                     src_gate_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
+              memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
+                     src_up_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
+              // Under scope=w13 the down WEIGHTS are staged here too, by the
+              // same column-slice walk the copy path uses -- byte for byte the
+              // `use_per_expert_ptrs` branch below, just without gate/up.
+              uint8_t* src_down = stage_down_weights ? (uint8_t*)config.down_projs[0][expert_id] : nullptr;
+              if (stage_down_weights && src_down == nullptr)
+                throw std::runtime_error("KT_ZEROCOPY_SCOPE=w13: null down_projs pointer for a CPU-resident expert");
+              for (size_t col = 0; col < config.hidden_size; col++) {
+                if (stage_down_weights)
+                  memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
+                         src_down + ((col * config.intermediate_size + i * tpc.intermediate_size) >> 1),
+                         (tpc.intermediate_size >> 1));
+                memcpy((ggml_bf16_t*)tpc.down_scale +
+                           (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
+                       src_down_scale +
+                           (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
+                       sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
+              }
+            },
+            nullptr);
+      } else if (use_per_expert_ptrs) {
         pool->get_subpool(i)->do_work_stealing_job(
             tpc.expert_num, nullptr,
             [&, i](int expert_id_) {
@@ -1214,13 +1510,19 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
 
     pool->dispense_backend()->do_numa_job([&, this](int i) {
       auto& tpc = tps[i]->config_;
+      // Under zero-copy these were never allocated (and must never be freed:
+      // they would be the checkpoint mapping).
       delete[] (uint8_t*)(tpc.gate_proj);
       delete[] (uint8_t*)(tpc.up_proj);
       delete[] (uint8_t*)(tpc.down_proj);
+      tpc.gate_proj = tpc.up_proj = tpc.down_proj = nullptr;
       delete[] (ggml_bf16_t*)(tpc.gate_scale);
       delete[] (ggml_bf16_t*)(tpc.up_scale);
       delete[] (ggml_bf16_t*)(tpc.down_scale);
+      tpc.gate_scale = tpc.up_scale = tpc.down_scale = nullptr;
     });
+
+    if (zero_copy && kt_zerocopy::audit_enabled()) kt_zerocopy::audit_report(/*stride=*/16);
 
     this->weights_loaded = true;
   }

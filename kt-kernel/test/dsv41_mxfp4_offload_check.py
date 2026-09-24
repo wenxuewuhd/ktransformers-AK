@@ -34,6 +34,7 @@ Run (private site dir, no global install):
 from __future__ import annotations
 
 import argparse
+import time
 import builtins
 import json
 import os
@@ -217,6 +218,18 @@ def scale_roundtrip(wrapper, ck, L, cpu_ids):
             ctl = exp_s.clone()
             ctl[12345] ^= 0x01
             res["control_mismatch"] = int((got_s != ctl).sum())
+            # 🔴 权重侧的阳性对照。零拷贝下 got_w 与 exp_w 可能是**同一批物理页**
+            #    （kt 的 BufferB 直接指向 checkpoint 的 mmap），所以 w_mismatch==0
+            #    本身不排除「比较是空转的」。拿【另一个专家】的字节比一次：
+            #    必须红。它同时证明两件事——ck.bytes_ 的偏移是按专家走的，
+            #    且 got_w 确实随专家变化（不是常量 / 不是恒等于传入的期望）。
+            other = [v for v in cpu_ids if v != e][0]
+            ob = f"layers.{L}.ffn.experts.{other}"
+            ctl_w = torch.cat([ck.bytes_(f"{ob}.w1.weight").flatten(),
+                               ck.bytes_(f"{ob}.w3.weight").flatten(),
+                               ck.bytes_(f"{ob}.w2.weight").flatten()])
+            res["w_control_mismatch"] = int((got_w != ctl_w).sum())
+            res["w_control_expert"] = other
     res["distinct"] = sorted(res["distinct"])
     return res
 
@@ -227,8 +240,18 @@ def main():
     ap.add_argument("--tokens", default="1,4,32")
     ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--numa", type=int, default=1)
+    # 生产是 threadpool_count=2 / numa_nodes=[0,1]（vllm_ascend/kt_offload/config.py）。
+    # 已有的三次 PASS 都是 tp=1 跑的，tp=2 的重组分支在本项目里零调用方。
+    ap.add_argument("--tp", type=int, default=1, help="threadpool_count")
+    # 带宽要量准就得让传输压过每专家的调用开销：12 个专家只有 0.21 GiB。
+    ap.add_argument("--n-cpu", type=int, default=0, help="改用前 N 个专家（量带宽用）")
+    ap.add_argument("--cpu-ids", default="")
+    ap.add_argument("--nodes", default="", help="逗号分隔；给了就覆盖 --numa")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--x-std", type=float, default=1.0)
+    # 落点实验只需要 load + audit；前向那段要给 256 个专家做参考实现，
+    # 反解出来的 bf16/fp32/fp64 三份参考是 70 GiB 匿名内存和大部分墙钟。
+    ap.add_argument("--roundtrip-only", action="store_true")
     args = ap.parse_args()
 
     print(f"kt_kernel {kt_kernel.__version__} from {kt_kernel.__file__}")
@@ -238,12 +261,18 @@ def main():
     ck = Ckpt(CKPT)
     rng = np.random.default_rng(args.seed)
     # CPU-resident experts: spread over the id range, include both ends.
-    cpu_ids = [0, 5, 37, 100, 128, 191, 255, 256, 300, 333, 370, 383]
+    cpu_ids = ([int(v) for v in args.cpu_ids.split(",")] if args.cpu_ids
+               else list(range(args.n_cpu)) if args.n_cpu
+               else [0, 5, 37, 100, 128, 191, 255, 256, 300, 333, 370, 383])
     gpu_pool = [1, 2, 64, 150, 200, 222, 260, 280, 310, 350, 377, 382]
     mask = torch.ones(N_EXP, dtype=torch.bool)
     mask[cpu_ids] = False
     gpu_set = set(range(N_EXP)) - set(cpu_ids)
     summary, probe_hits, n_required = [], [], 0
+
+    _nodes = [int(v) for v in args.nodes.split(",")] if args.nodes else [args.numa]
+    assert len(_nodes) == args.tp, f"threadpool_count={args.tp} 要 {args.tp} 个 node，给了 {_nodes}"
+    print(f"[cfg] threadpool_count={args.tp} numa_nodes={_nodes}")
 
     for L in [int(v) for v in args.layers.split(",")]:
         print(f"\n===== layer {L}: CPU experts {cpu_ids} ({len(cpu_ids)}/{N_EXP}); "
@@ -251,19 +280,35 @@ def main():
         wr = KTMoEWrapper(
             layer_idx=L, num_experts=N_EXP, num_experts_per_tok=TOPK, hidden_size=HIDDEN,
             moe_intermediate_size=INTER, gpu_experts_mask=mask, cpuinfer_threads=args.threads,
-            threadpool_count=1, weight_path=CKPT, chunked_prefill_size=64, method="MXFP4",
-            numa_nodes=[args.numa], swiglu_limit=LIMIT,
+            threadpool_count=args.tp, weight_path=CKPT, chunked_prefill_size=64, method="MXFP4",
+            numa_nodes=_nodes, swiglu_limit=LIMIT,
         )
         wr.load_weights(torch.arange(N_EXP, dtype=torch.int64))
 
+        _t0 = time.perf_counter()
         rt = scale_roundtrip(wr, ck, L, cpu_ids)
+        _dt = time.perf_counter() - _t0
+        # 🔴 直接索引，不用 .get(默认值)：键名写错会被默认值静默成 0，
+        #    而 0.02 GiB/s 这种离谱读数只是碰巧显眼，换个数就当真了。
+        _gib = (rt["bytes"] + rt["w_bytes"]) / (1 << 30)
+        print(f"[bw] kt BufferB -> host: {_gib:.3f} GiB in {_dt:.2f}s = {_gib/_dt:.2f} GiB/s "
+              f"(对表：今晚 acquire 实测 4.2 GiB/s；mmap 热态基准 52.8 GiB/s)")
+        # 🔴 w_mismatch 原先只打印、不进判据 —— 于是 "PASS" 与「权重对不对」无关。
+        #    零拷贝这条线上，权重比对才是「指没指错地方」的唯一防线，必须进判据；
+        #    并且要求它的阳性对照（换个专家）非零，否则 0 可能只是空转。
         rt_ok = (rt["mismatch"] == 0 and rt["bad_bits"] == 0 and rt["control_mismatch"] == 1
-                 and len(rt["distinct"]) > 1 and rt["bytes"] > 0)
+                 and len(rt["distinct"]) > 1 and rt["bytes"] > 0
+                 and rt["w_mismatch"] == 0 and rt["w_bytes"] > 0
+                 and rt["w_control_mismatch"] > 0)
         print(f"[roundtrip] experts={rt['experts']} scale_bytes={rt['bytes']} mismatch={rt['mismatch']} "
               f"sign/mantissa_bits_set={rt['bad_bits']} distinct={rt['distinct']} "
               f"control(1 flipped)->{rt['control_mismatch']}  weight_bytes={rt['w_bytes']} "
-              f"weight_mismatch={rt['w_mismatch']}  [{'PASS' if rt_ok else 'FAIL'}]")
+              f"weight_mismatch={rt['w_mismatch']} "
+              f"w_control(expert {rt['w_control_expert']})->{rt['w_control_mismatch']} "
+              f" [{'PASS' if rt_ok else 'FAIL'}]")
         ok &= rt_ok
+        if args.roundtrip_only:
+            continue
 
         ref_w, mut_w = {}, {}
         for e in cpu_ids:

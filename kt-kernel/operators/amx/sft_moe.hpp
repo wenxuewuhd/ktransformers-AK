@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "../../cpu_backend/worker_pool.h"
+#include "../common.hpp"  // kt_checked_aligned_alloc
 #include "../sft_profile.hpp"
 #include "ggml.h"
 #include "la/amx_kernels.hpp"
@@ -2726,9 +2727,12 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
     size_t down_b_size = static_cast<size_t>(config_.expert_num) * lora_rank_ * config_.hidden_size;
 
     // Allocate all transposed buffers at once
-    gate_lora_b_transposed_ = (ggml_bf16_t*)aligned_alloc(64, gate_up_b_size * sizeof(ggml_bf16_t));
-    up_lora_b_transposed_ = (ggml_bf16_t*)aligned_alloc(64, gate_up_b_size * sizeof(ggml_bf16_t));
-    down_lora_b_transposed_ = (ggml_bf16_t*)aligned_alloc(64, down_b_size * sizeof(ggml_bf16_t));
+    gate_lora_b_transposed_ = (ggml_bf16_t*)kt_checked_aligned_alloc(64, gate_up_b_size * sizeof(ggml_bf16_t),
+                                                                     "SFT transposed gate LoRA-B");
+    up_lora_b_transposed_ = (ggml_bf16_t*)kt_checked_aligned_alloc(64, gate_up_b_size * sizeof(ggml_bf16_t),
+                                                                   "SFT transposed up LoRA-B");
+    down_lora_b_transposed_ = (ggml_bf16_t*)kt_checked_aligned_alloc(64, down_b_size * sizeof(ggml_bf16_t),
+                                                                     "SFT transposed down LoRA-B");
   }
 
   /**
@@ -3164,7 +3168,7 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
 
     // If pool not yet allocated (Mode 1 init), allocate per-instance for save/load path
     if (backward_bb_pool_ == nullptr && backward_bb_pool_bytes_ > 0) {
-      backward_bb_pool_ = aligned_alloc(64, backward_bb_pool_bytes_);
+      backward_bb_pool_ = kt_checked_aligned_alloc(64, backward_bb_pool_bytes_, "SFT backward BufferB pool");
       init_backward_bb_pointers();
       backward_bb_locally_owned_ = true;
     }
@@ -3639,7 +3643,7 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
 
     // LoRA BB pool (persistent - stores converted LoRA weights, not seqlen-dependent)
     if (lora_bb_pool_bytes_ > 0) {
-      lora_bb_pool_ = aligned_alloc(64, lora_bb_pool_bytes_);
+      lora_bb_pool_ = kt_checked_aligned_alloc(64, lora_bb_pool_bytes_, "SFT LoRA BufferB pool");
     }
 
     // ★ Backward pass working buffers are allocated on-demand in backward() and freed after use ★
@@ -3656,7 +3660,7 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
       backward_bb_locally_owned_ = false;
     } else {
       if (backward_bb_pool_bytes_ > 0) {
-        backward_bb_pool_ = aligned_alloc(64, backward_bb_pool_bytes_);
+        backward_bb_pool_ = kt_checked_aligned_alloc(64, backward_bb_pool_bytes_, "SFT backward BufferB pool");
       }
       backward_bb_locally_owned_ = true;
     }

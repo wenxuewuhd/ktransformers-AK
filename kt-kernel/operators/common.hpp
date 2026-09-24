@@ -15,8 +15,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
+
+#if defined(__linux__)
+#include <numaif.h>
+#include <sched.h>
+#endif
 
 // #define FORWARD_TIME_PROFILE
 // #define FORWARD_TIME_REPORT
@@ -60,6 +67,122 @@ inline bool kt_moe_phase_timing() {
     return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
   }();
   return enabled;
+}
+
+// ---------------------------------------------------------------------------
+// Checked host allocation.
+//
+// kt's worker pool pins every worker thread to one NUMA node with
+// hwloc_set_membind(BIND | STRICT | THREAD) (cpu_backend/worker_pool.h:49) and
+// never resets that bind -- by design. STRICT means the allocation is not
+// allowed to spill to another node, so once the bound node is full
+// std::aligned_alloc returns nullptr instead of succeeding elsewhere.
+//
+// An unchecked nullptr from there used to disappear completely: it was handed
+// straight to the BufferB constructors, whose only guard is
+// assert(ptr % 64 == 0) (operators/amx/la/amx_raw_buffers.hpp) -- 0 passes that
+// test, and a Release build defines NDEBUG, which removes the assert outright.
+// The first write then took SIGSEGV, and with kernel.print-fatal-signals=0 and
+// core_pattern piped to apport that signal leaves neither a dmesg line nor a
+// core file: the process simply vanishes. (Observed 2026-09-24 10:41:21 --
+// EngineCore gone with no output at all, machine-wide global_oom two minutes
+// later.)
+//
+// These helpers do not prevent the failure; they make it say what happened.
+// The byte count says how much was asked for, and the NUMA binding of the
+// calling thread is what identifies the hard bind as the reason a machine with
+// free memory elsewhere could still fail to allocate -- without it that is
+// guesswork.
+// Origin: dsv4.1 single-card line, 2026-09-24.
+
+// One line describing where the calling thread runs and what its memory policy
+// allows. Only ever called on a failure path, so the /sys reads are free.
+inline std::string kt_thread_numa_binding(bool* hard_bound = nullptr) {
+  if (hard_bound != nullptr) *hard_bound = false;
+  std::ostringstream oss;
+#if defined(__linux__)
+  const int cpu = sched_getcpu();
+  const int cpu_node = cpu >= 0 ? numa_node_of_cpu(cpu) : -1;
+  oss << "cpu " << cpu;
+  if (numa_available() >= 0) {
+    oss << " on node " << cpu_node;
+
+    int mode = -1;
+    unsigned long mask[16] = {0};  // 1024 nodes
+    if (get_mempolicy(&mode, mask, sizeof(mask) * 8, nullptr, 0) == 0) {
+      const char* mode_name = "MPOL_?";
+      switch (mode) {
+        case MPOL_DEFAULT: mode_name = "MPOL_DEFAULT (not bound)"; break;
+        case MPOL_PREFERRED: mode_name = "MPOL_PREFERRED"; break;
+        case MPOL_BIND:
+          mode_name = "MPOL_BIND (hard-bound)";
+          if (hard_bound != nullptr) *hard_bound = true;
+          break;
+        case MPOL_INTERLEAVE: mode_name = "MPOL_INTERLEAVE"; break;
+        default: break;
+      }
+      oss << ", mempolicy " << mode_name << " nodes {";
+      const int max_node = numa_max_node();
+      bool first = true;
+      for (int n = 0; n <= max_node && n < 1024; n++) {
+        if (!((mask[n / 64] >> (n % 64)) & 1ULL)) continue;
+        if (!first) oss << ",";
+        first = false;
+        long long free_bytes = 0;
+        const long long total_bytes = numa_node_size64(n, &free_bytes);
+        oss << n << ":free " << (free_bytes >> 20) << "/" << (total_bytes >> 20) << " MiB";
+      }
+      // An empty mask means the policy names no node (MPOL_DEFAULT): report the
+      // node this thread actually runs on, so the numbers are never missing.
+      if (first && cpu_node >= 0) {
+        long long free_bytes = 0;
+        const long long total_bytes = numa_node_size64(cpu_node, &free_bytes);
+        oss << "all; local node " << cpu_node << ":free " << (free_bytes >> 20) << "/" << (total_bytes >> 20)
+            << " MiB";
+      } else if (first) {
+        oss << "-";
+      }
+      oss << "}";
+    } else {
+      oss << ", mempolicy unavailable (get_mempolicy failed)";
+    }
+  } else {
+    oss << ", libnuma reports no NUMA support";
+  }
+#else
+  oss << "unknown (non-Linux build)";
+#endif
+  return oss.str();
+}
+
+// std::aligned_alloc that never returns nullptr: on failure it prints and
+// throws (via ASSERT_RELEASE, so NDEBUG cannot compile the check away) a
+// message carrying the requested size and the calling thread's NUMA binding.
+// `what` names the buffer, `index` is an optional expert id (-1 = none).
+// The thrown type is std::runtime_error, which pybind11 surfaces to Python as
+// RuntimeError with this message intact.
+inline void* kt_checked_aligned_alloc(size_t alignment, size_t size, const char* what, long long index = -1) {
+  void* ptr = std::aligned_alloc(alignment, size);
+  if (ptr == nullptr) {
+    bool hard_bound = false;
+    const std::string binding = kt_thread_numa_binding(&hard_bound);
+    std::ostringstream oss;
+    oss << "kt-kernel: allocation of " << what;
+    if (index >= 0) oss << " for expert " << index;
+    oss << " failed: std::aligned_alloc(" << alignment << ", " << size << ") returned nullptr (" << size
+        << " bytes = " << (size >> 20) << " MiB). Calling thread: " << binding << ". ";
+    if (hard_bound) {
+      oss << "That thread is hard-bound to the node(s) above (hwloc_set_membind BIND|STRICT|THREAD, "
+             "cpu_backend/worker_pool.h) and kt never resets the bind, so this allocation could not fall back "
+             "to another node however much memory the rest of the machine has.";
+    } else {
+      oss << "That thread is not node-bound, so this is a machine-wide or cgroup/rlimit shortage rather than a "
+             "NUMA bind (kt's worker threads, unlike this one, are hard-bound in cpu_backend/worker_pool.h).";
+    }
+    const std::string msg = oss.str();
+    ASSERT_RELEASE(ptr != nullptr, msg.c_str());
+  }
+  return ptr;
 }
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>

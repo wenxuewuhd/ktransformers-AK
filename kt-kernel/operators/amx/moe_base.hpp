@@ -148,15 +148,21 @@ class AMX_MOE_BASE {
         continue;
       }
 
-      void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      // Checked: on a node-bound worker thread a full node makes these return
+      // nullptr, and nullptr passes the BufferB assert(ptr % 64 == 0) that
+      // NDEBUG removes anyway -- the crash then lands on the first write, with
+      // no dmesg line and no core. kt_checked_aligned_alloc reports the size
+      // and the thread's NUMA bind instead. See operators/common.hpp.
+      void* gate_bb_ptr = kt_checked_aligned_alloc(
+          64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size), "AMX gate BufferB", (long long)i);
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* up_bb_ptr = kt_checked_aligned_alloc(
+          64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size), "AMX up BufferB", (long long)i);
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
-      void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      void* down_bb_ptr = kt_checked_aligned_alloc(
+          64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size), "AMX down BufferB", (long long)i);
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
     // TODO: need update to all *.hpp

@@ -18,7 +18,7 @@
 #include <stdexcept>  // std::runtime_error -- was only ever pulled in transitively
 
 #include "../zerocopy_weights.hpp"  // KT_ZEROCOPY_WEIGHTS switch + page placement/pinning
-#include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
+#include "la/amx_raw_buffers.hpp"   // BufferABF16Impl
 #include "moe_base.hpp"
 
 namespace amx {
@@ -147,9 +147,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // is in fact aligned, which is the case for every owned (aligned_alloc'd)
   // BufferB, so the default path keeps its timings.
   // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
-  __attribute__((always_inline)) static inline __m128i ldw(const __m128i* w, int g) {
-    return _mm_loadu_si128(w + g);
-  }
+  __attribute__((always_inline)) static inline __m128i ldw(const __m128i* w, int g) { return _mm_loadu_si128(w + g); }
 
   struct DequantizedWeight {
 #if defined(__AVX512BF16__)
@@ -241,11 +239,11 @@ struct GemmKernel224MXFP4SmallKGroup {
     using Base::d;
     using Base::external_b;
     using Base::get_submat;
-    using Base::set_external_weights;
     using Base::k;
     using Base::k_group_count;
     using Base::k_group_size;
     using Base::n;
+    using Base::set_external_weights;
 
     uint8_t* scale_e8;
     bool scale_e8_valid = false;
@@ -319,10 +317,9 @@ struct GemmKernel224MXFP4SmallKGroup {
         const bool is_positive_power_of_two =
             (bits & 0x8000u) == 0 && (bits & 0x007Fu) == 0 && exponent != 0 && exponent != 0xFFu;
         if (!is_positive_power_of_two) {
-          throw std::runtime_error(
-              "MXFP4 compact scales: scale " + std::to_string(i) +
-              " is not a positive power of two (bf16 bits 0x" + std::to_string(bits) +
-              "). Set KT_MXFP4_COMPACT_SCALES=0 to fall back to the FP32 scale slot.");
+          throw std::runtime_error("MXFP4 compact scales: scale " + std::to_string(i) +
+                                   " is not a positive power of two (bf16 bits 0x" + std::to_string(bits) +
+                                   "). Set KT_MXFP4_COMPACT_SCALES=0 to fall back to the FP32 scale slot.");
         }
         scale_e8[i] = static_cast<uint8_t>(exponent);
       }
@@ -402,6 +399,93 @@ struct GemmKernel224MXFP4SmallKGroup {
     dst[1] = _mm512_reduce_add_ps(s1);
     dst[2] = _mm512_reduce_add_ps(s2);
     dst[3] = _mm512_reduce_add_ps(s3);
+  }
+
+  // Small speculative batches are already grouped by expert. Keep the K-group
+  // accumulation order of the original GEMV, but decode each weight group once
+  // for all M tokens in this output tile. Wider M uses two N rows to bound the
+  // number of live accumulators; M<=4 keeps the original four-row reduction.
+  template <int M>
+  static void fp4_mat_vec_reuse_kgroup(int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
+    static_assert(M >= 2 && M <= 6);
+    constexpr int NB = M <= 4 ? 4 : 2;
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    const int kg_count = k / 32;
+    const __m512bh* a_rows[M];
+    float* c_rows[M];
+    for (int mi = 0; mi < M; ++mi) {
+      a_rows[mi] = reinterpret_cast<const __m512bh*>(ba->get_submat(M, k, mi, 0));
+      c_rows[mi] = bc->get_submat(M, n, mi, n_start);
+    }
+
+    int n_pos = n_start;
+    for (; n_pos + NB <= n_end; n_pos += NB) {
+      const __m128i* w[NB];
+      const float* scales[NB];
+      for (int ni = 0; ni < NB; ++ni) {
+        w[ni] = reinterpret_cast<const __m128i*>(bb->get_submat(n, k, n_pos + ni, 0));
+        scales[ni] = bb->get_scale(n, n_pos + ni, k, 0);
+      }
+      __m512 acc[M][NB];
+      for (int mi = 0; mi < M; ++mi)
+        for (int ni = 0; ni < NB; ++ni) acc[mi][ni] = _mm512_setzero_ps();
+
+      for (int g = 0; g < kg_count; ++g) {
+        const DequantizedWeight d0(ldw(w[0], g));
+        const DequantizedWeight d1(ldw(w[1], g));
+        const __m512 s0 = _mm512_set1_ps(scales[0][g]);
+        const __m512 s1 = _mm512_set1_ps(scales[1][g]);
+        if constexpr (NB == 4) {
+          const DequantizedWeight d2(ldw(w[2], g));
+          const DequantizedWeight d3(ldw(w[3], g));
+          const __m512 s2 = _mm512_set1_ps(scales[2][g]);
+          const __m512 s3 = _mm512_set1_ps(scales[3][g]);
+#pragma GCC unroll 4
+          for (int mi = 0; mi < M; ++mi) {
+            const ActivationBF16 a(a_rows[mi][g]);
+            acc[mi][0] = _mm512_fmadd_ps(s0, mxfp4_dot_bf16(d0, a), acc[mi][0]);
+            acc[mi][1] = _mm512_fmadd_ps(s1, mxfp4_dot_bf16(d1, a), acc[mi][1]);
+            acc[mi][2] = _mm512_fmadd_ps(s2, mxfp4_dot_bf16(d2, a), acc[mi][2]);
+            acc[mi][3] = _mm512_fmadd_ps(s3, mxfp4_dot_bf16(d3, a), acc[mi][3]);
+          }
+        } else {
+#pragma GCC unroll 6
+          for (int mi = 0; mi < M; ++mi) {
+            const ActivationBF16 a(a_rows[mi][g]);
+            acc[mi][0] = _mm512_fmadd_ps(s0, mxfp4_dot_bf16(d0, a), acc[mi][0]);
+            acc[mi][1] = _mm512_fmadd_ps(s1, mxfp4_dot_bf16(d1, a), acc[mi][1]);
+          }
+        }
+      }
+      for (int mi = 0; mi < M; ++mi) {
+        float* out = c_rows[mi] + n_pos - n_start;
+        if constexpr (NB == 4) {
+          reduce4(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], out);
+        } else {
+          out[0] = _mm512_reduce_add_ps(acc[mi][0]);
+          out[1] = _mm512_reduce_add_ps(acc[mi][1]);
+        }
+      }
+    }
+
+    // Non-multiple N and the last worker's short output tile remain supported.
+    for (; n_pos < n_end; ++n_pos) {
+      const auto* w = reinterpret_cast<const __m128i*>(bb->get_submat(n, k, n_pos, 0));
+      const float* scales = bb->get_scale(n, n_pos, k, 0);
+      __m512 acc[M];
+      for (int mi = 0; mi < M; ++mi) acc[mi] = _mm512_setzero_ps();
+      for (int g = 0; g < kg_count; ++g) {
+        const DequantizedWeight decoded(ldw(w, g));
+        const __m512 scale = _mm512_set1_ps(scales[g]);
+#pragma GCC unroll 6
+        for (int mi = 0; mi < M; ++mi) {
+          const ActivationBF16 a(a_rows[mi][g]);
+          acc[mi] = _mm512_fmadd_ps(scale, mxfp4_dot_bf16(decoded, a), acc[mi]);
+        }
+      }
+      for (int mi = 0; mi < M; ++mi) c_rows[mi][n_pos - n_start] = _mm512_reduce_add_ps(acc[mi]);
+    }
   }
 
   // mat-vec: M 个独立 token，N 维 4 行一组累加，摊销 horizontal reduce。
@@ -751,6 +835,25 @@ inline void vec_mul_kgroup(int m, int n, int k, int k_group_size,
     return;
   }
 #endif
+  // Preserve the natural-order single-token fast path above and the general
+  // fallback below. Speculative verification has at most six tokens at K=5.
+  switch (m) {
+    case 2:
+      GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_reuse_kgroup<2>(n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+      return;
+    case 3:
+      GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_reuse_kgroup<3>(n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+      return;
+    case 4:
+      GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_reuse_kgroup<4>(n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+      return;
+    case 5:
+      GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_reuse_kgroup<5>(n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+      return;
+    case 6:
+      GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_reuse_kgroup<6>(n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+      return;
+  }
   GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
 }
 
@@ -837,8 +940,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   size_t buffer_a_required_size_impl(size_t m, size_t k) const { return T::BufferA::required_size(m, k); }
   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
     if (zero_copy_buffer(n, k))
-      return T::BufferB::required_size_scale_only(n, k, config_.quant_config.group_size,
-                                                  config_.compact_mxfp4_scales);
+      return T::BufferB::required_size_scale_only(n, k, config_.quant_config.group_size, config_.compact_mxfp4_scales);
     return T::BufferB::required_size(n, k, config_.quant_config.group_size, config_.compact_mxfp4_scales);
   }
   size_t buffer_c_required_size_impl(size_t m, size_t n) const { return T::BufferC::required_size(m, n); }
@@ -1551,10 +1653,9 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     // that was never loaded on the CPU. Fail loudly rather than dereferencing
     // a null BufferB. Origin: dsv4-a5 single-card offload (stage 0.6).
     if (this->config.lacks_cpu_weights(expert_id))
-      throw std::runtime_error(
-          "write_weight_scale_to_buffer: expert " + std::to_string(expert_id) +
-          " has no CPU weights (skip_gpu_expert_weights is on and gpu_experts_mask[" +
-          std::to_string(expert_id) + "] is true)");
+      throw std::runtime_error("write_weight_scale_to_buffer: expert " + std::to_string(expert_id) +
+                               " has no CPU weights (skip_gpu_expert_weights is on and gpu_experts_mask[" +
+                               std::to_string(expert_id) + "] is true)");
 
     this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
